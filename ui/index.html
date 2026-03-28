@@ -20,6 +20,11 @@
         // Ignore storage access failures before app boot.
       }
     </script>
+    <style>
+      html.boot-pending body {
+        visibility: hidden;
+      }
+    </style>
     <link rel="preload" as="image" href="/solana-mark.png">
     <link rel="stylesheet" href="/styles.css">
   </head>
