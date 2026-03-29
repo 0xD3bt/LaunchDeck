@@ -56,13 +56,16 @@ Examples:
 
 ### Bonk
 
-- should use official Raydium SDK surfaces
-- prefer Raydium SDK v2 where applicable
+- not active in the current initial version
+- should not be treated as a supported launch flow yet
+- future implementation should use official Raydium SDK surfaces
 - community repos are reference-only, not implementation sources
 
 ### Bagsapp
 
-- should use official Bags SDK/docs
+- not active in the current initial version
+- should not be treated as a supported launch flow yet
+- future implementation should use official Bags SDK/docs
 - creator BPS must be explicit
 - total fee-claimer BPS must equal `10000`
 - LUT-aware config creation may be required for larger fee-claimer sets
@@ -81,7 +84,7 @@ The backend reports:
 
 ## Current Runtime Notes
 
-- Pump is the verified launch flow in the code today.
+- Pump is the only active launch flow in the code today.
 - `Helius Sender`, `Standard RPC`, and `Jito Bundle` are the current explicit provider choices.
 - `Standard RPC` and `Helius Sender` keep dependent launch/follow-up flows sequential.
 - `Jito Bundle` owns the current bundle transport path.
@@ -89,7 +92,7 @@ The backend reports:
   - default: `pump-fun`
   - optional custom provider: `pinata`
   - Pinata reuses uploaded image CIDs across metadata-only edits within the current app session
-- Bonk and Bags are represented in the launchpad model, but still require live validation before they should be treated as production-verified launch builders.
+- Bonk and Bags may appear in model/planning surfaces, but they are not active launch builders in the current initial version.
 
 ## Documentation Pointers
 

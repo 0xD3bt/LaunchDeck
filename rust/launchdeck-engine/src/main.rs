@@ -1,4 +1,5 @@
 mod config;
+mod follow;
 mod image_library;
 mod launchpads;
 mod observability;
@@ -17,9 +18,13 @@ mod vamp;
 mod wallet;
 
 use crate::{
-    config::{RawConfig, normalize_raw_config},
+    config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
+    follow::{
+        FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
+        FollowJobResponse, FollowReadyRequest, FollowReserveRequest,
+    },
     image_library::{
-        build_image_library_payload, create_category, delete_image, save_data_url_image,
+        build_image_library_payload, create_category, delete_image, save_image_bytes,
         update_image,
     },
     launchpads::launchpad_registry,
@@ -27,10 +32,17 @@ use crate::{
         log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
-    pump_native::{try_compile_native_pump, warm_default_lookup_tables, warm_pump_global_state},
+    pump_native::{
+        compile_atomic_follow_buy_transaction, try_compile_native_pump, warm_default_lookup_tables,
+        warm_pump_global_state,
+    },
     report::{LaunchReport, build_report, render_report},
-    reports_browser::{list_persisted_reports, read_persisted_report},
-    rpc::{send_transactions_for_transport, simulate_transactions, spawn_blockhash_refresh_task},
+    reports_browser::{list_persisted_reports, read_persisted_report_bundle},
+    rpc::{
+        CompiledTransaction, confirm_submitted_transactions_for_transport, simulate_transactions,
+        spawn_blockhash_refresh_task, submit_independent_transactions_for_transport,
+        submit_transactions_for_transport,
+    },
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
         list_workers, restore_workers, start_worker, stop_worker,
@@ -38,7 +50,9 @@ use crate::{
     strategies::strategy_registry,
     transport::{
         build_transport_plan, configured_helius_sender_endpoint, configured_jito_bundle_endpoints,
-        estimate_transaction_count,
+        configured_provider_region, configured_shared_region, default_endpoint_profile,
+        default_endpoint_profile_for_provider, estimate_transaction_count,
+        helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
     },
     ui_bridge::{build_raw_config_from_form, quote_from_form, upload_metadata_from_form},
     ui_config::{
@@ -48,15 +62,17 @@ use crate::{
     wallet::{
         enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key,
         public_key_from_secret, selected_wallet_key_or_default,
+        selected_wallet_key_or_default_from_wallets,
     },
 };
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, Response, StatusCode, header},
     routing::{get, post},
 };
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -134,13 +150,6 @@ struct QuoteQuery {
 
 #[allow(non_snake_case)]
 #[derive(Deserialize, Default)]
-struct UploadImageRequest {
-    dataUrl: Option<String>,
-    filename: Option<String>,
-}
-
-#[allow(non_snake_case)]
-#[derive(Deserialize, Default)]
 struct VampRequest {
     contractAddress: Option<String>,
 }
@@ -174,24 +183,21 @@ struct ImageDeleteRequest {
 }
 
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
+const DEFAULT_LOCAL_AUTH_TOKEN: &str = "4815927603149027";
 
 fn configured_engine_port() -> u16 {
     std::env::var("LAUNCHDECK_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .or_else(|| {
-            std::env::var("LAUNCHDECK_ENGINE_PORT")
-                .ok()
-                .and_then(|value| value.parse::<u16>().ok())
-        })
         .unwrap_or(8789)
 }
 
 fn configured_auth_token() -> Option<String> {
-    let token = std::env::var("LAUNCHDECK_ENGINE_AUTH_TOKEN").unwrap_or_default();
+    let token = std::env::var("LAUNCHDECK_ENGINE_AUTH_TOKEN")
+        .unwrap_or_else(|_| DEFAULT_LOCAL_AUTH_TOKEN.to_string());
     let trimmed = token.trim();
     if trimmed.is_empty() {
-        None
+        Some(DEFAULT_LOCAL_AUTH_TOKEN.to_string())
     } else {
         Some(trimmed.to_string())
     }
@@ -238,23 +244,70 @@ fn configured_rpc_url() -> String {
             return trimmed.to_string();
         }
     }
-    if let Ok(explicit) = std::env::var("HELIUS_RPC_URL") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
-        let trimmed = api_key.trim();
-        if !trimmed.is_empty() {
-            return format!("https://mainnet.helius-rpc.com/?api-key={trimmed}");
-        }
-    }
     "http://127.0.0.1:8899".to_string()
 }
 
 fn configured_base_url() -> String {
     format!("http://127.0.0.1:{}", configured_engine_port())
+}
+
+fn configured_follow_daemon_port() -> u16 {
+    std::env::var("LAUNCHDECK_FOLLOW_DAEMON_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8790)
+}
+
+fn configured_follow_daemon_base_url() -> String {
+    std::env::var("LAUNCHDECK_FOLLOW_DAEMON_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", configured_follow_daemon_port()))
+}
+
+fn configured_follow_daemon_transport() -> Result<String, String> {
+    let transport = std::env::var("LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT")
+        .unwrap_or_else(|_| "local-http".to_string())
+        .trim()
+        .to_lowercase();
+    match transport.as_str() {
+        "" | "local-http" => Ok("local-http".to_string()),
+        other => Err(format!(
+            "Unsupported follow daemon transport: {other}. Expected local-http."
+        )),
+    }
+}
+
+async fn follow_daemon_status_payload() -> Value {
+    let base_url = configured_follow_daemon_base_url();
+    match configured_follow_daemon_transport() {
+        Ok(transport) => {
+            let client = FollowDaemonClient::new(&base_url);
+            match client.health().await {
+                Ok(health) => json!({
+                    "configured": true,
+                    "reachable": true,
+                    "transport": transport,
+                    "url": base_url,
+                    "health": health,
+                }),
+                Err(error) => json!({
+                    "configured": true,
+                    "reachable": false,
+                    "transport": transport,
+                    "url": base_url,
+                    "error": error,
+                }),
+            }
+        }
+        Err(error) => json!({
+            "configured": false,
+            "reachable": false,
+            "url": base_url,
+            "error": error,
+        }),
+    }
 }
 
 fn resolve_signer_source(selected_wallet_key: &str) -> String {
@@ -296,6 +349,24 @@ fn guess_content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+fn cache_control_for_path(path: &std::path::Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension == "html" {
+        return "no-store";
+    }
+    if path.to_string_lossy().contains("uploads") {
+        return "public, max-age=86400";
+    }
+    if matches!(extension.as_str(), "js" | "css" | "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif") {
+        return "no-cache";
+    }
+    "no-store"
+}
+
 fn file_response(path: std::path::PathBuf) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     let body = std::fs::read(&path).map_err(|_| {
         (
@@ -309,7 +380,7 @@ fn file_response(path: std::path::PathBuf) -> Result<Response<Body>, (StatusCode
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, guess_content_type(&path))
-        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CACHE_CONTROL, cache_control_for_path(&path))
         .body(Body::from(body))
         .map_err(|error| {
             (
@@ -337,6 +408,16 @@ fn current_time_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn attach_timing(mut payload: Value, started_at_ms: u128) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "timingMs".to_string(),
+            Value::from(current_time_ms().saturating_sub(started_at_ms) as u64),
+        );
+    }
+    payload
+}
+
 fn synthetic_mint_address(trace_id: &str) -> String {
     let clean = trace_id.replace('-', "");
     let mut bytes = Vec::with_capacity(32);
@@ -351,6 +432,19 @@ fn render_report_value(report: &Value) -> Value {
     serde_json::from_value::<LaunchReport>(report.clone())
         .map(|parsed| Value::String(render_report(&parsed)))
         .unwrap_or_else(|_| Value::String(String::new()))
+}
+
+fn append_execution_warning(report: &mut Value, warning: &str) {
+    let Some(execution) = report.get_mut("execution") else {
+        return;
+    };
+    let mut existing_warnings = execution
+        .get("warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    existing_warnings.push(Value::String(warning.to_string()));
+    execution["warnings"] = Value::Array(existing_warnings);
 }
 
 fn set_report_timing(report: &mut Value, key: &str, value_ms: u128) {
@@ -409,22 +503,301 @@ fn refresh_report_benchmark(report: &mut Value) {
     });
 }
 
+fn attach_follow_daemon_report(
+    report: &mut Value,
+    transport: Option<&str>,
+    reserved: Option<&FollowJobResponse>,
+    armed: Option<&FollowJobResponse>,
+) {
+    let latest = armed.or(reserved);
+    let job = latest.and_then(|response| response.job.clone());
+    let health = latest.map(|response| response.health.clone());
+    let timing_profiles = latest
+        .map(|response| response.timingProfiles.clone())
+        .unwrap_or_default();
+    report["followDaemon"] = json!({
+        "schemaVersion": FOLLOW_RESPONSE_SCHEMA_VERSION,
+        "enabled": reserved.is_some() || armed.is_some(),
+        "transport": transport,
+        "reserved": reserved,
+        "armed": armed,
+        "job": job,
+        "health": health,
+        "timingProfiles": timing_profiles,
+    });
+}
+
+fn split_same_time_snipes(
+    follow_launch: &NormalizedFollowLaunch,
+) -> (Vec<crate::config::NormalizedFollowLaunchSnipe>, NormalizedFollowLaunch) {
+    let mut same_time = Vec::new();
+    let mut deferred = follow_launch.clone();
+    deferred.snipes = follow_launch
+        .snipes
+        .iter()
+        .filter_map(|snipe| {
+            if snipe.submitWithLaunch {
+                same_time.push(snipe.clone());
+                if snipe.retryOnFailure {
+                    let mut retry_snipe = snipe.clone();
+                    retry_snipe.submitWithLaunch = false;
+                    retry_snipe.submitDelayMs = 450;
+                    retry_snipe.targetBlockOffset = None;
+                    retry_snipe.skipIfTokenBalancePositive = true;
+                    Some(retry_snipe)
+                } else {
+                    None
+                }
+            } else {
+                Some(snipe.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    deferred.enabled = !deferred.snipes.is_empty() || deferred.devAutoSell.is_some();
+    (same_time, deferred)
+}
+
+fn has_same_time_snipes(follow_launch: &NormalizedFollowLaunch) -> bool {
+    follow_launch
+        .snipes
+        .iter()
+        .any(|snipe| snipe.enabled && snipe.submitWithLaunch)
+}
+
+fn parse_sol_decimal_to_lamports(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(0);
+    }
+    let normalized = trimmed.replace(',', ".");
+    let mut parts = normalized.split('.');
+    let whole = parts.next()?;
+    let fractional = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || !whole.chars().all(|char| char.is_ascii_digit())
+        || !fractional.chars().all(|char| char.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole_value = whole.parse::<u64>().ok()?;
+    let mut fractional_text = fractional.to_string();
+    if fractional_text.len() > 9 {
+        fractional_text.truncate(9);
+    }
+    while fractional_text.len() < 9 {
+        fractional_text.push('0');
+    }
+    let fractional_value = if fractional_text.is_empty() {
+        0
+    } else {
+        fractional_text.parse::<u64>().ok()?
+    };
+    whole_value
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(fractional_value))
+}
+
+fn format_lamports_to_sol_decimal(value: u64) -> String {
+    let whole = value / 1_000_000_000;
+    let fractional = value % 1_000_000_000;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    let mut fractional_text = format!("{fractional:09}");
+    while fractional_text.ends_with('0') {
+        fractional_text.pop();
+    }
+    format!("{whole}.{fractional_text}")
+}
+
+fn apply_same_time_creation_fee_guard(normalized: &mut NormalizedConfig) -> Option<String> {
+    if !has_same_time_snipes(&normalized.followLaunch) {
+        return None;
+    }
+    let creation_priority = parse_sol_decimal_to_lamports(&normalized.execution.priorityFeeSol)?;
+    let buy_priority = parse_sol_decimal_to_lamports(&normalized.execution.buyPriorityFeeSol)?;
+    let creation_tip = parse_sol_decimal_to_lamports(&normalized.execution.tipSol)?;
+    let buy_tip = parse_sol_decimal_to_lamports(&normalized.execution.buyTipSol)?;
+    let mut adjusted_fields = Vec::new();
+    if creation_priority <= buy_priority {
+        let next_priority = buy_priority.saturating_add(1);
+        let next_priority_text = format_lamports_to_sol_decimal(next_priority);
+        normalized.execution.priorityFeeSol = next_priority_text.clone();
+        normalized.execution.maxPriorityFeeSol = next_priority_text;
+        adjusted_fields.push("priority fee");
+    }
+    if creation_tip <= buy_tip {
+        let next_tip = buy_tip.saturating_add(1);
+        let next_tip_text = format_lamports_to_sol_decimal(next_tip);
+        normalized.execution.tipSol = next_tip_text.clone();
+        normalized.execution.maxTipSol = next_tip_text;
+        normalized.tx.jitoTipLamports = next_tip as i64;
+        adjusted_fields.push("tip");
+    }
+    if adjusted_fields.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Same-time sniper safeguard raised launch {} above same-time buy fees.",
+            adjusted_fields.join(" and ")
+        ))
+    }
+}
+
+async fn compile_same_time_snipes(
+    rpc_url: &str,
+    normalized: &crate::config::NormalizedConfig,
+    mint: &str,
+    launch_creator: &str,
+    snipes: &[crate::config::NormalizedFollowLaunchSnipe],
+) -> Result<Vec<CompiledTransaction>, String> {
+    let tasks = snipes.iter().enumerate().map(|(index, snipe)| async move {
+        let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
+        let mut tx = compile_atomic_follow_buy_transaction(
+            rpc_url,
+            &normalized.execution,
+            normalized.token.mayhemMode,
+            &normalized.tx.jitoTipAccount,
+            &wallet_secret,
+            mint,
+            launch_creator,
+            &snipe.buyAmountSol,
+        )
+        .await?;
+        tx.label = format!(
+            "sniper-buy-{}-wallet-{}",
+            index + 1,
+            snipe.walletEnvKey.replace("SOLANA_PRIVATE_KEY", "")
+        );
+        Ok::<CompiledTransaction, String>(tx)
+    });
+    join_all(tasks)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn build_status_payload(
     state: &Arc<AppState>,
     requested_wallet: &str,
+    strict_wallet_selection: bool,
 ) -> Result<Value, String> {
-    let raw_wallets = list_solana_env_wallets();
-    if !requested_wallet.trim().is_empty()
-        && !raw_wallets
+    let mut payload = build_bootstrap_fast_payload(requested_wallet, strict_wallet_selection)?;
+    let wallet_status = build_wallet_status_payload(requested_wallet, strict_wallet_selection).await?;
+    let runtime_status = build_runtime_status_payload(state).await;
+    payload["rpcUrl"] = wallet_status
+        .get("rpcUrl")
+        .cloned()
+        .unwrap_or(Value::String(configured_rpc_url()));
+    payload["connected"] = wallet_status
+        .get("connected")
+        .cloned()
+        .unwrap_or(Value::Bool(false));
+    payload["wallets"] = wallet_status
+        .get("wallets")
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    payload["selectedWalletKey"] = wallet_status
+        .get("selectedWalletKey")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["wallet"] = wallet_status.get("wallet").cloned().unwrap_or(Value::Null);
+    payload["balanceLamports"] = wallet_status
+        .get("balanceLamports")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["balanceSol"] = wallet_status
+        .get("balanceSol")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["usd1Balance"] = wallet_status
+        .get("usd1Balance")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["transport"] = runtime_status
+        .get("transport")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["followDaemon"] = runtime_status
+        .get("followDaemon")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["runtime"] = runtime_status
+        .get("runtime")
+        .cloned()
+        .unwrap_or(Value::Null);
+    payload["runtimeWorkers"] = runtime_status
+        .get("runtimeWorkers")
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    Ok(payload)
+}
+
+fn resolve_selected_wallet_key(
+    requested_wallet: &str,
+    strict_wallet_selection: bool,
+    raw_wallets: &[crate::wallet::WalletSummary],
+) -> Result<Option<String>, String> {
+    let requested_wallet = requested_wallet.trim();
+    let requested_wallet_is_known = requested_wallet.is_empty()
+        || raw_wallets
             .iter()
-            .any(|wallet| wallet.envKey == requested_wallet.trim())
-    {
+            .any(|wallet| wallet.envKey == requested_wallet);
+    if strict_wallet_selection && !requested_wallet_is_known {
         return Err(format!(
             "Unknown wallet env key: {}",
-            requested_wallet.trim()
+            requested_wallet
         ));
     }
-    let selected_wallet_key = selected_wallet_key_or_default(requested_wallet);
+    Ok(selected_wallet_key_or_default_from_wallets(
+        if requested_wallet_is_known {
+            requested_wallet
+        } else {
+            ""
+        },
+        raw_wallets,
+    ))
+}
+
+fn build_bootstrap_fast_payload(
+    requested_wallet: &str,
+    strict_wallet_selection: bool,
+) -> Result<Value, String> {
+    let raw_wallets = list_solana_env_wallets();
+    let selected_wallet_key =
+        resolve_selected_wallet_key(requested_wallet, strict_wallet_selection, &raw_wallets)?;
+    let selected_wallet = selected_wallet_key.as_ref().and_then(|env_key| {
+        raw_wallets
+            .iter()
+            .find(|wallet| wallet.envKey == *env_key)
+            .cloned()
+    });
+    Ok(json!({
+        "ok": true,
+        "service": "launchdeck-engine",
+        "engineBackend": "rust",
+        "implemented": true,
+        "executionMode": "rust-native-only",
+        "message": "Rust engine is online with native Pump execution, native RPC transport, and native runtime workers. Unsupported requests fail explicitly instead of falling back to JavaScript.",
+        "connected": selected_wallet.is_some(),
+        "wallets": raw_wallets,
+        "selectedWalletKey": selected_wallet_key,
+        "wallet": selected_wallet.as_ref().and_then(|wallet| wallet.publicKey.clone()),
+        "providers": provider_availability_registry(),
+        "providerRegistry": provider_registry(),
+        "launchpads": launchpad_registry(),
+        "regionRouting": build_region_routing_payload(),
+        "config": read_persistent_config(),
+    }))
+}
+
+async fn build_wallet_status_payload(
+    requested_wallet: &str,
+    strict_wallet_selection: bool,
+) -> Result<Value, String> {
+    let raw_wallets = list_solana_env_wallets();
+    let selected_wallet_key =
+        resolve_selected_wallet_key(requested_wallet, strict_wallet_selection, &raw_wallets)?;
     let rpc_url = configured_rpc_url();
     let wallets = enrich_wallet_statuses(&rpc_url, USD1_MINT, &raw_wallets).await;
     let selected_wallet = selected_wallet_key.as_ref().and_then(|env_key| {
@@ -433,14 +806,8 @@ async fn build_status_payload(
             .find(|wallet| wallet.envKey == *env_key)
             .cloned()
     });
-    let runtime_workers = list_workers(&state.runtime).await;
     Ok(json!({
         "ok": true,
-        "service": "launchdeck-engine",
-        "engineBackend": "rust",
-        "implemented": true,
-        "executionMode": "rust-native-only",
-        "message": "Rust engine is online with native Pump execution, native RPC transport, and native runtime workers. Unsupported requests fail explicitly instead of falling back to JavaScript.",
         "rpcUrl": rpc_url,
         "connected": selected_wallet.is_some(),
         "wallets": wallets,
@@ -449,19 +816,50 @@ async fn build_status_payload(
         "balanceLamports": selected_wallet.as_ref().and_then(|wallet| wallet.balanceLamports),
         "balanceSol": selected_wallet.as_ref().and_then(|wallet| wallet.balanceSol),
         "usd1Balance": selected_wallet.as_ref().and_then(|wallet| wallet.usd1Balance),
-        "providers": provider_availability_registry(),
-        "providerRegistry": provider_registry(),
-        "launchpads": launchpad_registry(),
+    }))
+}
+
+async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
+    let (runtime_workers, follow_daemon) = tokio::join!(
+        list_workers(&state.runtime),
+        follow_daemon_status_payload(),
+    );
+    json!({
+        "ok": true,
+        "service": "launchdeck-engine",
         "transport": {
             "heliusSenderEndpoint": configured_helius_sender_endpoint(),
             "jitoBundleEndpoints": configured_jito_bundle_endpoints(),
         },
+        "followDaemon": follow_daemon,
         "runtime": {
             "statePath": state.runtime.storage_path,
             "workerCount": runtime_workers.len(),
         },
         "runtimeWorkers": runtime_workers,
-    }))
+    })
+}
+
+fn build_region_routing_payload() -> Value {
+    json!({
+        "shared": {
+            "configured": configured_shared_region(),
+            "effective": default_endpoint_profile(),
+        },
+        "providers": {
+            "helius-sender": {
+                "configured": configured_provider_region("helius-sender"),
+                "effective": default_endpoint_profile_for_provider("helius-sender"),
+                "endpointOverrideActive": helius_sender_endpoint_override_active(),
+            },
+            "jito-bundle": {
+                "configured": configured_provider_region("jito-bundle"),
+                "effective": default_endpoint_profile_for_provider("jito-bundle"),
+                "endpointOverrideActive": jito_bundle_endpoint_override_active(),
+            }
+        },
+        "restartRequired": true,
+    })
 }
 
 async fn engine_status(
@@ -470,7 +868,7 @@ async fn engine_status(
     Json(payload): Json<StatusRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     authorize(&headers, &state)?;
-    build_status_payload(&state, &payload.wallet.unwrap_or_default())
+    build_status_payload(&state, &payload.wallet.unwrap_or_default(), true)
         .await
         .map(Json)
         .map_err(|error| {
@@ -577,7 +975,7 @@ async fn execute_engine_action_payload(
         )
     })?;
     let normalize_started_ms = current_time_ms();
-    let normalized = normalize_raw_config(parsed).map_err(|error| {
+    let mut normalized = normalize_raw_config(parsed).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -587,6 +985,7 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
+    let same_time_fee_guard_warning = apply_same_time_creation_fee_guard(&mut normalized);
     let normalize_config_ms = current_time_ms().saturating_sub(normalize_started_ms);
     log_event(
         "engine_action_received",
@@ -671,6 +1070,9 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
+        if let Some(warning) = same_time_fee_guard_warning.as_deref() {
+            append_execution_warning(&mut report_value, warning);
+        }
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report_value, "formToRawConfigMs", value);
         }
@@ -790,13 +1192,26 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let (compiled_transactions, mut report_value, text_value, assembly_executor, compile_breakdown) = (
+    let (
+        mut compiled_transactions,
+        mut report_value,
+        text_value,
+        assembly_executor,
+        compile_breakdown,
+        compiled_mint,
+        compiled_launch_creator,
+    ) = (
         native.compiled_transactions,
         native.report,
         Value::String(native.text),
         "rust-native".to_string(),
         native.compile_timings,
+        native.mint,
+        native.launch_creator,
     );
+    if let Some(warning) = same_time_fee_guard_warning.as_deref() {
+        append_execution_warning(&mut report_value, warning);
+    }
     set_report_timing(
         &mut report_value,
         "compileTransactionsMs",
@@ -979,16 +1394,9 @@ async fn execute_engine_action_payload(
 
     if action == "send" {
         let execution_class = transport_plan.executionClass.clone();
-        let (sent, warnings, send_timing) = send_transactions_for_transport(
-            &configured_rpc_url(),
-            &transport_plan,
-            &compiled_transactions,
-            &normalized.execution.commitment,
-            normalized.execution.skipPreflight,
-            normalized.execution.trackSendBlockHeight,
-        )
-        .await
-        .map_err(|error| {
+        let (same_time_snipes, deferred_follow_launch) = split_same_time_snipes(&normalized.followLaunch);
+        let same_time_retry_enabled = same_time_snipes.iter().any(|snipe| snipe.retryOnFailure);
+        let follow_daemon_transport = configured_follow_daemon_transport().map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -998,6 +1406,192 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
+        let follow_daemon_client = if deferred_follow_launch.enabled {
+            Some(FollowDaemonClient::new(&configured_follow_daemon_base_url()))
+        } else {
+            None
+        };
+        let mut reserved_follow_job: Option<FollowJobResponse> = None;
+        let mut armed_follow_job: Option<FollowJobResponse> = None;
+        let mut same_time_sniper_compile_ms = 0u128;
+        let mut same_time_independent_compiled: Vec<CompiledTransaction> = Vec::new();
+        let mut same_time_sent: Vec<crate::rpc::SentResult> = Vec::new();
+        let rpc_url = configured_rpc_url();
+        if let Some(client) = follow_daemon_client.as_ref() {
+            let ready = client
+                .ready(&FollowReadyRequest {
+                    followLaunch: deferred_follow_launch.clone(),
+                    execution: normalized.execution.clone(),
+                    watchEndpoint: transport_plan.watchEndpoint.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Follow daemon readiness check failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+            if !ready.ready {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": ready.reason.clone().unwrap_or_else(|| "Follow daemon is not ready.".to_string()),
+                        "traceId": trace.traceId,
+                        "followDaemon": ready,
+                    })),
+                ));
+            }
+            reserved_follow_job = Some(
+                client
+                    .reserve(&FollowReserveRequest {
+                        traceId: trace.traceId.clone(),
+                        launchpad: normalized.launchpad.clone(),
+                        selectedWalletKey: normalized.selectedWalletKey.clone(),
+                        followLaunch: deferred_follow_launch.clone(),
+                        execution: normalized.execution.clone(),
+                        tokenMayhemMode: normalized.token.mayhemMode,
+                        jitoTipAccount: normalized.tx.jitoTipAccount.clone(),
+                        preferPostSetupCreatorVaultForSell: matches!(
+                            normalized.mode.as_str(),
+                            "agent-custom" | "agent-locked"
+                        ),
+                    })
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("Follow daemon reservation failed: {error}"),
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?,
+            );
+        }
+        if !same_time_snipes.is_empty() {
+            let same_time_compile_started_ms = current_time_ms();
+            let same_time_compiled = compile_same_time_snipes(
+                &rpc_url,
+                &normalized,
+                &compiled_mint,
+                &compiled_launch_creator,
+                &same_time_snipes,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Same-time sniper compile failed: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+            same_time_sniper_compile_ms =
+                current_time_ms().saturating_sub(same_time_compile_started_ms);
+            if transport_plan.transportType == "jito-bundle" {
+                compiled_transactions.extend(same_time_compiled);
+            } else {
+                same_time_independent_compiled = same_time_compiled;
+            }
+        }
+        let submit_started_ms = current_time_ms();
+        let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled.is_empty() {
+            submit_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &compiled_transactions,
+                &normalized.execution.commitment,
+                normalized.execution.skipPreflight,
+                normalized.execution.trackSendBlockHeight,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": error,
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?
+        } else {
+            let launch_submit = submit_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &compiled_transactions,
+                &normalized.execution.commitment,
+                normalized.execution.skipPreflight,
+                normalized.execution.trackSendBlockHeight,
+            );
+            let same_time_submit = submit_independent_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &same_time_independent_compiled,
+                &normalized.execution.commitment,
+                normalized.execution.skipPreflight,
+                normalized.execution.trackSendBlockHeight,
+            );
+            let (launch_result, same_time_result) = tokio::join!(launch_submit, same_time_submit);
+            let (launch_sent, mut launch_warnings, _launch_submit_ms) =
+                launch_result.map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
+            match same_time_result {
+                Ok((sent, same_time_warnings, _same_time_submit_ms)) => {
+                    same_time_sent = sent;
+                    launch_warnings.extend(same_time_warnings);
+                }
+                Err(error) if same_time_retry_enabled => {
+                    launch_warnings.push(format!(
+                        "Same-time sniper submit failed; daemon retry is armed for one retry attempt: {error}"
+                    ));
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            }
+            (
+                launch_sent,
+                launch_warnings,
+                current_time_ms().saturating_sub(submit_started_ms),
+            )
+        };
+        let launch_signature = launch_sent
+            .first()
+            .and_then(|result| result.signature.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": "Launch submit completed without a signature, so follow actions cannot be armed safely.",
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
         let mut report = report_value;
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
@@ -1007,7 +1601,7 @@ async fn execute_engine_action_payload(
         set_report_timing(
             &mut report,
             "compileTransactionsMs",
-            compile_transactions_ms,
+            compile_transactions_ms.saturating_add(same_time_sniper_compile_ms),
         );
         set_report_timing(
             &mut report,
@@ -1034,23 +1628,19 @@ async fn execute_engine_action_payload(
             "compileTxSerializeMs",
             compile_breakdown.tx_serialize_ms,
         );
-        set_report_timing(
+        set_report_timing(&mut report, "sendMs", submit_ms);
+        set_report_timing(&mut report, "sendSubmitMs", submit_ms);
+        set_report_timing(&mut report, "sendConfirmMs", 0);
+        attach_follow_daemon_report(
             &mut report,
-            "sendMs",
-            send_timing.submit_ms.saturating_add(send_timing.confirm_ms),
+            if deferred_follow_launch.enabled {
+                Some(follow_daemon_transport.as_str())
+            } else {
+                None
+            },
+            reserved_follow_job.as_ref(),
+            None,
         );
-        set_report_timing(&mut report, "sendSubmitMs", send_timing.submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", send_timing.confirm_ms);
-        if let Some(execution) = report.get_mut("execution") {
-            execution["sent"] = serde_json::to_value(sent).unwrap_or(Value::Array(vec![]));
-            let mut existing_warnings = execution
-                .get("warnings")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            existing_warnings.extend(warnings.into_iter().map(Value::String));
-            execution["warnings"] = Value::Array(existing_warnings);
-        }
         let send_log_path = if should_persist_report {
             let persist_started_ms = current_time_ms();
             let path = persist_launch_report(&trace.traceId, &action, &transport_plan, &report)
@@ -1074,10 +1664,138 @@ async fn execute_engine_action_payload(
         } else {
             None
         };
+        if let Some(client) = follow_daemon_client.as_ref() {
+            armed_follow_job = Some(
+                client
+                .arm(&FollowArmRequest {
+                    traceId: trace.traceId.clone(),
+                    mint: compiled_mint.clone(),
+                    launchCreator: compiled_launch_creator.clone(),
+                    launchSignature: launch_signature,
+                    submitAtMs: current_time_ms(),
+                    sendObservedBlockHeight: launch_sent.first().and_then(|result| result.sendObservedBlockHeight),
+                    reportPath: send_log_path.clone(),
+                    transportPlan: transport_plan.clone(),
+                })
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Launch submitted but follow daemon arm failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?,
+            );
+            attach_follow_daemon_report(
+                &mut report,
+                Some(follow_daemon_transport.as_str()),
+                reserved_follow_job.as_ref(),
+                armed_follow_job.as_ref(),
+            );
+        }
+        let (mut confirm_warnings, mut confirm_ms) = match confirm_submitted_transactions_for_transport(
+            &rpc_url,
+            &transport_plan,
+            &mut launch_sent,
+            &normalized.execution.commitment,
+            normalized.execution.trackSendBlockHeight,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(client) = follow_daemon_client.as_ref() {
+                    let _ = client
+                        .cancel(&FollowCancelRequest {
+                            traceId: trace.traceId.clone(),
+                            actionId: None,
+                            note: Some(format!("Launch confirmation failed: {error}")),
+                        })
+                        .await;
+                }
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": error,
+                        "traceId": trace.traceId,
+                    })),
+                ));
+            }
+        };
+        if !same_time_sent.is_empty() {
+            match confirm_submitted_transactions_for_transport(
+                &rpc_url,
+                &transport_plan,
+                &mut same_time_sent,
+                &normalized.execution.commitment,
+                normalized.execution.trackSendBlockHeight,
+            )
+            .await
+            {
+                Ok((same_time_confirm_warnings, same_time_confirm_ms)) => {
+                    confirm_warnings.extend(same_time_confirm_warnings);
+                    confirm_ms = confirm_ms.saturating_add(same_time_confirm_ms);
+                }
+                Err(error) if same_time_retry_enabled => {
+                    confirm_warnings.push(format!(
+                        "Same-time sniper confirmation failed; daemon retry will attempt one fallback buy: {error}"
+                    ));
+                }
+                Err(error) => {
+                    if let Some(client) = follow_daemon_client.as_ref() {
+                        let _ = client
+                            .cancel(&FollowCancelRequest {
+                                traceId: trace.traceId.clone(),
+                                actionId: None,
+                                note: Some(format!("Same-time sniper confirmation failed: {error}")),
+                            })
+                            .await;
+                    }
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": error,
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            }
+        }
+        let mut sent = launch_sent;
+        sent.append(&mut same_time_sent);
+        warnings.extend(confirm_warnings);
+        set_report_timing(&mut report, "sendMs", submit_ms.saturating_add(confirm_ms));
+        set_report_timing(&mut report, "sendSubmitMs", submit_ms);
+        set_report_timing(&mut report, "sendConfirmMs", confirm_ms);
+        if let Some(execution) = report.get_mut("execution") {
+            execution["sent"] = serde_json::to_value(sent).unwrap_or(Value::Array(vec![]));
+            let mut existing_warnings = execution
+                .get("warnings")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            existing_warnings.extend(warnings.into_iter().map(Value::String));
+            execution["warnings"] = Value::Array(existing_warnings);
+        }
         set_report_timing(
             &mut report,
             "totalElapsedMs",
             current_time_ms().saturating_sub(action_started_ms),
+        );
+        attach_follow_daemon_report(
+            &mut report,
+            if deferred_follow_launch.enabled {
+                Some(follow_daemon_transport.as_str())
+            } else {
+                None
+            },
+            reserved_follow_job.as_ref(),
+            armed_follow_job.as_ref(),
         );
         refresh_report_benchmark(&mut report);
         if let Some(path) = send_log_path.as_ref() {
@@ -1126,6 +1844,13 @@ async fn execute_engine_action_payload(
             "assemblyExecutor": assembly_executor,
             "report": report,
             "sendLogPath": send_log_path,
+            "followDaemonTransport": if deferred_follow_launch.enabled {
+                Some(follow_daemon_transport)
+            } else {
+                None::<String>
+            },
+            "followDaemonReserved": reserved_follow_job,
+            "followDaemonArmed": armed_follow_job,
             "text": render_report_value(&report),
             "metadataUri": prepared_metadata_uri,
         }));
@@ -1176,6 +1901,7 @@ fn build_settings_payload() -> Value {
         "ok": true,
         "config": read_persistent_config(),
         "defaults": create_default_persistent_config(),
+        "regionRouting": build_region_routing_payload(),
         "strategies": strategy_registry(),
         "engine": {
             "backend": "rust",
@@ -1184,10 +1910,37 @@ fn build_settings_payload() -> Value {
     })
 }
 
+async fn api_bootstrap_fast(
+    Query(query): Query<StatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let requested_wallet = query.wallet.unwrap_or_default();
+    let mut payload = build_bootstrap_fast_payload(&requested_wallet, false).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    payload["backend"] = Value::String("rust".to_string());
+    payload["signerSource"] = Value::String(resolve_signer_source(
+        payload
+            .get("selectedWalletKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ));
+    Ok(Json(attach_timing(payload, started_at_ms)))
+}
+
 async fn api_bootstrap(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut payload = build_status_payload(&state, "").await.map_err(|error| {
+    let started_at_ms = current_time_ms();
+    let requested_wallet = query.wallet.unwrap_or_default();
+    let mut payload = build_status_payload(&state, &requested_wallet, false).await.map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -1204,7 +1957,7 @@ async fn api_bootstrap(
             .unwrap_or_default(),
     ));
     payload["config"] = read_persistent_config();
-    Ok(Json(payload))
+    Ok(Json(attach_timing(payload, started_at_ms)))
 }
 
 async fn api_lookup_tables_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -1242,12 +1995,45 @@ async fn api_pump_global_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)
     })))
 }
 
+async fn api_wallet_status(
+    Query(query): Query<StatusQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let wallet = query.wallet.unwrap_or_default();
+    let mut payload = build_wallet_status_payload(&wallet, true).await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        )
+    })?;
+    payload["backend"] = Value::String("rust".to_string());
+    payload["signerSource"] = Value::String(resolve_signer_source(
+        payload
+            .get("selectedWalletKey")
+            .and_then(Value::as_str)
+            .unwrap_or(wallet.as_str()),
+    ));
+    Ok(Json(attach_timing(payload, started_at_ms)))
+}
+
+async fn api_runtime_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let started_at_ms = current_time_ms();
+    Json(attach_timing(
+        build_runtime_status_payload(&state).await,
+        started_at_ms,
+    ))
+}
+
 async fn api_status(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let wallet = query.wallet.unwrap_or_default();
-    let mut payload = build_status_payload(&state, &wallet)
+    let mut payload = build_status_payload(&state, &wallet, true)
         .await
         .map_err(|error| {
             (
@@ -1266,7 +2052,7 @@ async fn api_status(
             .unwrap_or(wallet.as_str()),
     ));
     payload["config"] = read_persistent_config();
-    Ok(Json(payload))
+    Ok(Json(attach_timing(payload, started_at_ms)))
 }
 
 async fn api_run(
@@ -1323,7 +2109,9 @@ async fn api_run(
             set_report_timing(
                 report,
                 "totalElapsedMs",
-                backend_total_ms.unwrap_or_default().saturating_add(pre_request_ms),
+                backend_total_ms
+                    .unwrap_or_default()
+                    .saturating_add(pre_request_ms),
             );
             set_report_timing(report, "clientPreRequestMs", pre_request_ms);
         }
@@ -1361,24 +2149,27 @@ async fn api_run(
 
 async fn api_engine_health() -> Json<Value> {
     let engine = health().await;
+    let follow_daemon = follow_daemon_status_payload().await;
     Json(json!({
         "ok": true,
         "backend": "rust",
         "url": configured_base_url(),
         "engine": engine.0,
+        "followDaemon": follow_daemon,
     }))
 }
 
 async fn api_quote(
     Query(query): Query<QuoteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let mode = query.mode.unwrap_or_default();
     let amount = query.amount.unwrap_or_default();
     if mode.trim().is_empty() || amount.trim().is_empty() {
-        return Ok(Json(json!({
+        return Ok(Json(attach_timing(json!({
             "ok": true,
             "quote": Value::Null,
-        })));
+        }), started_at_ms)));
     }
     let quote = quote_from_form(
         &configured_rpc_url(),
@@ -1394,19 +2185,21 @@ async fn api_quote(
             })),
         )
     })?;
-    Ok(Json(json!({
+    Ok(Json(attach_timing(json!({
         "ok": true,
         "quote": quote,
-    })))
+    }), started_at_ms)))
 }
 
 async fn api_settings_get() -> Json<Value> {
-    Json(build_settings_payload())
+    let started_at_ms = current_time_ms();
+    Json(attach_timing(build_settings_payload(), started_at_ms))
 }
 
 async fn api_settings_save(
     Json(payload): Json<SettingsSaveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let config = payload
         .config
         .unwrap_or_else(create_default_persistent_config);
@@ -1421,10 +2214,11 @@ async fn api_settings_save(
     })?;
     let mut response = build_settings_payload();
     response["savedPath"] = Value::String(saved_path);
-    Ok(Json(response))
+    Ok(Json(attach_timing(response, started_at_ms)))
 }
 
 async fn api_reports_list(Query(query): Query<ReportsQuery>) -> Json<Value> {
+    let started_at_ms = current_time_ms();
     let sort = if query
         .sort
         .unwrap_or_else(|| "newest".to_string())
@@ -1435,18 +2229,19 @@ async fn api_reports_list(Query(query): Query<ReportsQuery>) -> Json<Value> {
     } else {
         "newest"
     };
-    Json(json!({
+    Json(attach_timing(json!({
         "ok": true,
         "sort": sort,
         "reports": list_persisted_reports(sort),
-    }))
+    }), started_at_ms))
 }
 
 async fn api_reports_view(
     Query(query): Query<ReportViewQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let id = query.id.unwrap_or_default();
-    let (entry, text) = read_persisted_report(&id).map_err(|error| {
+    let (entry, text, payload) = read_persisted_report_bundle(&id).map_err(|error| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1455,21 +2250,71 @@ async fn api_reports_view(
             })),
         )
     })?;
-    Ok(Json(json!({
+    Ok(Json(attach_timing(json!({
         "ok": true,
         "entry": entry,
         "text": text,
-    })))
+        "payload": payload,
+    }), started_at_ms)))
 }
 
 async fn api_upload_image(
-    Json(payload): Json<UploadImageRequest>,
+    mut multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let record = save_data_url_image(
-        payload.dataUrl.as_deref().unwrap_or_default(),
-        payload.filename.as_deref().unwrap_or("image"),
-    )
-    .map_err(|error| {
+    let started_at_ms = current_time_ms();
+    let mut bytes = Vec::new();
+    let mut filename = "image".to_string();
+    let mut content_type = String::new();
+    while let Some(field) = multipart.next_field().await.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string(),
+            })),
+        )
+    })? {
+        if field.name().unwrap_or_default() != "file" {
+            continue;
+        }
+        filename = field.file_name().unwrap_or("image").to_string();
+        content_type = field.content_type().unwrap_or_default().to_string();
+        bytes = field.bytes().await.map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                })),
+            )
+        })?.to_vec();
+        break;
+    }
+    if bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Image file is required.",
+            })),
+        ));
+    }
+    let extension = match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "Only png, jpg, webp, and gif images are supported.",
+                })),
+            ))
+        }
+    };
+    let record = save_image_bytes(&bytes, extension, &filename, None).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -1478,7 +2323,7 @@ async fn api_upload_image(
             })),
         )
     })?;
-    Ok(Json(json!({
+    Ok(Json(attach_timing(json!({
         "ok": true,
         "id": record.id,
         "fileName": record.fileName,
@@ -1489,12 +2334,13 @@ async fn api_upload_image(
         "createdAt": record.createdAt,
         "updatedAt": record.updatedAt,
         "previewUrl": record.previewUrl,
-    })))
+    }), started_at_ms)))
 }
 
 async fn api_metadata_upload(
     Json(payload): Json<MetadataUploadRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let form = payload.form.unwrap_or(Value::Null);
     let metadata_uri = upload_metadata_from_form(form).await.map_err(|error| {
         (
@@ -1505,15 +2351,16 @@ async fn api_metadata_upload(
             })),
         )
     })?;
-    Ok(Json(json!({
+    Ok(Json(attach_timing(json!({
         "ok": true,
         "metadataUri": metadata_uri,
-    })))
+    }), started_at_ms)))
 }
 
 async fn api_images_list(
     Query(query): Query<ImagesQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
     let payload = build_image_library_payload(
         query.search.as_deref().unwrap_or_default(),
         query.category.as_deref().unwrap_or_default(),
@@ -1532,9 +2379,10 @@ async fn api_images_list(
             })),
         )
     })?;
-    Ok(Json(
+    Ok(Json(attach_timing(
         serde_json::to_value(payload).unwrap_or(json!({"ok": false})),
-    ))
+        started_at_ms,
+    )))
 }
 
 async fn api_image_update(
@@ -1836,7 +2684,9 @@ async fn main() {
         auth_token: configured_auth_token(),
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
     });
-    spawn_blockhash_refresh_task(rpc_url, "confirmed");
+    spawn_blockhash_refresh_task(rpc_url.clone(), "processed");
+    spawn_blockhash_refresh_task(rpc_url.clone(), "confirmed");
+    spawn_blockhash_refresh_task(rpc_url, "finalized");
     let restored_workers = restore_workers(&state.runtime).await;
     let app = Router::new()
         .route("/health", get(health))
@@ -1848,9 +2698,12 @@ async fn main() {
             "/index.html",
             get(|| async { file_response(paths::ui_dir().join("index.html")) }),
         )
+        .route("/api/bootstrap-fast", get(api_bootstrap_fast))
         .route("/api/bootstrap", get(api_bootstrap))
         .route("/api/lookup-tables/warm", post(api_lookup_tables_warm))
         .route("/api/pump-global/warm", post(api_pump_global_warm))
+        .route("/api/wallet-status", get(api_wallet_status))
+        .route("/api/runtime-status", get(api_runtime_status))
         .route("/api/status", get(api_status))
         .route("/api/run", post(api_run))
         .route("/api/engine/health", get(api_engine_health))

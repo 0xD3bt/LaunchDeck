@@ -1,6 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     config::{NormalizedConfig, NormalizedRecipient},
@@ -124,7 +125,6 @@ pub struct ExecutionSummary {
     pub resolvedProvider: String,
     pub endpointProfile: String,
     pub resolvedEndpointProfile: String,
-    pub policy: String,
     pub executionClass: String,
     pub transportType: String,
     pub ordering: String,
@@ -133,10 +133,8 @@ pub struct ExecutionSummary {
     pub activePresetId: String,
     pub buyProvider: String,
     pub buyEndpointProfile: String,
-    pub buyPolicy: String,
     pub sellProvider: String,
     pub sellEndpointProfile: String,
-    pub sellPolicy: String,
     pub buyAutoGas: bool,
     pub buyAutoMode: String,
     pub requestedSummary: String,
@@ -178,6 +176,8 @@ pub struct LaunchReport {
     pub bundleJitoTip: bool,
     pub transactions: Vec<TransactionSummary>,
     pub execution: ExecutionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followDaemon: Option<Value>,
     #[serde(default)]
     pub benchmark: Option<BenchmarkSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -474,7 +474,6 @@ pub fn build_report(
             resolvedProvider: transport_plan.resolvedProvider.clone(),
             endpointProfile: config.execution.endpointProfile.clone(),
             resolvedEndpointProfile: transport_plan.resolvedEndpointProfile.clone(),
-            policy: config.execution.policy.clone(),
             executionClass: transport_plan.executionClass.clone(),
             transportType: transport_plan.transportType.clone(),
             ordering: transport_plan.ordering.clone(),
@@ -483,10 +482,8 @@ pub fn build_report(
             activePresetId: config.presets.activePresetId.clone(),
             buyProvider: config.execution.buyProvider.clone(),
             buyEndpointProfile: config.execution.buyEndpointProfile.clone(),
-            buyPolicy: config.execution.buyPolicy.clone(),
             sellProvider: config.execution.sellProvider.clone(),
             sellEndpointProfile: config.execution.sellEndpointProfile.clone(),
-            sellPolicy: config.execution.sellPolicy.clone(),
             buyAutoGas: config.execution.buyAutoGas,
             buyAutoMode: config.execution.buyAutoMode.clone(),
             requestedSummary: requested_summary(config, transport_plan),
@@ -504,6 +501,7 @@ pub fn build_report(
             sent: vec![],
             warnings,
         },
+        followDaemon: None,
         benchmark: None,
         outPath: None,
     }
@@ -543,8 +541,8 @@ pub fn render_report(report: &LaunchReport) -> String {
     }
     lines.push(format!("Launchpad: {}", report.launchpad));
     lines.push(format!(
-        "Provider: {} ({})",
-        report.execution.resolvedProvider, report.execution.policy
+        "Provider: {}",
+        report.execution.resolvedProvider
     ));
     if !report.execution.resolvedEndpointProfile.is_empty() {
         lines.push(format!(
@@ -573,6 +571,109 @@ pub fn render_report(report: &LaunchReport) -> String {
         lines.push("Jito tip handling: separate bundled tip transaction".to_string());
     }
     lines.push(format!("Execution: {}", report.execution.requestedSummary));
+    if let Some(follow) = report.followDaemon.as_ref().and_then(Value::as_object) {
+        let enabled = follow
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            lines.push("Follow daemon:".to_string());
+            lines.push(
+                "  Advisory only: timing suggestions do not change configured follow settings."
+                    .to_string(),
+            );
+            if let Some(transport) = follow.get("transport").and_then(Value::as_str)
+                && !transport.is_empty()
+            {
+                lines.push(format!("  Transport: {transport}"));
+            }
+            if let Some(job) = follow.get("job").and_then(Value::as_object) {
+                if let Some(state) = job.get("state").and_then(Value::as_str) {
+                    lines.push(format!("  Job state: {state}"));
+                }
+                if let Some(actions) = job.get("actions").and_then(Value::as_array) {
+                    let confirmed = actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .is_some_and(|state| state == "confirmed")
+                        })
+                        .count();
+                    let problems = actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .is_some_and(|state| {
+                                    matches!(state, "failed" | "cancelled" | "expired")
+                                })
+                        })
+                        .count();
+                    lines.push(format!(
+                        "  Actions: {} total | {} confirmed | {} problem",
+                        actions.len(),
+                        confirmed,
+                        problems
+                    ));
+                }
+            }
+            if let Some(profiles) = follow.get("timingProfiles").and_then(Value::as_array)
+                && !profiles.is_empty()
+            {
+                lines.push("  Timing advice:".to_string());
+                for profile in profiles {
+                    let action_type = profile
+                        .get("actionType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let sample_count = profile
+                        .get("sampleCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let weighted_quality_score = profile
+                        .get("weightedQualityScore")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let recommendation = profile
+                        .get("recommendation")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let confidence = recommendation
+                        .get("confidence")
+                        .and_then(Value::as_str)
+                        .unwrap_or("low");
+                    let success_rate = recommendation
+                        .get("successRate")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let suggested_delay = recommendation
+                        .get("suggestedSubmitDelayMs")
+                        .and_then(Value::as_u64);
+                    let suggested_jitter = recommendation
+                        .get("suggestedJitterMs")
+                        .and_then(Value::as_u64);
+                    let mut summary = format!(
+                        "  - {}: samples={} | confidence={} | success={:.0}% | quality={:.1}",
+                        action_type,
+                        sample_count,
+                        confidence,
+                        success_rate * 100.0,
+                        weighted_quality_score
+                    );
+                    if let Some(delay) = suggested_delay {
+                        summary.push_str(&format!(" | suggest delay={}ms", delay));
+                    }
+                    if let Some(jitter) = suggested_jitter {
+                        summary.push_str(&format!(" | suggest jitter={}ms", jitter));
+                    }
+                    lines.push(summary);
+                }
+            }
+        }
+    }
     if let Some(benchmark) = &report.benchmark {
         lines.push("Benchmark:".to_string());
         let timings = &benchmark.timings;

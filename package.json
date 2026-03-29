@@ -12,7 +12,9 @@
     "engine:test": "cargo test --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "engine:bench": "node ./scripts/engine-benchmark.js",
     "ui": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml",
-    "bot": "powershell -ExecutionPolicy Bypass -File ./start-bot.ps1",
+    "start": "powershell -ExecutionPolicy Bypass -File ./start.ps1",
+    "stop": "powershell -ExecutionPolicy Bypass -File ./stop.ps1",
+    "restart": "powershell -ExecutionPolicy Bypass -File ./start.ps1",
     "analyze": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- analyze-launch",
     "trace-agent": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- trace-agent-account"
   },

@@ -20,18 +20,26 @@ LaunchDeck is built for anyone who wants to:
 
 ## Current Runtime Model
 
-LaunchDeck now runs as a Rust-only local host.
+LaunchDeck now runs as two local Rust processes:
 
-The Rust backend serves:
+- Rust host on the UI/API port
+- follow daemon on the follow-daemon port
+
+The Rust host serves:
 
 - the browser UI static files
 - browser-facing `/api/*` routes
 - engine `/engine/*` routes
 - local uploads under `/uploads/*`
 
-The current verified native launch runtime is still centered on `pump`, but the UI host, settings persistence, image library, reports browser, and vamp import flow now also live in Rust.
+The follow daemon manages launch-follow actions, realtime watchers, follow telemetry, and persisted timing profiles.
 
-The default local entrypoint is `http://127.0.0.1:8789`.
+The current initial active launch runtime is `pump` only, but the UI host, settings persistence, image library, reports browser, vamp import flow, and follow-daemon control plane now also live in Rust.
+
+Default local entrypoints:
+
+- UI host: `http://127.0.0.1:8789`
+- follow daemon: `http://127.0.0.1:8790`
 
 ## Current Pump Coverage
 
@@ -45,18 +53,26 @@ The Rust-native Pump path currently covers:
 
 Pump launch assembly, transaction shaping, reporting, simulation, and send execution now run through the Rust engine rather than the legacy JS compile bridge for these verified launch shapes.
 
+Bonk and Bagsapp should not currently be treated as active launch flows in the initial version.
+
 ## Run Locally
 
 Primary local entrypoints:
 
-- `npm run bot`
+- `npm start`
+- `npm stop`
+- `npm restart`
 - `npm run ui`
 
-`npm run bot` uses `start-bot.ps1` to launch the Rust host and open the local UI.
+`npm start` uses `start.ps1` to stop any existing LaunchDeck engine or follow-daemon processes, start both, wait for health, and open the local UI.
+
+`npm stop` uses `stop.ps1` to stop any running LaunchDeck engine or follow-daemon processes, including stale listeners on the configured local ports.
+
+`npm restart` performs the same clean recycle explicitly.
 
 `npm run ui` starts the Rust host directly without the helper script.
 
-The host uses `LAUNCHDECK_PORT` as the primary local port. `LAUNCHDECK_ENGINE_PORT` is only kept as a legacy fallback for migration compatibility.
+The host uses `LAUNCHDECK_PORT` as the local UI/API port.
 
 The send layer now exposes explicit provider choices:
 
@@ -98,6 +114,26 @@ Examples:
 - `Helius Sender` hard-forces Sender-compatible send flags.
 - `Jito Bundle` creation can accept both tip and priority in the UI, but the engine may intentionally drop creation priority for multi-transaction launch flows where it would only waste money.
 
+## Follow Launch System
+
+LaunchDeck now supports a dedicated follow-launch system for launch-adjacent actions.
+
+Current follow behavior includes:
+
+- same-time sniper buys compiled alongside launch creation
+- daemon-executed sniper buys using `On Submit + Delay`
+- daemon-executed sniper buys using `Block Offset`
+- automatic dev sell execution
+- sniper sell follow actions
+- inline same-time fee safeguard warnings
+- optional one-time same-time retry through the daemon
+
+Current timing modes:
+
+- `Same Time`: submit alongside launch creation
+- `On Submit + Delay`: schedule from observed launch submit time
+- `Block Offset`: send when the configured launch-relative block is observed
+
 ## Reporting
 
 LaunchDeck now writes richer execution reports that capture:
@@ -122,6 +158,14 @@ The benchmark output now includes both end-to-end and backend-only timings:
 
 This makes metadata wait, compile latency, and chain confirmation time visible separately in both the main output and persisted reports.
 
+Follow reports now also include:
+
+- persisted follow-job state
+- action-level outcomes for sniper buys and follow sells
+- watcher health
+- follow telemetry samples
+- timing profiles such as `P50 Submit`, `P75 Submit`, and `P90 Submit`
+
 ## Launch Optimizations
 
 Recent Pump-focused optimizations in the Rust runtime include:
@@ -131,6 +175,9 @@ Recent Pump-focused optimizations in the Rust runtime include:
 - local lookup-table persistence and warm-up on page load
 - background blockhash refresh with cache age limits
 - cached Pump global state for dev-buy quoting and compile-time launch assembly
+- arm-time warm-up for delayed follow-buy state
+- split delayed-buy prepare/finalize flow in the follow daemon
+- concurrent same-time sniper compile and non-bundle submit paths
 - immediate metadata pre-upload from the UI once image, name, and ticker are present
 - configurable metadata upload provider:
   - `pump-fun` remains the default
@@ -159,6 +206,8 @@ The Rust host preserves the existing local storage layout under `.local/launchde
 
 This keeps existing UI settings, uploaded images, and persisted reports compatible through the Rust-only cutover.
 
+Follow-daemon state and telemetry are also persisted under the same local runtime area.
+
 ## Docs
 
 - `docs/ARCHITECTURE.md`
@@ -166,4 +215,6 @@ This keeps existing UI settings, uploaded images, and persisted reports compatib
 - `docs/CONFIG.md`
 - `docs/LAUNCHPADS.md`
 - `docs/STRATEGIES.md`
+- `docs/FOLLOW_DAEMON.md`
+- `docs/FRONTEND_REGRESSION_CHECKLIST.md`
 - `docs/EXECUTION_PROVIDER_PLAN.md`

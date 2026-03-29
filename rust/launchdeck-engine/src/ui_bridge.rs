@@ -3,7 +3,9 @@
 use crate::{
     config::{
         RawAgent, RawAutomaticDevSell, RawConfig, RawCreatorFee, RawExecution, RawFeeSharing,
-        RawPostLaunch, RawPresets, RawRecipient, RawSnipeOwnLaunch, RawToken, RawTx,
+        RawFollowLaunch, RawFollowLaunchConstraints, RawFollowLaunchMarketCapTrigger,
+        RawFollowLaunchSell, RawFollowLaunchSnipe, RawPostLaunch, RawPresets, RawRecipient,
+        RawSnipeOwnLaunch, RawToken, RawTx,
     },
     paths,
     pump_native::{LaunchQuote, quote_launch},
@@ -14,8 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    env,
-    fs,
+    env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -57,22 +58,15 @@ fn parse_metadata_upload_provider(value: &str) -> Result<MetadataUploadProvider,
 }
 
 fn configured_metadata_upload_provider() -> Result<MetadataUploadProvider, String> {
-    let configured = env::var("LAUNCHDECK_METADATA_UPLOAD_PROVIDER")
-        .or_else(|_| env::var("LAUNCHDECK_METADATA_PROVIDER"))
-        .unwrap_or_default();
+    let configured = env::var("LAUNCHDECK_METADATA_UPLOAD_PROVIDER").unwrap_or_default();
     parse_metadata_upload_provider(&configured)
 }
 
 fn configured_pinata_jwt() -> Result<String, String> {
-    let jwt = env::var("PINATA_JWT")
-        .or_else(|_| env::var("LAUNCHDECK_PINATA_JWT"))
-        .unwrap_or_default();
+    let jwt = env::var("PINATA_JWT").unwrap_or_default();
     let trimmed = jwt.trim();
     if trimmed.is_empty() {
-        Err(
-            "PINATA_JWT (or LAUNCHDECK_PINATA_JWT) is required when metadata upload provider is pinata."
-                .to_string(),
-        )
+        Err("PINATA_JWT is required when metadata upload provider is pinata.".to_string())
     } else {
         Ok(trimmed.to_string())
     }
@@ -132,19 +126,11 @@ pub struct UiForm {
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
-    pub endpointProfile: String,
-    #[serde(default)]
-    pub policy: String,
-    #[serde(default)]
     pub priorityFeeSol: String,
     #[serde(default)]
     pub creationTipSol: String,
     #[serde(default)]
     pub buyProvider: String,
-    #[serde(default)]
-    pub buyEndpointProfile: String,
-    #[serde(default)]
-    pub buyPolicy: String,
     #[serde(default)]
     pub buyPriorityFeeSol: String,
     #[serde(default)]
@@ -153,10 +139,6 @@ pub struct UiForm {
     pub buySlippagePercent: String,
     #[serde(default)]
     pub sellProvider: String,
-    #[serde(default)]
-    pub sellEndpointProfile: String,
-    #[serde(default)]
-    pub sellPolicy: String,
     #[serde(default)]
     pub sellPriorityFeeSol: String,
     #[serde(default)]
@@ -176,11 +158,21 @@ pub struct UiForm {
     #[serde(default)]
     pub snipeBuyAmountSol: String,
     #[serde(default)]
+    pub sniperEnabled: bool,
+    #[serde(default)]
+    pub sniperWallets: Vec<UiSniperWalletInput>,
+    #[serde(default)]
+    pub followLaunch: UiFollowLaunch,
+    #[serde(default)]
     pub automaticDevSellEnabled: bool,
     #[serde(default)]
     pub automaticDevSellPercent: String,
     #[serde(default)]
-    pub automaticDevSellDelaySeconds: String,
+    pub automaticDevSellTriggerMode: String,
+    #[serde(default)]
+    pub automaticDevSellDelayMs: String,
+    #[serde(default)]
+    pub automaticDevSellBlockOffset: String,
     #[serde(default)]
     pub imageFileName: String,
 }
@@ -197,6 +189,62 @@ pub struct UiRecipientInput {
     pub githubUserId: String,
     #[serde(default)]
     pub shareBps: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct UiSniperWalletInput {
+    #[serde(default)]
+    pub envKey: String,
+    #[serde(default)]
+    pub amountSol: String,
+    #[serde(default)]
+    pub triggerMode: String,
+    #[serde(default)]
+    pub submitDelayMs: Option<i64>,
+    #[serde(default)]
+    pub targetBlockOffset: Option<i64>,
+    #[serde(default)]
+    pub retryOnce: bool,
+    #[serde(default)]
+    pub jitterMs: Option<i64>,
+    #[serde(default)]
+    pub feeJitterBps: Option<i64>,
+    #[serde(default)]
+    pub sellPercent: Option<i64>,
+    #[serde(default)]
+    pub sellDelayMs: Option<i64>,
+    #[serde(default)]
+    pub sellMarketCapThreshold: String,
+    #[serde(default)]
+    pub sellMarketCapDirection: String,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct UiFollowLaunch {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub snipes: Vec<UiSniperWalletInput>,
+    #[serde(default)]
+    pub devAutoSell: UiFollowLaunchSell,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct UiFollowLaunchSell {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub percent: String,
+    #[serde(default)]
+    pub triggerMode: String,
+    #[serde(default)]
+    pub delayMs: String,
+    #[serde(default)]
+    pub targetBlockOffset: String,
+    #[serde(default)]
+    pub marketCapThreshold: String,
+    #[serde(default)]
+    pub marketCapDirection: String,
 }
 
 fn uploads_dir() -> std::path::PathBuf {
@@ -473,7 +521,10 @@ fn uploaded_image_details(config: &RawConfig) -> Result<(String, PathBuf), Strin
 fn build_launch_metadata_json(config: &RawConfig, image_uri: &str) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("name".to_string(), Value::String(config.token.name.clone()));
-    payload.insert("symbol".to_string(), Value::String(config.token.symbol.clone()));
+    payload.insert(
+        "symbol".to_string(),
+        Value::String(config.token.symbol.clone()),
+    );
     payload.insert(
         "description".to_string(),
         Value::String(config.token.description.clone()),
@@ -580,7 +631,10 @@ async fn upload_image_to_pinata(
         .json()
         .await
         .map_err(|error| format!("Failed to parse Pinata image upload response: {error}"))?;
-    let image_uri = format!("ipfs://{}", pinata_cid(&image_payload, "Pinata image upload")?);
+    let image_uri = format!(
+        "ipfs://{}",
+        pinata_cid(&image_payload, "Pinata image upload")?
+    );
     store_pinata_image_uri(image_cache_key, &image_uri);
     Ok(image_uri)
 }
@@ -753,35 +807,21 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         form.launchpad.trim().to_lowercase()
     };
     let provider = sanitize_provider(&form.provider);
-    let endpoint_profile = if provider == "standard-rpc" {
-        String::new()
-    } else {
-        form.endpointProfile.trim().to_lowercase()
-    };
+    let endpoint_profile = String::new();
     let buy_provider = sanitize_provider(if form.buyProvider.trim().is_empty() {
         &provider
     } else {
         &form.buyProvider
     });
-    let buy_endpoint_profile = if buy_provider == "standard-rpc" {
-        String::new()
-    } else if form.buyEndpointProfile.trim().is_empty() {
-        endpoint_profile.clone()
-    } else {
-        form.buyEndpointProfile.trim().to_lowercase()
-    };
+    let buy_endpoint_profile = String::new();
     let sell_provider = sanitize_provider(if form.sellProvider.trim().is_empty() {
         &provider
     } else {
         &form.sellProvider
     });
-    let sell_endpoint_profile = if sell_provider == "standard-rpc" {
-        String::new()
-    } else if form.sellEndpointProfile.trim().is_empty() {
-        endpoint_profile.clone()
-    } else {
-        form.sellEndpointProfile.trim().to_lowercase()
-    };
+    let sell_endpoint_profile = String::new();
+    let buy_tip_supported = tip_supported(&buy_provider);
+    let sell_tip_supported = tip_supported(&sell_provider);
     let priority_fee_lamports =
         parse_decimal_to_u64(&form.priorityFeeSol, 9, "creation priority fee")?;
     let tip_lamports = if tip_supported(&provider) {
@@ -827,6 +867,100 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         .to_string();
     let selected_wallet_key =
         selected_wallet_key_or_default(&form.selectedWalletKey).unwrap_or_default();
+    let follow_snipes = if !form.followLaunch.snipes.is_empty() {
+        form.followLaunch.snipes.clone()
+    } else {
+        form.sniperWallets.clone()
+    };
+    let follow_launch_snipes = follow_snipes
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.envKey.trim().is_empty() && !entry.amountSol.trim().is_empty())
+        .map(|(index, entry)| RawFollowLaunchSnipe {
+            actionId: format!("snipe-{}-buy", index + 1),
+            enabled: Some(json!(true)),
+            walletEnvKey: entry.envKey.trim().to_string(),
+            buyAmountSol: entry.amountSol.trim().to_string(),
+            submitWithLaunch: Some(json!(entry.triggerMode.trim().eq_ignore_ascii_case("same-time"))),
+            retryOnFailure: Some(json!(entry.retryOnce)),
+            submitDelayMs: if entry.triggerMode.trim().eq_ignore_ascii_case("submit-delay") {
+                entry.submitDelayMs.map(|value| json!(value.max(0)))
+            } else {
+                Some(json!(0))
+            },
+            targetBlockOffset: if entry.triggerMode.trim().eq_ignore_ascii_case("block-offset") {
+                entry.targetBlockOffset.map(|value| json!(value.max(0)))
+            } else {
+                None
+            },
+            jitterMs: entry.jitterMs.map(|value| json!(value.max(0))),
+            feeJitterBps: entry.feeJitterBps.map(|value| json!(value.max(0))),
+            postBuySell: if entry.sellPercent.unwrap_or(0) > 0
+                || entry.sellDelayMs.unwrap_or(0) > 0
+                || !entry.sellMarketCapThreshold.trim().is_empty()
+            {
+                Some(RawFollowLaunchSell {
+                    actionId: format!("snipe-{}-sell", index + 1),
+                    enabled: Some(json!(true)),
+                    walletEnvKey: entry.envKey.trim().to_string(),
+                    percent: entry.sellPercent.map(|value| json!(value.max(0))),
+                    delayMs: entry.sellDelayMs.map(|value| json!(value.max(0))),
+                    targetBlockOffset: None,
+                    marketCap: RawFollowLaunchMarketCapTrigger {
+                        enabled: Some(json!(!entry.sellMarketCapThreshold.trim().is_empty())),
+                        direction: if entry.sellMarketCapDirection.trim().is_empty() {
+                            "gte".to_string()
+                        } else {
+                            entry.sellMarketCapDirection.trim().to_string()
+                        },
+                        threshold: entry.sellMarketCapThreshold.trim().to_string(),
+                    },
+                    precheckRequired: Some(json!(false)),
+                    requireConfirmation: Some(json!(true)),
+                })
+            } else {
+                None
+            },
+        })
+        .collect::<Vec<_>>();
+    let dev_auto_sell_percent = if !form.followLaunch.devAutoSell.percent.trim().is_empty() {
+        form.followLaunch.devAutoSell.percent.trim().to_string()
+    } else {
+        form.automaticDevSellPercent.trim().to_string()
+    };
+    let dev_auto_sell_trigger_mode = if !form.followLaunch.devAutoSell.triggerMode.trim().is_empty() {
+        form.followLaunch.devAutoSell.triggerMode.trim().to_string()
+    } else if !form.automaticDevSellTriggerMode.trim().is_empty() {
+        form.automaticDevSellTriggerMode.trim().to_string()
+    } else {
+        "confirmation".to_string()
+    };
+    let dev_auto_sell_delay_ms = if !form.followLaunch.devAutoSell.delayMs.trim().is_empty() {
+        form.followLaunch.devAutoSell.delayMs.trim().to_string()
+    } else {
+        form.automaticDevSellDelayMs.trim().to_string()
+    };
+    let dev_auto_sell_block_offset = if !form.followLaunch.devAutoSell.targetBlockOffset.trim().is_empty() {
+        form.followLaunch.devAutoSell.targetBlockOffset.trim().to_string()
+    } else {
+        form.automaticDevSellBlockOffset.trim().to_string()
+    };
+    let dev_auto_sell_require_confirmation = dev_auto_sell_trigger_mode == "confirmation";
+    let dev_auto_sell_target_block_offset = if dev_auto_sell_trigger_mode == "block-offset" {
+        dev_auto_sell_block_offset.clone()
+    } else {
+        String::new()
+    };
+    let dev_auto_sell_delay_ms = if dev_auto_sell_trigger_mode == "submit-delay" {
+        dev_auto_sell_delay_ms
+    } else {
+        String::new()
+    };
+    let follow_launch_enabled = form.followLaunch.enabled
+        || form.sniperEnabled
+        || !follow_launch_snipes.is_empty()
+        || form.automaticDevSellEnabled
+        || form.followLaunch.devAutoSell.enabled;
     Ok(RawConfig {
         mode: mode.clone(),
         launchpad,
@@ -904,11 +1038,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             trackSendBlockHeight: Some(json!(form.trackSendBlockHeight)),
             provider: provider.clone(),
             endpointProfile: endpoint_profile.clone(),
-            policy: if form.policy.trim().is_empty() {
-                "safe".to_string()
-            } else {
-                form.policy.trim().to_string()
-            },
+            policy: String::new(),
             autoGas: Some(json!(true)),
             autoMode: "launchAuto".to_string(),
             priorityFeeSol: form.priorityFeeSol.trim().to_string(),
@@ -925,35 +1055,27 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             },
             buyProvider: buy_provider,
             buyEndpointProfile: buy_endpoint_profile,
-            buyPolicy: if form.buyPolicy.trim().is_empty() {
-                "safe".to_string()
-            } else {
-                form.buyPolicy.trim().to_string()
-            },
+            buyPolicy: String::new(),
             buyAutoGas: Some(json!(true)),
             buyAutoMode: "buyAuto".to_string(),
             buyPriorityFeeSol: form.buyPriorityFeeSol.trim().to_string(),
-            buyTipSol: if tip_supported(&provider) {
+            buyTipSol: if buy_tip_supported {
                 form.buyTipSol.trim().to_string()
             } else {
                 String::new()
             },
             buySlippagePercent: form.buySlippagePercent.trim().to_string(),
             buyMaxPriorityFeeSol: form.buyPriorityFeeSol.trim().to_string(),
-            buyMaxTipSol: if tip_supported(&provider) {
+            buyMaxTipSol: if buy_tip_supported {
                 form.buyTipSol.trim().to_string()
             } else {
                 String::new()
             },
             sellProvider: sell_provider,
             sellEndpointProfile: sell_endpoint_profile,
-            sellPolicy: if form.sellPolicy.trim().is_empty() {
-                "safe".to_string()
-            } else {
-                form.sellPolicy.trim().to_string()
-            },
+            sellPolicy: String::new(),
             sellPriorityFeeSol: form.sellPriorityFeeSol.trim().to_string(),
-            sellTipSol: if tip_supported(&provider) {
+            sellTipSol: if sell_tip_supported {
                 form.sellTipSol.trim().to_string()
             } else {
                 String::new()
@@ -979,7 +1101,66 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             automaticDevSell: RawAutomaticDevSell {
                 enabled: Some(json!(form.automaticDevSellEnabled)),
                 percent: Some(json!(form.automaticDevSellPercent.trim())),
-                delaySeconds: Some(json!(form.automaticDevSellDelaySeconds.trim())),
+                delaySeconds: Some(json!("0")),
+            },
+        },
+        followLaunch: RawFollowLaunch {
+            enabled: Some(json!(follow_launch_enabled)),
+            schemaVersion: Some(json!(1)),
+            snipes: follow_launch_snipes,
+            devAutoSell: if form.followLaunch.devAutoSell.enabled
+                || form.automaticDevSellEnabled
+                || !dev_auto_sell_percent.trim().is_empty()
+            {
+                Some(RawFollowLaunchSell {
+                    actionId: "dev-auto-sell".to_string(),
+                    enabled: Some(json!(true)),
+                    walletEnvKey: selected_wallet_key.clone(),
+                    percent: Some(json!(dev_auto_sell_percent)),
+                    delayMs: Some(json!(dev_auto_sell_delay_ms)),
+                    targetBlockOffset: Some(json!(dev_auto_sell_target_block_offset)),
+                    marketCap: RawFollowLaunchMarketCapTrigger {
+                        enabled: Some(json!(
+                            !form
+                                .followLaunch
+                                .devAutoSell
+                                .marketCapThreshold
+                                .trim()
+                                .is_empty()
+                        )),
+                        direction: if form
+                            .followLaunch
+                            .devAutoSell
+                            .marketCapDirection
+                            .trim()
+                            .is_empty()
+                        {
+                            "gte".to_string()
+                        } else {
+                            form.followLaunch
+                                .devAutoSell
+                                .marketCapDirection
+                                .trim()
+                                .to_string()
+                        },
+                        threshold: form
+                            .followLaunch
+                            .devAutoSell
+                            .marketCapThreshold
+                            .trim()
+                            .to_string(),
+                    },
+                    precheckRequired: Some(json!(false)),
+                    requireConfirmation: Some(json!(dev_auto_sell_require_confirmation)),
+                })
+            } else {
+                None
+            },
+            constraints: RawFollowLaunchConstraints {
+                pumpOnly: Some(json!(true)),
+                retryBudget: Some(json!(1)),
+                requireDaemonReadiness: Some(json!(true)),
+                blockOnRequiredPrechecks: Some(json!(true)),
             },
         },
         presets: RawPresets {
@@ -1028,8 +1209,8 @@ pub async fn build_raw_config_from_form(
 #[cfg(test)]
 mod tests {
     use super::{
-        MetadataUploadProvider, UiForm, build_raw_config_from_ui_form, normalize_metadata_uri,
-        parse_metadata_upload_provider,
+        MetadataUploadProvider, UiFollowLaunch, UiFollowLaunchSell, UiForm, UiSniperWalletInput,
+        build_raw_config_from_ui_form, normalize_metadata_uri, parse_metadata_upload_provider,
     };
     use serde_json::json;
 
@@ -1127,5 +1308,59 @@ mod tests {
         .expect("vanity key should be preserved");
 
         assert_eq!(raw.vanityPrivateKey, "vanity-secret");
+    }
+
+    #[tokio::test]
+    async fn builds_structured_follow_launch_from_ui_payload() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                sniperEnabled: true,
+                sniperWallets: vec![UiSniperWalletInput {
+                    envKey: "SOLANA_PRIVATE_KEY2".to_string(),
+                    amountSol: "0.25".to_string(),
+                    triggerMode: "submit-delay".to_string(),
+                    submitDelayMs: Some(25),
+                    jitterMs: Some(5),
+                    feeJitterBps: Some(200),
+                    ..UiSniperWalletInput::default()
+                }],
+                followLaunch: UiFollowLaunch {
+                    enabled: true,
+                    devAutoSell: UiFollowLaunchSell {
+                        enabled: true,
+                        percent: "50".to_string(),
+                        triggerMode: "submit-delay".to_string(),
+                        delayMs: "2000".to_string(),
+                        ..UiFollowLaunchSell::default()
+                    },
+                    ..UiFollowLaunch::default()
+                },
+                automaticDevSellEnabled: true,
+                automaticDevSellPercent: "50".to_string(),
+                automaticDevSellTriggerMode: "submit-delay".to_string(),
+                automaticDevSellDelayMs: "2000".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("follow launch config should build");
+
+        assert_eq!(raw.followLaunch.snipes.len(), 1);
+        assert_eq!(
+            raw.followLaunch.snipes[0].walletEnvKey,
+            "SOLANA_PRIVATE_KEY2"
+        );
+        assert_eq!(raw.followLaunch.snipes[0].buyAmountSol, "0.25");
+        assert_eq!(raw.followLaunch.snipes[0].submitWithLaunch, Some(json!(false)));
+        assert_eq!(raw.followLaunch.snipes[0].submitDelayMs, Some(json!(25)));
+        let dev_auto_sell = raw
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        assert_eq!(dev_auto_sell.walletEnvKey, "SOLANA_PRIVATE_KEY");
+        assert_eq!(dev_auto_sell.percent, Some(json!("50")));
+        assert_eq!(dev_auto_sell.delayMs, Some(json!("2000")));
     }
 }

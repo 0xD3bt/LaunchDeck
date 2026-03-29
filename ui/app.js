@@ -9,6 +9,8 @@ const reportsTerminalOutput = document.getElementById("reports-terminal-output")
 const reportsTerminalMeta = document.getElementById("reports-terminal-meta");
 const reportsTerminalResizeHandle = document.getElementById("reports-terminal-resize-handle");
 const buttons = Array.from(document.querySelectorAll("[data-action]"));
+const shellMain = document.querySelector(".shell");
+const workspaceShell = document.querySelector(".workspace-shell");
 const walletBox = document.querySelector(".wallet-box");
 const walletSelect = document.getElementById("wallet-select");
 const walletBalance = document.getElementById("wallet-balance");
@@ -24,6 +26,8 @@ const themeToggleButton = document.getElementById("toggle-theme-button");
 const feeSplitPill = document.getElementById("fee-split-pill");
 const imageInput = document.getElementById("image-input");
 const openImageLibraryButton = document.getElementById("open-image-library-button");
+const imageLayoutToggle = document.getElementById("image-layout-toggle");
+const tokenSurfaceSection = document.getElementById("token-surface-section");
 const imagePreview = document.getElementById("image-preview");
 const imageEmpty = document.getElementById("image-empty");
 const imageStatus = document.getElementById("image-status");
@@ -92,12 +96,9 @@ const creationTipInput = document.getElementById("creation-tip-input");
 const creationPriorityInput = document.getElementById("creation-priority-input");
 const launchpadInputs = Array.from(document.querySelectorAll('input[name="launchpad"]'));
 const providerSelect = document.getElementById("provider-select");
-const endpointProfileSelect = document.getElementById("endpoint-profile-select");
 const buyProviderSelect = document.getElementById("buy-provider-select");
-const buyEndpointProfileSelect = document.getElementById("buy-endpoint-profile-select");
 const sellProviderSelect = document.getElementById("sell-provider-select");
-const sellEndpointProfileSelect = document.getElementById("sell-endpoint-profile-select");
-const trackSendBlockHeightToggle = document.getElementById("track-send-block-height-toggle");
+const settingsBackendRegionSummary = document.getElementById("settings-backend-region-summary");
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
@@ -153,11 +154,18 @@ const devAutoSellButton = document.getElementById("dev-auto-sell-button");
 const devAutoSellPanel = document.getElementById("dev-auto-sell-panel");
 const autoSellEnabledInput = document.getElementById("auto-sell-enabled-input");
 const autoSellToggleState = document.getElementById("auto-sell-toggle-state");
+const autoSellTriggerValue = document.getElementById("auto-sell-trigger-value");
+const autoSellTriggerDescription = document.getElementById("auto-sell-trigger-description");
 const autoSellDelaySlider = document.getElementById("auto-sell-delay-slider");
+const autoSellDelayControl = document.getElementById("auto-sell-delay-control");
 const autoSellPercentSlider = document.getElementById("auto-sell-percent-slider");
 const autoSellDelayValue = document.getElementById("auto-sell-delay-value");
+const autoSellBlockControl = document.getElementById("auto-sell-block-control");
+const autoSellBlockValue = document.getElementById("auto-sell-block-value");
 const autoSellPercentValue = document.getElementById("auto-sell-percent-value");
 const autoSellSettings = document.getElementById("auto-sell-settings");
+const autoSellTriggerModeButtons = Array.from(document.querySelectorAll("[data-auto-sell-trigger-mode]"));
+const autoSellBlockOffsetButtons = Array.from(document.querySelectorAll("[data-auto-sell-block-offset]"));
 const sniperModal = document.getElementById("sniper-modal");
 const sniperClose = document.getElementById("sniper-close");
 const sniperCancel = document.getElementById("sniper-cancel");
@@ -169,6 +177,7 @@ const sniperEnabledState = document.getElementById("sniper-enabled-state");
 const sniperWalletsSection = document.getElementById("sniper-wallets-section");
 const sniperWalletList = document.getElementById("sniper-wallet-list");
 const sniperSelectionSummary = document.getElementById("sniper-selection-summary");
+const sniperTotalSummary = document.getElementById("sniper-total-summary");
 const sniperModalError = document.getElementById("sniper-modal-error");
 const vanityModal = document.getElementById("vanity-modal");
 const vanityClose = document.getElementById("vanity-close");
@@ -189,8 +198,21 @@ const REPORTS_TERMINAL_SORT_KEY = "launchdeck.reportsTerminalSort";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const SELECTED_WALLET_STORAGE_KEY = "launchdeck.selectedWalletKey";
+const SNIPER_DRAFT_STORAGE_KEY = "launchdeck.sniperDraft.v1";
+const IMAGE_LAYOUT_COMPACT_STORAGE_KEY = "launchdeck.imageLayoutCompact";
+const SELECTED_MODE_STORAGE_KEY = "launchdeck.selectedMode";
+const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
+const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
+const POPOUT_FORM_WIDTH = 532;
+const POPOUT_REPORTS_WIDTH = 560;
+const POPOUT_WORKSPACE_GAP = 12;
 const pageSearchParams = new URLSearchParams(window.location.search);
 const isPopoutMode = pageSearchParams.get("popout") === "1";
+const popoutOutputParam = pageSearchParams.get("output");
+const popoutReportsParam = pageSearchParams.get("reports");
+let popoutAutosizeFrame = 0;
+const RequestUtils = window.LaunchDeckRequestUtils || {};
+const RenderUtils = window.LaunchDeckRenderUtils || {};
 const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
   nameMaxLength: 32,
   symbolMaxLength: 10,
@@ -199,16 +221,54 @@ const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
 if (isPopoutMode) {
   document.body.classList.add("popout-mode");
   document.title = "LaunchDeck Popout";
+  window.addEventListener("load", () => {
+    schedulePopoutAutosize();
+  });
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      schedulePopoutAutosize();
+    }).catch(() => {});
+  }
 }
 
 setThemeMode(getStoredThemeMode(), { persist: false });
-setOutputSectionVisible(getStoredOutputSectionVisible());
+setOutputSectionVisible(
+  isPopoutMode && popoutOutputParam != null
+    ? popoutOutputParam === "1"
+    : getStoredOutputSectionVisible(),
+);
+setImageLayoutCompact(getStoredImageLayoutCompact(), { persist: false });
 
 let uploadedImage = null;
 let latestWalletStatus = null;
+let latestRuntimeStatus = null;
 let latestLaunchpadRegistry = {};
+let walletStatusRequestSerial = 0;
+let appBootstrapState = {
+  started: false,
+  staticLoaded: false,
+  configLoaded: false,
+  walletsLoaded: false,
+  runtimeLoaded: false,
+};
 let quoteTimer = null;
 let defaultsApplied = false;
+const requestStates = {
+  bootstrap: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  walletStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  runtimeStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  reports: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  reportView: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  images: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  quote: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+};
+const renderCache = {
+  walletDropdown: "",
+  sniperWalletList: "",
+  reportsList: "",
+  imageGrid: "",
+  backendRegion: "",
+};
 let metadataUploadState = {
   debounceTimer: null,
   inFlightPromise: null,
@@ -242,27 +302,24 @@ let syncingPresetInputs = false;
 let lastTopPresetMarkup = "";
 let lastSettingsPresetMarkup = "";
 let lastQuickDevBuyMarkup = "";
-let sniperState = {
-  enabled: false,
-  wallets: {},
-};
 let reportsTerminalState = {
   entries: [],
   activeId: "",
+  activePayload: null,
+  activeText: "",
+  activeTab: "overview",
   sort: getStoredReportsTerminalSort(),
 };
 let reportsTerminalResizeState = null;
 const REPORTS_TERMINAL_DEFAULT_LIST_WIDTH = 152;
 const REPORTS_TERMINAL_MIN_LIST_WIDTH = 120;
 const REPORTS_TERMINAL_MAX_LIST_WIDTH = 240;
-setReportsTerminalSort(reportsTerminalState.sort, { persist: false });
-setReportsTerminalVisible(getStoredReportsTerminalVisible(), { persist: false });
-setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
 const SPLIT_COLORS = ["#5b7cff", "#ff5d5d", "#14c38e", "#ffb020", "#7c5cff", "#00b8d9", "#ef5da8", "#8b5cf6"];
 const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
 const METADATA_PREUPLOAD_DEBOUNCE_MS = 500;
 const MAX_FEE_SPLIT_RECIPIENTS = 10;
+const SNIPER_EXECUTION_RESERVE_SOL = 0.005;
 const SNIPER_BALANCE_PRESETS = [
   { label: "MAX", ratio: 1 },
   { label: "75%", ratio: 0.75 },
@@ -273,18 +330,6 @@ const PROVIDER_LABELS = {
   "helius-sender": "Helius Sender",
   "standard-rpc": "Standard RPC",
   "jito-bundle": "Jito Bundle",
-};
-const ENDPOINT_PROFILE_LABELS = {
-  global: "Global",
-  us: "US",
-  eu: "EU",
-  west: "West",
-  asia: "Asia",
-};
-const PROVIDER_ENDPOINT_PROFILE_SUPPORT = {
-  "helius-sender": ["global", "us", "eu", "west", "asia"],
-  "jito-bundle": ["global", "us", "eu", "west", "asia"],
-  "standard-rpc": [],
 };
 const ROUTE_CAPABILITIES = {
   "helius-sender": {
@@ -357,6 +402,160 @@ function formatSliderValue(value, suffix, digits = 0) {
   return `${numeric.toFixed(digits)}${suffix}`;
 }
 
+function normalizeLaunchMode(value) {
+  const mode = String(value || "").trim();
+  if (["regular", "cashback", "agent-custom", "agent-unlocked", "agent-locked"].includes(mode)) {
+    return mode;
+  }
+  return "regular";
+}
+
+function getStoredLaunchMode() {
+  try {
+    const stored = window.localStorage.getItem(SELECTED_MODE_STORAGE_KEY);
+    return stored ? normalizeLaunchMode(stored) : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function setStoredLaunchMode(mode) {
+  try {
+    window.localStorage.setItem(SELECTED_MODE_STORAGE_KEY, normalizeLaunchMode(mode));
+  } catch (_error) {
+    // Ignore storage failures and keep mode controls functional.
+  }
+}
+
+function serializeFeeSplitDraft() {
+  return {
+    enabled: Boolean(feeSplitEnabled && feeSplitEnabled.checked),
+    rows: getFeeSplitRows().map((row) => ({
+      type: row.dataset.type || "wallet",
+      value: row.querySelector(".recipient-target")?.value?.trim() || "",
+      sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
+      defaultReceiver: row.dataset.defaultReceiver === "true",
+      targetLocked: row.dataset.targetLocked === "true",
+    })),
+  };
+}
+
+function normalizeFeeSplitDraft(value) {
+  const rows = Array.isArray(value && value.rows)
+    ? value.rows.map((entry) => ({
+      type: entry && entry.type === "github" ? "github" : "wallet",
+      value: String(entry && entry.value || "").trim(),
+      sharePercent: normalizeDecimalInput(entry && entry.sharePercent || "", 2),
+      defaultReceiver: Boolean(entry && entry.defaultReceiver),
+      targetLocked: Boolean(entry && entry.targetLocked),
+    }))
+    : [];
+  return {
+    enabled: Boolean(value && value.enabled),
+    rows,
+  };
+}
+
+function getStoredFeeSplitDraft() {
+  try {
+    const raw = window.localStorage.getItem(FEE_SPLIT_DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    return normalizeFeeSplitDraft(JSON.parse(raw));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function setStoredFeeSplitDraft(value) {
+  try {
+    const normalized = normalizeFeeSplitDraft(value);
+    if (!normalized.enabled && normalized.rows.length === 0) {
+      window.localStorage.removeItem(FEE_SPLIT_DRAFT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(FEE_SPLIT_DRAFT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch (_error) {
+    // Ignore storage failures and keep fee split controls functional.
+  }
+}
+
+function applyFeeSplitDraft(value, { persist = false } = {}) {
+  const draft = normalizeFeeSplitDraft(value);
+  if (feeSplitEnabled) feeSplitEnabled.checked = draft.enabled;
+  if (feeSplitList) {
+    feeSplitList.innerHTML = "";
+    draft.rows.forEach((entry) => {
+      feeSplitList.appendChild(createFeeSplitRow(entry));
+    });
+  }
+  if (draft.enabled) ensureFeeSplitDefaultRow();
+  syncFeeSplitTotals();
+  if (persist) setStoredFeeSplitDraft(draft);
+}
+
+function serializeAgentSplitDraft() {
+  return {
+    rows: getAgentSplitRows().map((row) => ({
+      locked: row.dataset.locked === "true",
+      type: row.dataset.type || "wallet",
+      value: row.querySelector(".recipient-target")?.value?.trim() || "",
+      sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
+      defaultReceiver: row.dataset.defaultReceiver === "true",
+      targetLocked: row.dataset.targetLocked === "true",
+    })),
+  };
+}
+
+function normalizeAgentSplitDraft(value) {
+  const rows = Array.isArray(value && value.rows)
+    ? value.rows.map((entry) => ({
+      locked: Boolean(entry && entry.locked),
+      type: entry && entry.type === "github" ? "github" : "wallet",
+      value: String(entry && entry.value || "").trim(),
+      sharePercent: normalizeDecimalInput(entry && entry.sharePercent || "", 2),
+      defaultReceiver: Boolean(entry && entry.defaultReceiver),
+      targetLocked: Boolean(entry && entry.targetLocked),
+    }))
+    : [];
+  return { rows };
+}
+
+function getStoredAgentSplitDraft() {
+  try {
+    const raw = window.localStorage.getItem(AGENT_SPLIT_DRAFT_STORAGE_KEY);
+    if (!raw) return null;
+    return normalizeAgentSplitDraft(JSON.parse(raw));
+  } catch (_error) {
+    return null;
+  }
+}
+
+function setStoredAgentSplitDraft(value) {
+  try {
+    const normalized = normalizeAgentSplitDraft(value);
+    if (normalized.rows.length === 0) {
+      window.localStorage.removeItem(AGENT_SPLIT_DRAFT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(AGENT_SPLIT_DRAFT_STORAGE_KEY, JSON.stringify(normalized));
+  } catch (_error) {
+    // Ignore storage failures and keep agent split controls functional.
+  }
+}
+
+function applyAgentSplitDraft(value, { persist = false } = {}) {
+  const draft = normalizeAgentSplitDraft(value);
+  if (agentSplitList) {
+    agentSplitList.innerHTML = "";
+    draft.rows.forEach((entry) => {
+      agentSplitList.appendChild(createAgentSplitRow(entry));
+    });
+  }
+  normalizeAgentSplitStructure();
+  syncAgentSplitTotals();
+  if (persist) setStoredAgentSplitDraft(draft);
+}
+
 function normalizeDecimalInput(value, maxDecimals = 6) {
   const raw = String(value || "").replace(/,/g, ".").trim();
   if (!raw) return "";
@@ -366,6 +565,344 @@ function normalizeDecimalInput(value, maxDecimals = 6) {
   return fractional !== undefined && sanitized.includes(".")
     ? `${safeWhole || "0"}.${fractional.slice(0, maxDecimals)}`
     : safeWhole;
+}
+
+const reportsFeature = window.ReportsFeature.create({
+  elements: {
+    reportsTerminalSection,
+    reportsTerminalList,
+    reportsTerminalOutput,
+    reportsTerminalMeta,
+    reportsTerminalResizeHandle,
+    openPopoutButton,
+    toggleOutputButton,
+    toggleReportsButton,
+    reportsRefreshButton,
+    reportsSortButton,
+  },
+  storage: {
+    visibilityKey: REPORTS_TERMINAL_VISIBILITY_KEY,
+    sortKey: REPORTS_TERMINAL_SORT_KEY,
+    listWidthKey: REPORTS_TERMINAL_LIST_WIDTH_KEY,
+  },
+  requestStates,
+  renderCache,
+  state: reportsTerminalState,
+  getResizeState: () => reportsTerminalResizeState,
+  setResizeState: (value) => {
+    reportsTerminalResizeState = value;
+  },
+  constants: {
+    defaultListWidth: REPORTS_TERMINAL_DEFAULT_LIST_WIDTH,
+    minListWidth: REPORTS_TERMINAL_MIN_LIST_WIDTH,
+    maxListWidth: REPORTS_TERMINAL_MAX_LIST_WIDTH,
+  },
+  schedulePopoutAutosize,
+  refreshOnVisible: () => refreshReportsTerminal(),
+  renderOutput: () => renderReportsTerminalOutput(),
+  renderList: () => renderReportsTerminalList(),
+  loadEntry: (id) => loadReportsTerminalEntry(id),
+  refreshReports: (options) => refreshReportsTerminal(options),
+  normalizeTab: (tab) => normalizeReportsTerminalTab(tab),
+  shortenAddress,
+  openPopoutWindow,
+});
+
+reportsFeature.bindEvents();
+
+function getStoredReportsTerminalListWidth() {
+  return reportsFeature.getStoredListWidth();
+}
+
+function setReportsTerminalListWidth(width, options) {
+  return reportsFeature.setListWidth(width, options);
+}
+
+function setReportsTerminalVisible(isVisible, options) {
+  return reportsFeature.setVisible(isVisible, options);
+}
+
+function setReportsTerminalSort(sort, options) {
+  return reportsFeature.setSort(sort, options);
+}
+
+setReportsTerminalSort(reportsTerminalState.sort, { persist: false });
+setReportsTerminalVisible(
+  isPopoutMode && popoutReportsParam != null
+    ? popoutReportsParam === "1"
+    : getStoredReportsTerminalVisible(),
+  { persist: false },
+);
+setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
+
+const imagesFeature = window.ImagesFeature.create({
+  elements: {
+    imageStatus,
+    imagePath,
+    imagePreview,
+    imageEmpty,
+    imageLibraryModal,
+    imageLibrarySearchInput,
+    imageLibraryUploadButton,
+    imageLibraryGrid,
+    imageLibraryEmpty,
+    imageCategoryChips,
+    newImageCategoryButton,
+    imageItemMenu,
+    imageMenuFavorite,
+    imageMenuEdit,
+    imageMenuDelete,
+    imageDetailsModal,
+    imageDetailsTitle,
+    imageDetailsClose,
+    imageDetailsCancel,
+    imageDetailsSave,
+    imageDetailsName,
+    imageDetailsTags,
+    imageDetailsAddTag,
+    imageDetailsTagList,
+    imageDetailsError,
+    imageDetailsCategoryRow,
+    imageDetailsCategory,
+    imageDetailsNewCategory,
+    imageCategoryModal,
+    imageCategoryClose,
+    imageCategoryCancel,
+    imageCategorySave,
+    imageCategoryName,
+    imageCategoryError,
+    imageLibraryClose,
+    imageInput,
+    openImageLibraryButton,
+  },
+  renderCache,
+  requestStates,
+  getImageLibraryState: () => imageLibraryState,
+  getActiveImageMenuId: () => activeImageMenuId,
+  setActiveImageMenuId: (value) => {
+    activeImageMenuId = value;
+  },
+  getActiveImageDetailsId: () => activeImageDetailsId,
+  setActiveImageDetailsId: (value) => {
+    activeImageDetailsId = value;
+  },
+  getImageDetailsTagsState: () => imageDetailsTagsState,
+  setImageDetailsTagsState: (value) => {
+    imageDetailsTagsState = value;
+  },
+  getIsEditingNewImageUpload: () => isEditingNewImageUpload,
+  setIsEditingNewImageUpload: (value) => {
+    isEditingNewImageUpload = value;
+  },
+  getImageCategoryModalContext: () => imageCategoryModalContext,
+  setImageCategoryModalContext: (value) => {
+    imageCategoryModalContext = value;
+  },
+  getUploadedImage: () => uploadedImage,
+  setUploadedImage: (value) => {
+    uploadedImage = value;
+  },
+  clearMetadataUploadCache,
+  setImagePreview,
+  scheduleMetadataPreupload,
+  escapeHTML,
+  fetchJsonLatest: RequestUtils.fetchJsonLatest,
+});
+
+imagesFeature.bindEvents();
+
+function hideImageItemMenu() {
+  imagesFeature.hideItemMenu();
+}
+
+function setSelectedImage(image) {
+  imagesFeature.setSelectedImage(image);
+}
+
+function renderImageCategoryChips() {
+  imagesFeature.renderCategoryChips();
+}
+
+function renderImageLibraryGrid() {
+  imagesFeature.renderLibraryGrid();
+}
+
+function fetchImageLibrary() {
+  return imagesFeature.fetchLibrary();
+}
+
+function showImageLibraryModal() {
+  imagesFeature.showLibraryModal();
+}
+
+function hideImageLibraryModal() {
+  imagesFeature.hideLibraryModal();
+}
+
+function showImageDetailsModal(image, options = {}) {
+  imagesFeature.showDetailsModal(image, options);
+}
+
+function hideImageDetailsModal() {
+  imagesFeature.hideDetailsModal();
+}
+
+function showImageCategoryModal(context = "library") {
+  imagesFeature.showCategoryModal(context);
+}
+
+function hideImageCategoryModal() {
+  imagesFeature.hideCategoryModal();
+}
+
+const autoSellFeature = window.AutoSellFeature.create({
+  elements: {
+    devAutoSellButton,
+    devAutoSellPanel,
+    autoSellEnabledInput,
+    autoSellToggleState,
+    autoSellTriggerValue,
+    autoSellTriggerDescription,
+    autoSellDelaySlider,
+    autoSellDelayControl,
+    autoSellPercentSlider,
+    autoSellDelayValue,
+    autoSellBlockControl,
+    autoSellBlockValue,
+    autoSellPercentValue,
+    autoSellSettings,
+    autoSellTriggerModeButtons,
+    autoSellBlockOffsetButtons,
+  },
+  getNamedValue,
+  setNamedValue,
+  isNamedChecked,
+  formatSliderValue,
+  syncSettingsCapabilities,
+  syncActivePresetFromInputs,
+  validateFieldByName,
+  documentNode: document,
+});
+
+autoSellFeature.bindEvents();
+
+function normalizeAutoSellTriggerMode(value) {
+  return autoSellFeature.normalizeTriggerMode(value);
+}
+
+function getAutoSellTriggerMode() {
+  return autoSellFeature.getTriggerMode();
+}
+
+function getAutoSellDelayMs() {
+  return autoSellFeature.getDelayMs();
+}
+
+function getAutoSellBlockOffset() {
+  return autoSellFeature.getBlockOffset();
+}
+
+function getAutoSellTriggerLabel(mode = getAutoSellTriggerMode()) {
+  return autoSellFeature.getTriggerLabel(mode);
+}
+
+function getAutoSellTriggerDescription(mode = getAutoSellTriggerMode()) {
+  return autoSellFeature.getTriggerDescription(mode);
+}
+
+function getAutoSellSummaryText(formValues = readForm()) {
+  return autoSellFeature.getSummaryText(formValues);
+}
+
+function syncDevAutoSellUI() {
+  autoSellFeature.syncUI();
+}
+
+function toggleDevAutoSellPanel(forceOpen) {
+  autoSellFeature.togglePanel(forceOpen);
+}
+
+const sniperFeature = window.SniperFeature.create({
+  storageKey: SNIPER_DRAFT_STORAGE_KEY,
+  renderCache,
+  balancePresets: SNIPER_BALANCE_PRESETS,
+  executionReserveSol: SNIPER_EXECUTION_RESERVE_SOL,
+  elements: {
+    postLaunchStrategyInput,
+    snipeBuyAmountInput,
+    sniperEnabledInput,
+    sniperConfigJsonInput,
+    modeSniperButton,
+    sniperModal,
+    sniperClose,
+    sniperCancel,
+    sniperSave,
+    sniperRefreshButton,
+    sniperResetButton,
+    sniperEnabledToggle,
+    sniperEnabledState,
+    sniperWalletsSection,
+    sniperWalletList,
+    sniperSelectionSummary,
+    sniperTotalSummary,
+    sniperModalError,
+  },
+  getLatestWalletStatus: () => latestWalletStatus,
+  getAppBootstrapState: () => appBootstrapState,
+  getSelectedWalletKey: () => selectedWalletKey(),
+  getNamedValue,
+  walletDisplayName,
+  walletIndexFromEnvKey,
+  shortenAddress,
+  escapeHTML,
+  normalizeDecimalInput,
+  getRouteCapabilities,
+  getBuyProvider,
+  getSellProvider,
+  refreshWalletStatus,
+  metaNode,
+});
+
+sniperFeature.bindEvents();
+
+function normalizeSniperDraftState(value) {
+  return sniperFeature.normalizeDraftState(value);
+}
+
+function getStoredSniperDraft() {
+  return sniperFeature.getStoredDraft();
+}
+
+function getSniperTriggerSummary(entry = {}) {
+  return sniperFeature.getTriggerSummary(entry);
+}
+
+function setSniperModalError(message = "") {
+  sniperFeature.setModalError(message);
+}
+
+function resetSniperState() {
+  sniperFeature.resetState();
+}
+
+function applySniperStateToForm() {
+  sniperFeature.applyStateToForm();
+}
+
+function renderSniperUI() {
+  sniperFeature.renderUI();
+}
+
+function showSniperModal() {
+  sniperFeature.showModal();
+}
+
+function hideSniperModal() {
+  sniperFeature.hideModal();
+}
+
+function validateSniperState() {
+  return sniperFeature.validateState();
 }
 
 function updateDescriptionDisclosure() {
@@ -519,10 +1056,12 @@ async function saveDevBuyPresetEditor() {
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Failed to save quick deploy presets.");
     }
+    setRegionRouting(payload.regionRouting || (latestWalletStatus && latestWalletStatus.regionRouting));
     setConfig(payload.config);
     if (latestWalletStatus) latestWalletStatus.config = payload.config;
     renderQuickDevBuyButtons(payload.config);
     populateDevBuyPresetEditor(payload.config);
+    renderBackendRegionSummary(payload.regionRouting);
     setDevBuyPresetEditorOpen(false);
   } catch (error) {
     statusNode.textContent = "Error";
@@ -555,16 +1094,12 @@ function createFallbackConfig() {
         label: `P${index + 1}`,
         creationSettings: {
           provider: "helius-sender",
-          endpointProfile: "global",
-          policy: "safe",
           tipSol: "0.01",
           priorityFeeSol: "0.001",
           devBuySol: amount,
         },
         buySettings: {
           provider: "helius-sender",
-          endpointProfile: "global",
-          policy: "safe",
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
@@ -572,16 +1107,16 @@ function createFallbackConfig() {
         },
         sellSettings: {
           provider: "helius-sender",
-          endpointProfile: "global",
-          policy: "safe",
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
         },
         automaticDevSell: {
           enabled: false,
-          percent: 0,
-          delaySeconds: 0,
+          percent: 100,
+          triggerMode: "confirmation",
+          delayMs: 0,
+          targetBlockOffset: 0,
         },
         postLaunchStrategy: "none",
       })),
@@ -641,6 +1176,83 @@ function setConfig(nextConfig) {
   renderQuickDevBuyButtons(nextConfig);
 }
 
+function setRegionRouting(nextRegionRouting) {
+  if (!latestWalletStatus) {
+    latestWalletStatus = {
+      connected: false,
+      config: cloneConfig(getConfig()),
+      regionRouting: nextRegionRouting || null,
+    };
+    return;
+  }
+  latestWalletStatus = {
+    ...latestWalletStatus,
+    regionRouting: nextRegionRouting || latestWalletStatus.regionRouting || null,
+  };
+}
+
+function formatBackendRegionValue(value, fallback = "global") {
+  const normalized = String(value || "").trim();
+  return normalized || fallback;
+}
+
+function renderBackendRegionSummary(regionRouting = latestWalletStatus && latestWalletStatus.regionRouting) {
+  if (!settingsBackendRegionSummary) return;
+  if (!regionRouting || typeof regionRouting !== "object") {
+    if (RenderUtils.setCachedHTML) {
+      RenderUtils.setCachedHTML(
+        renderCache,
+        "backendRegion",
+        settingsBackendRegionSummary,
+        '<div class="settings-section-copy">Loading backend routing defaults...</div>',
+      );
+    } else {
+      settingsBackendRegionSummary.innerHTML = '<div class="settings-section-copy">Loading backend routing defaults...</div>';
+    }
+    return;
+  }
+  const shared = regionRouting && regionRouting.shared ? regionRouting.shared : {};
+  const providers = regionRouting && regionRouting.providers ? regionRouting.providers : {};
+  const sharedConfigured = formatBackendRegionValue(shared.configured, "None");
+  const sharedEffective = formatBackendRegionValue(shared.effective);
+  const providerRows = ["helius-sender", "jito-bundle"].map((provider) => {
+    const entry = providers[provider] || {};
+    const configured = formatBackendRegionValue(entry.configured, "None");
+    const effective = formatBackendRegionValue(entry.effective);
+    const overrideNote = entry.endpointOverrideActive
+      ? '<div class="settings-region-note">Explicit endpoint override active. Region fanout is bypassed.</div>'
+      : "";
+    return `
+      <div class="settings-region-card">
+        <div class="settings-region-card-head">
+          <strong>${escapeHTML(PROVIDER_LABELS[provider] || provider)}</strong>
+          <span class="settings-region-effective">${escapeHTML(effective)}</span>
+        </div>
+        <div class="settings-region-meta">Override: ${escapeHTML(configured)}</div>
+        ${overrideNote}
+      </div>
+    `;
+  }).join("");
+  const markup = `
+    <div class="settings-region-card settings-region-card-shared">
+      <div class="settings-region-card-head">
+        <strong>Shared backend region</strong>
+        <span class="settings-region-effective">${escapeHTML(sharedEffective)}</span>
+      </div>
+      <div class="settings-region-meta">Configured: ${escapeHTML(sharedConfigured)}</div>
+    </div>
+    ${providerRows}
+    <div class="settings-sidebar-note">
+      Region defaults are recommended because provider fanout usually reaches more nearby supported endpoints and lands faster and more reliably than pinning one endpoint. Change backend env values, then run <code>npm restart</code>.
+    </div>
+  `;
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "backendRegion", settingsBackendRegionSummary, markup);
+  } else {
+    settingsBackendRegionSummary.innerHTML = markup;
+  }
+}
+
 function renderPresetChipMarkup(config = getConfig(), { topBar = false } = {}) {
   const activePresetId = getActivePresetId(config);
   return getPresetItems(config).map((preset, index) => `
@@ -649,7 +1261,7 @@ function renderPresetChipMarkup(config = getConfig(), { topBar = false } = {}) {
       class="preset-chip${preset.id === activePresetId ? " active" : ""}${topBar ? " compact" : ""}"
       data-preset-id="${escapeHTML(preset.id)}"
     >
-      ${escapeHTML(getPresetDisplayLabel(preset, index))}
+      ${escapeHTML(topBar ? getPresetDisplayLabel(preset, index) : `Preset ${index + 1}`)}
     </button>
   `).join("");
 }
@@ -877,36 +1489,12 @@ function getProvider() {
   return providerSelect ? providerSelect.value || "helius-sender" : "helius-sender";
 }
 
-function getEndpointProfile() {
-  return endpointProfileSelect ? endpointProfileSelect.value || "global" : "global";
-}
-
-function getPolicy() {
-  return "safe";
-}
-
 function getBuyProvider() {
   return buyProviderSelect ? buyProviderSelect.value || "helius-sender" : "helius-sender";
 }
 
-function getBuyEndpointProfile() {
-  return buyEndpointProfileSelect ? buyEndpointProfileSelect.value || "global" : "global";
-}
-
-function getBuyPolicy() {
-  return "safe";
-}
-
 function getSellProvider() {
   return sellProviderSelect ? sellProviderSelect.value || "helius-sender" : "helius-sender";
-}
-
-function getSellEndpointProfile() {
-  return sellEndpointProfileSelect ? sellEndpointProfileSelect.value || "global" : "global";
-}
-
-function getSellPolicy() {
-  return "safe";
 }
 
 function getRouteCapabilities(route, rowType) {
@@ -929,28 +1517,15 @@ function setFieldVisibility(input, visible) {
   if (label) label.hidden = !visible;
 }
 
-function providerSupportsEndpointProfile(provider) {
-  return Array.isArray(PROVIDER_ENDPOINT_PROFILE_SUPPORT[provider]) && PROVIDER_ENDPOINT_PROFILE_SUPPORT[provider].length > 0;
-}
-
 function syncSettingsCapabilities() {
   const editing = isPresetEditing(getConfig());
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
   const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
   const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
-  const creationSupportsEndpointProfile = providerSupportsEndpointProfile(getProvider());
-  const buySupportsEndpointProfile = providerSupportsEndpointProfile(getBuyProvider());
-  const sellSupportsEndpointProfile = providerSupportsEndpointProfile(getSellProvider());
 
   if (providerSelect) providerSelect.disabled = !editing;
-  if (endpointProfileSelect) endpointProfileSelect.disabled = !editing || !creationSupportsEndpointProfile;
   if (buyProviderSelect) buyProviderSelect.disabled = !editing;
-  if (buyEndpointProfileSelect) buyEndpointProfileSelect.disabled = !editing || !buySupportsEndpointProfile;
   if (sellProviderSelect) sellProviderSelect.disabled = !editing;
-  if (sellEndpointProfileSelect) sellEndpointProfileSelect.disabled = !editing || !sellSupportsEndpointProfile;
-  setFieldVisibility(endpointProfileSelect, creationSupportsEndpointProfile);
-  setFieldVisibility(buyEndpointProfileSelect, buySupportsEndpointProfile);
-  setFieldVisibility(sellEndpointProfileSelect, sellSupportsEndpointProfile);
   setFieldVisibility(creationTipInput, creationCapabilities.tip);
   setFieldVisibility(creationPriorityInput, creationCapabilities.priority);
   setFieldVisibility(buyPriorityFeeInput, buyCapabilities.priority);
@@ -974,16 +1549,13 @@ function applyPresetToSettingsInputs(preset, options = {}) {
   const { syncToMainForm = true } = options;
   syncingPresetInputs = true;
   if (providerSelect) providerSelect.value = preset.creationSettings.provider || "helius-sender";
-  if (endpointProfileSelect) endpointProfileSelect.value = preset.creationSettings.endpointProfile || "global";
   if (creationTipInput) creationTipInput.value = preset.creationSettings.tipSol || "";
   if (creationPriorityInput) creationPriorityInput.value = preset.creationSettings.priorityFeeSol || "";
   if (buyProviderSelect) buyProviderSelect.value = preset.buySettings.provider || "helius-sender";
-  if (buyEndpointProfileSelect) buyEndpointProfileSelect.value = preset.buySettings.endpointProfile || "global";
   if (buyPriorityFeeInput) buyPriorityFeeInput.value = preset.buySettings.priorityFeeSol || "";
   if (buyTipInput) buyTipInput.value = preset.buySettings.tipSol || "";
   if (buySlippageInput) buySlippageInput.value = preset.buySettings.slippagePercent || "";
   if (sellProviderSelect) sellProviderSelect.value = preset.sellSettings.provider || "helius-sender";
-  if (sellEndpointProfileSelect) sellEndpointProfileSelect.value = preset.sellSettings.endpointProfile || "global";
   if (sellPriorityFeeInput) sellPriorityFeeInput.value = preset.sellSettings.priorityFeeSol || "";
   if (sellTipInput) sellTipInput.value = preset.sellSettings.tipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = preset.sellSettings.slippagePercent || "";
@@ -1007,8 +1579,6 @@ function syncActivePresetFromInputs() {
   activePreset.creationSettings = {
     ...activePreset.creationSettings,
     provider: getProvider(),
-    endpointProfile: providerSupportsEndpointProfile(getProvider()) ? getEndpointProfile() : "",
-    policy: getPolicy(),
     tipSol: creationTipInput ? creationTipInput.value.trim() : "",
     priorityFeeSol: creationPriorityInput ? creationPriorityInput.value.trim() : "",
     devBuySol: activePreset.creationSettings && activePreset.creationSettings.devBuySol
@@ -1018,8 +1588,6 @@ function syncActivePresetFromInputs() {
   activePreset.buySettings = {
     ...activePreset.buySettings,
     provider: getBuyProvider(),
-    endpointProfile: providerSupportsEndpointProfile(getBuyProvider()) ? getBuyEndpointProfile() : "",
-    policy: getBuyPolicy(),
     priorityFeeSol: buyPriorityFeeInput ? buyPriorityFeeInput.value.trim() : "",
     tipSol: buyTipInput ? buyTipInput.value.trim() : "",
     slippagePercent: buySlippageInput ? buySlippageInput.value.trim() : "",
@@ -1027,8 +1595,6 @@ function syncActivePresetFromInputs() {
   activePreset.sellSettings = {
     ...activePreset.sellSettings,
     provider: getSellProvider(),
-    endpointProfile: providerSupportsEndpointProfile(getSellProvider()) ? getSellEndpointProfile() : "",
-    policy: getSellPolicy(),
     priorityFeeSol: sellPriorityFeeInput ? sellPriorityFeeInput.value.trim() : "",
     tipSol: sellTipInput ? sellTipInput.value.trim() : "",
     slippagePercent: sellSlippageInput ? sellSlippageInput.value.trim() : "",
@@ -1057,16 +1623,13 @@ function setPresetEditing(editing) {
   setConfig(config);
   const inputs = [
     providerSelect,
-    endpointProfileSelect,
     creationTipInput,
     creationPriorityInput,
     buyProviderSelect,
-    buyEndpointProfileSelect,
     buyPriorityFeeInput,
     buyTipInput,
     buySlippageInput,
     sellProviderSelect,
-    sellEndpointProfileSelect,
     sellPriorityFeeInput,
     sellTipInput,
     sellSlippageInput,
@@ -1078,180 +1641,12 @@ function setPresetEditing(editing) {
   syncSettingsCapabilities();
 }
 
-function syncDevAutoSellUI() {
-  const enabled = isNamedChecked("automaticDevSellEnabled");
-  const delay = getNamedValue("automaticDevSellDelaySeconds") || "0";
-  const percent = getNamedValue("automaticDevSellPercent") || "0";
-
-  if (devAutoSellButton) devAutoSellButton.classList.toggle("active", enabled);
-  if (autoSellToggleState) autoSellToggleState.textContent = enabled ? "ON" : "OFF";
-  if (autoSellEnabledInput) autoSellEnabledInput.checked = enabled;
-  if (autoSellSettings) autoSellSettings.hidden = !enabled;
-  if (autoSellDelaySlider) {
-    autoSellDelaySlider.value = delay;
-    autoSellDelaySlider.disabled = !enabled;
-  }
-  if (autoSellPercentSlider) {
-    autoSellPercentSlider.value = percent;
-    autoSellPercentSlider.disabled = !enabled;
-  }
-  if (autoSellDelayValue) autoSellDelayValue.textContent = formatSliderValue(delay, "s", 1);
-  if (autoSellPercentValue) autoSellPercentValue.textContent = formatSliderValue(percent, "%", 0);
-  syncSettingsCapabilities();
-}
-
-function setSniperModalError(message = "") {
-  if (sniperModalError) sniperModalError.textContent = message;
-}
-
-function getSniperSelectedEntries() {
-  return Object.entries(sniperState.wallets || {})
-    .filter(([, entry]) => entry && entry.selected)
-    .map(([envKey, entry]) => ({
-      envKey,
-      amountSol: String(entry.amountSol || "").trim(),
-    }));
-}
-
-function resetSniperState() {
-  sniperState = {
-    enabled: false,
-    wallets: {},
-  };
-  applySniperStateToForm();
-  renderSniperUI();
-}
-
-function applySniperStateToForm() {
-  const selectedEntries = getSniperSelectedEntries().filter((entry) => Number(entry.amountSol) > 0);
-  if (sniperEnabledInput) sniperEnabledInput.value = sniperState.enabled ? "true" : "false";
-  if (sniperConfigJsonInput) sniperConfigJsonInput.value = JSON.stringify(selectedEntries);
-  if (postLaunchStrategyInput) postLaunchStrategyInput.value = sniperState.enabled && selectedEntries.length > 0 ? "snipe-own-launch" : "none";
-  if (snipeBuyAmountInput) {
-    const total = selectedEntries.reduce((sum, entry) => sum + Number(entry.amountSol || 0), 0);
-    snipeBuyAmountInput.value = total > 0 ? total.toFixed(6).replace(/\.?0+$/, "") : "";
-  }
-}
-
-function renderSniperButtonState() {
-  const selectedEntries = getSniperSelectedEntries().filter((entry) => Number(entry.amountSol) > 0);
-  if (modeSniperButton) {
-    modeSniperButton.classList.toggle("active", sniperState.enabled && selectedEntries.length > 0);
-  }
-}
-
-function getWalletBalanceForSniper(wallet) {
-  if (!wallet) return 0;
-  if (wallet.balanceSol != null && Number.isFinite(Number(wallet.balanceSol))) {
-    return Number(wallet.balanceSol);
-  }
-  if (latestWalletStatus && wallet.envKey === latestWalletStatus.selectedWalletKey) {
-    return Number(latestWalletStatus.balanceSol || 0);
-  }
-  return 0;
-}
-
-function renderSniperWalletList() {
-  if (!sniperWalletList) return;
-  const wallets = latestWalletStatus && Array.isArray(latestWalletStatus.wallets) ? latestWalletStatus.wallets : [];
-  const selectedKey = latestWalletStatus && latestWalletStatus.selectedWalletKey ? latestWalletStatus.selectedWalletKey : "";
-  if (selectedKey && sniperState.wallets[selectedKey]) {
-    sniperState.wallets[selectedKey] = {
-      ...sniperState.wallets[selectedKey],
-      selected: false,
-      amountSol: "",
-    };
-    applySniperStateToForm();
-    renderSniperButtonState();
-  }
-  const selectedCount = getSniperSelectedEntries().length;
-  if (sniperSelectionSummary) {
-    sniperSelectionSummary.textContent = `${selectedCount} wallet${selectedCount === 1 ? "" : "s"} selected`;
-  }
-  if (sniperWalletsSection) sniperWalletsSection.hidden = !sniperState.enabled;
-  if (sniperEnabledState) sniperEnabledState.textContent = sniperState.enabled ? "ON" : "OFF";
-  if (sniperEnabledToggle) sniperEnabledToggle.checked = sniperState.enabled;
-
-  if (wallets.length === 0) {
-    sniperWalletList.innerHTML = `<div class="sniper-wallet-empty muted">No wallets found in \`.env\`.</div>`;
-    return;
-  }
-
-  sniperWalletList.innerHTML = wallets.map((wallet) => {
-    const disabled = wallet.envKey === selectedKey;
-    const balanceSol = getWalletBalanceForSniper(wallet);
-    const state = sniperState.wallets[wallet.envKey] || { selected: false, amountSol: "" };
-    return `
-      <div class="sniper-wallet-row${disabled ? " is-disabled" : ""}${state.selected ? " is-selected" : ""}" data-sniper-wallet-row="${escapeHTML(wallet.envKey)}">
-        <label class="sniper-wallet-main">
-          <input
-            type="checkbox"
-            class="sniper-wallet-checkbox"
-            data-sniper-wallet-checkbox="${escapeHTML(wallet.envKey)}"
-            ${state.selected ? "checked" : ""}
-            ${disabled ? "disabled" : ""}
-          >
-          <div class="sniper-wallet-info">
-            <div class="sniper-wallet-name">${escapeHTML(`Imported SOL Key #${walletIndexFromEnvKey(wallet.envKey)}`)}</div>
-            <div class="sniper-wallet-meta">
-              <span>${escapeHTML(shortenAddress(wallet.publicKey || "invalid", 5))}</span>
-              ${disabled ? '<span class="sniper-wallet-pill">Deployer</span>' : ""}
-            </div>
-          </div>
-          <div class="sniper-wallet-balance">${Number(balanceSol).toFixed(3)}</div>
-        </label>
-        <div class="sniper-wallet-config"${!state.selected || disabled ? " hidden" : ""}>
-          <label class="sniper-wallet-amount">
-            <span>Amount</span>
-            <input type="text" inputmode="decimal" value="${escapeHTML(state.amountSol || "")}" data-sniper-wallet-amount="${escapeHTML(wallet.envKey)}" placeholder="0">
-          </label>
-          <div class="sniper-wallet-presets">
-            ${SNIPER_BALANCE_PRESETS.map((preset) => `
-              <button type="button" class="button subtle sniper-preset-button" data-sniper-preset="${escapeHTML(wallet.envKey)}" data-sniper-ratio="${preset.ratio}">
-                ${escapeHTML(preset.label)}
-              </button>
-            `).join("")}
-          </div>
-        </div>
-      </div>
-    `;
-  }).join("");
-}
 
 function renderVanityButtonState() {
   if (!modeVanityButton) return;
   modeVanityButton.classList.toggle("active", Boolean(getNamedValue("vanityPrivateKey").trim()));
 }
 
-function renderSniperUI() {
-  applySniperStateToForm();
-  renderSniperButtonState();
-  renderSniperWalletList();
-}
-
-function showSniperModal() {
-  setSniperModalError("");
-  renderSniperUI();
-  if (sniperModal) sniperModal.hidden = false;
-}
-
-function hideSniperModal() {
-  if (sniperModal) sniperModal.hidden = true;
-}
-
-function validateSniperState() {
-  if (!sniperState.enabled) return [];
-  const wallets = getSniperSelectedEntries();
-  if (wallets.length === 0) return ["Select at least one sniper wallet."];
-  const errors = [];
-  wallets.forEach((entry) => {
-    const amount = Number(entry.amountSol);
-    if (!entry.amountSol || !Number.isFinite(amount) || amount <= 0) {
-      errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} needs a positive buy amount.`);
-    }
-  });
-  return errors;
-}
 
 function showVanityModal() {
   if (vanityPrivateKeyText) vanityPrivateKeyText.value = getNamedValue("vanityPrivateKey");
@@ -1358,8 +1753,16 @@ function applyVanityValue(rawValue) {
 }
 
 function hydrateModeActionState() {
+  const storedDraft = getStoredSniperDraft();
   const enabled = getNamedValue("sniperEnabled") === "true";
   let wallets = {};
+  if (storedDraft) {
+    sniperFeature.setState(storedDraft);
+    applySniperStateToForm();
+    renderSniperUI();
+    renderVanityButtonState();
+    return;
+  }
   try {
     const parsed = JSON.parse(getNamedValue("sniperConfigJson") || "[]");
     if (Array.isArray(parsed)) {
@@ -1367,7 +1770,15 @@ function hydrateModeActionState() {
         if (!entry || !entry.envKey) return accumulator;
         accumulator[entry.envKey] = {
           selected: true,
-          amountSol: normalizeDecimalInput(entry.amountSol || ""),
+          amountSol: entry.amountSol || "",
+          triggerMode: entry.targetBlockOffset != null
+            ? "block-offset"
+            : (entry.submitWithLaunch
+              ? "same-time"
+              : "on-submit"),
+          submitDelayMs: entry.submitDelayMs || 0,
+          targetBlockOffset: entry.targetBlockOffset,
+          retryOnce: Boolean(entry.retryOnce),
         };
         return accumulator;
       }, {});
@@ -1375,218 +1786,10 @@ function hydrateModeActionState() {
   } catch (_error) {
     wallets = {};
   }
-  sniperState = { enabled, wallets };
+  sniperFeature.setState({ enabled, wallets });
+  applySniperStateToForm();
   renderSniperUI();
   renderVanityButtonState();
-}
-
-function hideImageItemMenu() {
-  if (!imageItemMenu) return;
-  imageItemMenu.hidden = true;
-  imageItemMenu.style.left = "";
-  imageItemMenu.style.top = "";
-  activeImageMenuId = "";
-}
-
-function renderImageDetailsTags() {
-  if (!imageDetailsTagList) return;
-  imageDetailsTagList.innerHTML = imageDetailsTagsState.map((tag, index) => `
-    <button type="button" class="image-tag-chip" data-image-tag-index="${index}">
-      <span>${escapeHTML(tag)}</span>
-      <span class="image-tag-chip-remove">&times;</span>
-    </button>
-  `).join("");
-}
-
-function setImageDetailsError(message = "") {
-  if (imageDetailsError) imageDetailsError.textContent = message;
-}
-
-function normalizeImageTag(value) {
-  return String(value || "").trim().replace(/\s+/g, " ").slice(0, 24);
-}
-
-function normalizeImageCategoryName(value) {
-  return String(value || "").trim().replace(/\s+/g, " ").slice(0, 32);
-}
-
-function renderImageDetailsCategoryOptions(selectedCategory = "") {
-  if (!imageDetailsCategory) return;
-  const selected = normalizeImageCategoryName(selectedCategory);
-  const categories = [...imageLibraryState.categories];
-  if (selected && !categories.some((entry) => entry.toLowerCase() === selected.toLowerCase())) {
-    categories.push(selected);
-    categories.sort((a, b) => a.localeCompare(b));
-  }
-  imageDetailsCategory.innerHTML = [
-    '<option value="">Uncategorized</option>',
-    ...categories.map((category) => `<option value="${escapeHTML(category)}">${escapeHTML(category)}</option>`),
-  ].join("");
-  imageDetailsCategory.value = selected;
-}
-
-function addImageDetailTag(rawValue) {
-  const value = normalizeImageTag(rawValue);
-  if (!value) return false;
-  if (imageDetailsTagsState.some((tag) => tag.toLowerCase() === value.toLowerCase())) return false;
-  imageDetailsTagsState.push(value);
-  renderImageDetailsTags();
-  if (imageDetailsTags) imageDetailsTags.value = "";
-  return true;
-}
-
-function setSelectedImage(image) {
-  uploadedImage = image || null;
-  clearMetadataUploadCache({ clearInput: true });
-  if (!image) {
-    imageStatus.textContent = "";
-    imagePath.textContent = "";
-    setImagePreview("");
-    return;
-  }
-  imageStatus.textContent = "";
-  imagePath.textContent = "";
-  setImagePreview(image.previewUrl);
-  scheduleMetadataPreupload({ immediate: true });
-}
-
-function renderImageCategoryChips() {
-  if (!imageCategoryChips) return;
-  imageCategoryChips.innerHTML = imageLibraryState.categories.map((category) => `
-    <button type="button" class="image-category-chip${imageLibraryState.category === category ? " active" : ""}" data-image-category="${escapeHTML(category)}">
-      ${escapeHTML(category)}
-    </button>
-  `).join("");
-  document.querySelectorAll("[data-image-category]").forEach((button) => {
-    button.classList.toggle("active", button.getAttribute("data-image-category") === imageLibraryState.category);
-  });
-}
-
-function renderImageLibraryGrid() {
-  if (!imageLibraryGrid) return;
-  const imageTiles = imageLibraryState.images.map((image) => `
-    <div class="image-library-item${image.id === imageLibraryState.activeImageId ? " active" : ""}" data-image-id="${escapeHTML(image.id)}" tabindex="0" role="button" aria-label="${escapeHTML(image.name || image.fileName || "image")}">
-      <img src="${escapeHTML(image.previewUrl)}" alt="${escapeHTML(image.name || image.fileName || "image")}">
-      <button type="button" class="image-library-item-menu-trigger" data-image-menu-id="${escapeHTML(image.id)}">&hellip;</button>
-    </div>
-  `);
-  imageTiles.push(`
-    <button type="button" class="image-library-item image-library-upload-tile" data-image-upload-tile>
-      <span>+</span>
-    </button>
-  `);
-  imageLibraryGrid.innerHTML = imageTiles.join("");
-  const isEmpty = imageLibraryState.images.length === 0;
-  imageLibraryGrid.hidden = isEmpty;
-  if (imageLibraryEmpty) imageLibraryEmpty.hidden = !isEmpty;
-}
-
-async function fetchImageLibrary() {
-  const params = new URLSearchParams();
-  if (imageLibraryState.search) params.set("search", imageLibraryState.search);
-  if (imageLibraryState.category === "favorites") {
-    params.set("favoritesOnly", "true");
-  } else if (imageLibraryState.category && imageLibraryState.category !== "all") {
-    params.set("category", imageLibraryState.category);
-  }
-  const response = await fetch(`/api/images?${params.toString()}`);
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to load images.");
-  }
-  imageLibraryState.images = Array.isArray(payload.images) ? payload.images : [];
-  imageLibraryState.categories = Array.isArray(payload.categories) ? payload.categories : [];
-  renderImageCategoryChips();
-  renderImageLibraryGrid();
-}
-
-function showImageLibraryModal() {
-  if (imageLibraryModal) imageLibraryModal.hidden = false;
-  imageLibraryState.activeImageId = uploadedImage && uploadedImage.id ? uploadedImage.id : "";
-  fetchImageLibrary().catch((error) => {
-    imageStatus.textContent = error.message;
-  });
-}
-
-function hideImageLibraryModal() {
-  if (imageLibraryModal) imageLibraryModal.hidden = true;
-  hideImageItemMenu();
-}
-
-function showImageDetailsModal(image, options = {}) {
-  if (!image) return;
-  hideImageItemMenu();
-  activeImageDetailsId = image.id;
-  isEditingNewImageUpload = Boolean(options.isNewUpload);
-  setImageDetailsError("");
-  if (imageDetailsName) imageDetailsName.value = image.name || "";
-  imageDetailsTagsState = Array.isArray(image.tags) ? [...image.tags] : [];
-  if (imageDetailsTags) imageDetailsTags.value = "";
-  renderImageDetailsTags();
-  renderImageDetailsCategoryOptions(image.category || "");
-  if (imageDetailsCategoryRow) imageDetailsCategoryRow.hidden = false;
-  if (imageDetailsTitle) {
-    imageDetailsTitle.textContent = options.isNewUpload ? "Name Image" : "Edit Image Details";
-  }
-  if (imageDetailsModal) imageDetailsModal.hidden = false;
-}
-
-function hideImageDetailsModal() {
-  if (imageDetailsModal) imageDetailsModal.hidden = true;
-  setImageDetailsError("");
-  activeImageDetailsId = "";
-  imageDetailsTagsState = [];
-  renderImageDetailsTags();
-  isEditingNewImageUpload = false;
-}
-
-function setImageCategoryError(message = "") {
-  if (imageCategoryError) imageCategoryError.textContent = message;
-}
-
-function showImageCategoryModal(context = "library") {
-  imageCategoryModalContext = context;
-  setImageCategoryError("");
-  if (imageCategoryName) imageCategoryName.value = "";
-  if (imageCategoryModal) imageCategoryModal.hidden = false;
-  if (imageCategoryName) imageCategoryName.focus();
-}
-
-function hideImageCategoryModal() {
-  if (imageCategoryModal) imageCategoryModal.hidden = true;
-  if (imageCategoryName) imageCategoryName.value = "";
-  setImageCategoryError("");
-}
-
-async function createImageCategory(rawName) {
-  const name = normalizeImageCategoryName(rawName);
-  if (!name) {
-    throw new Error("Category name is required.");
-  }
-  const response = await fetch("/api/images/categories", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to create category.");
-  }
-  imageLibraryState.categories = Array.isArray(payload.categories) ? payload.categories : imageLibraryState.categories;
-  renderImageCategoryChips();
-  renderImageDetailsCategoryOptions(payload.category || name);
-  return payload.category || name;
-}
-
-function openImageItemMenu(imageId, anchor) {
-  const image = imageLibraryState.images.find((entry) => entry.id === imageId);
-  if (!image || !anchor || !imageItemMenu) return;
-  activeImageMenuId = imageId;
-  imageMenuFavorite.textContent = image.isFavorite ? "Remove Favorite" : "Add to Favorites";
-  const rect = anchor.getBoundingClientRect();
-  imageItemMenu.style.left = `${Math.max(12, rect.right - 180)}px`;
-  imageItemMenu.style.top = `${rect.bottom + 6}px`;
-  imageItemMenu.hidden = false;
 }
 
 function setImagePreview(previewUrl) {
@@ -1603,6 +1806,39 @@ function setImagePreview(previewUrl) {
 
 function selectedWalletKey() {
   return walletSelect.value || "";
+}
+
+function hasBootstrapConfig() {
+  return Boolean(appBootstrapState.staticLoaded && appBootstrapState.configLoaded && latestWalletStatus && latestWalletStatus.config);
+}
+
+function ensureInteractiveBootstrapReady(message = "App settings are still loading from the backend.") {
+  if (hasBootstrapConfig()) return true;
+  statusNode.textContent = "Loading";
+  metaNode.textContent = message;
+  return false;
+}
+
+function markBootstrapState(nextState = {}) {
+  appBootstrapState = {
+    ...appBootstrapState,
+    ...nextState,
+  };
+}
+
+function setSettingsLoadingState(isLoading) {
+  if (!settingsModal) return;
+  settingsModal.classList.toggle("settings-loading", Boolean(isLoading));
+  const controls = settingsModal.querySelectorAll("input, select, button");
+  controls.forEach((control) => {
+    if (control === settingsClose || control === settingsCancel) return;
+    control.disabled = Boolean(isLoading);
+  });
+}
+
+function selectedWalletRecord() {
+  const wallets = latestWalletStatus && Array.isArray(latestWalletStatus.wallets) ? latestWalletStatus.wallets : [];
+  return wallets.find((wallet) => wallet.envKey === selectedWalletKey()) || null;
 }
 
 function getStoredSelectedWalletKey() {
@@ -1640,40 +1876,44 @@ function walletIndexFromEnvKey(envKey) {
 
 function walletLabel(wallet, balanceSol) {
   if (!wallet) return "No wallet";
-  const index = walletIndexFromEnvKey(wallet.envKey);
-  if (!wallet.publicKey) return `#${index}: invalid`;
+  const displayName = walletDisplayName(wallet);
+  if (!wallet.publicKey) return `${displayName}: invalid`;
   const bal = balanceSol != null ? ` | ${Number(balanceSol).toFixed(4)} SOL` : "";
-  return `#${index} - ${wallet.publicKey}${bal}`;
+  return `${displayName} - ${wallet.publicKey}${bal}`;
 }
 
 function walletDisplayName(wallet) {
   if (!wallet) return "No wallet";
+  if (wallet.customName && String(wallet.customName).trim()) {
+    return String(wallet.customName).trim();
+  }
   const index = walletIndexFromEnvKey(wallet.envKey);
-  return `Imported SOL Key ${index}`;
+  return `#${index}`;
 }
 
 function walletBalanceSol(wallet) {
-  if (!wallet || wallet.balanceSol == null || Number.isNaN(Number(wallet.balanceSol))) return 0;
+  if (!wallet || wallet.balanceSol == null || Number.isNaN(Number(wallet.balanceSol))) return null;
   return Number(wallet.balanceSol);
 }
 
 function formatWalletSol(value) {
-  return Number(value || 0).toFixed(2);
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  return Number(value).toFixed(2);
 }
 
 function formatWalletUsd(value) {
-  return Number(value || 0).toFixed(2);
+  if (value == null || Number.isNaN(Number(value))) return "--";
+  return Number(value).toFixed(2);
 }
 
 function walletUsdValue(wallet) {
-  if (!wallet || wallet.usd1Balance == null || Number.isNaN(Number(wallet.usd1Balance))) return 0;
+  if (!wallet || wallet.usd1Balance == null || Number.isNaN(Number(wallet.usd1Balance))) return null;
   return Number(wallet.usd1Balance);
 }
 
 function renderWalletSummary() {
   if (!walletSummarySol || !walletSummaryUsd) return;
-  const wallets = latestWalletStatus && Array.isArray(latestWalletStatus.wallets) ? latestWalletStatus.wallets : [];
-  const selectedWallet = wallets.find((wallet) => wallet.envKey === selectedWalletKey()) || null;
+  const selectedWallet = selectedWalletRecord();
   walletSummarySol.textContent = formatWalletSol(walletBalanceSol(selectedWallet));
   walletSummaryUsd.textContent = formatWalletUsd(walletUsdValue(selectedWallet));
 }
@@ -1681,10 +1921,15 @@ function renderWalletSummary() {
 function renderWalletDropdownList(wallets = [], selectedKey = "") {
   if (!walletDropdownList) return;
   if (!wallets.length) {
-    walletDropdownList.innerHTML = `<div class="wallet-empty-state">No wallets found</div>`;
+    const emptyMarkup = `<div class="wallet-empty-state">${appBootstrapState.walletsLoaded ? "No wallets found" : "Loading wallets..."}</div>`;
+    if (RenderUtils.setCachedHTML) {
+      RenderUtils.setCachedHTML(renderCache, "walletDropdown", walletDropdownList, emptyMarkup);
+    } else {
+      walletDropdownList.innerHTML = emptyMarkup;
+    }
     return;
   }
-  walletDropdownList.innerHTML = wallets.map((wallet) => {
+  const markup = wallets.map((wallet) => {
     const solValue = walletBalanceSol(wallet);
     const usdValue = walletUsdValue(wallet);
     return `
@@ -1704,6 +1949,11 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
       </button>
     `;
   }).join("");
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "walletDropdown", walletDropdownList, markup);
+  } else {
+    walletDropdownList.innerHTML = markup;
+  }
 }
 
 function setWalletDropdownOpen(isOpen) {
@@ -1900,6 +2150,7 @@ function showFeeSplitModal() {
   if (mode === "regular") {
     feeSplitEnabled.checked = true;
     updateFeeSplitVisibility();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
     if (feeSplitModal) feeSplitModal.hidden = false;
     return;
   }
@@ -2097,6 +2348,7 @@ function attemptCloseAgentSplitModal() {
     setAgentSplitModalError(errors[0]);
     return false;
   }
+  setStoredAgentSplitDraft(serializeAgentSplitDraft());
   setAgentSplitModalError("");
   hideAgentSplitModal();
   return true;
@@ -2200,9 +2452,7 @@ function applyProviderAvailability(providers = {}) {
     Array.from(select.options).forEach((option) => {
       const entry = providers[option.value];
       option.disabled = Boolean(entry && !entry.available);
-      option.textContent = entry && entry.supportState === "unverified"
-        ? `${PROVIDER_LABELS[option.value] || option.textContent.replace(/ \(unverified\)$/, "")} (unverified)`
-        : (PROVIDER_LABELS[option.value] || option.textContent.replace(/ \(unverified\)$/, ""));
+      option.textContent = PROVIDER_LABELS[option.value] || option.textContent.replace(/ \(unverified\)$/, "");
       if (entry && entry.reason) {
         option.title = entry.reason;
       }
@@ -2236,9 +2486,7 @@ function applyLaunchpadAvailability(launchpads = {}) {
       const baseLabel = input.value === "bagsapp"
         ? "Bagsapp"
         : input.value.charAt(0).toUpperCase() + input.value.slice(1);
-      titleNode.textContent = entry && entry.supportState === "unverified"
-        ? `${baseLabel} (unverified)`
-        : baseLabel;
+      titleNode.textContent = baseLabel;
     }
   });
 
@@ -2254,6 +2502,10 @@ function applyLaunchpadAvailability(launchpads = {}) {
 function applyPersistentDefaults(config) {
   if (!config || defaultsApplied) return;
   const defaults = config.defaults || {};
+  const storedSniperDraft = getStoredSniperDraft();
+  const storedMode = getStoredLaunchMode();
+  const storedFeeSplitDraft = getStoredFeeSplitDraft();
+  const storedAgentSplitDraft = getStoredAgentSplitDraft();
   if (defaults.launchpad) {
     const launchpadInput = document.querySelector(`input[name="launchpad"][value="${defaults.launchpad}"]`);
     if (launchpadInput) launchpadInput.checked = true;
@@ -2262,13 +2514,42 @@ function applyPersistentDefaults(config) {
   applyPresetToSettingsInputs(getActivePreset(config));
   if (defaults.automaticDevSell) {
     if (autoSellEnabledInput) autoSellEnabledInput.checked = Boolean(defaults.automaticDevSell.enabled);
-    setNamedValue("automaticDevSellPercent", String(defaults.automaticDevSell.percent || 0));
-    setNamedValue("automaticDevSellDelaySeconds", String(defaults.automaticDevSell.delaySeconds || 0));
+    setNamedValue(
+      "automaticDevSellPercent",
+      String(defaults.automaticDevSell.enabled
+        ? Math.max(1, Number(defaults.automaticDevSell.percent || 100))
+        : Number(defaults.automaticDevSell.percent || 100)),
+    );
+    setNamedValue(
+      "automaticDevSellTriggerMode",
+      normalizeAutoSellTriggerMode(
+        defaults.automaticDevSell.triggerMode
+          || (Number(defaults.automaticDevSell.delaySeconds || 0) > 0 ? "submit-delay" : "confirmation"),
+      ),
+    );
+    setNamedValue(
+      "automaticDevSellDelayMs",
+      String(defaults.automaticDevSell.delayMs != null
+        ? defaults.automaticDevSell.delayMs
+        : Number(defaults.automaticDevSell.delaySeconds || 0) * 1000),
+    );
+    setNamedValue("automaticDevSellBlockOffset", String(defaults.automaticDevSell.targetBlockOffset || 0));
   }
-  if (trackSendBlockHeightToggle) {
-    trackSendBlockHeightToggle.checked = Boolean(defaults.misc && defaults.misc.trackSendBlockHeight);
-  }
+  applyFeeSplitDraft(
+    storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null,
+    { persist: false },
+  );
+  applyAgentSplitDraft(
+    storedAgentSplitDraft || (defaults.misc && defaults.misc.agentSplitDraft) || null,
+    { persist: false },
+  );
+  setMode(storedMode || defaults.mode || "regular");
+  syncDevAutoSellUI();
   setPresetEditing(Boolean(defaults.presetEditing));
+  if (!storedSniperDraft && defaults.misc && defaults.misc.sniperDraft) {
+    sniperFeature.setState(normalizeSniperDraftState(defaults.misc.sniperDraft));
+    applySniperStateToForm();
+  }
   renderQuickDevBuyButtons(config);
   populateDevBuyPresetEditor(config);
   defaultsApplied = true;
@@ -2299,9 +2580,6 @@ function readForm() {
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
   const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
   const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
-  const creationSupportsEndpointProfile = providerSupportsEndpointProfile(getProvider());
-  const buySupportsEndpointProfile = providerSupportsEndpointProfile(getBuyProvider());
-  const sellSupportsEndpointProfile = providerSupportsEndpointProfile(getSellProvider());
   const devBuyAmount = String(values.devBuyAmount || "").trim();
   const agentSplitRecipients = mode === "agent-custom" ? collectAgentSplitRecipients() : [];
   const agentBuyback = agentSplitRecipients.find((entry) => entry.type === "agent");
@@ -2319,14 +2597,8 @@ function readForm() {
     selectedWalletKey: selectedWalletKey(),
     launchpad: getLaunchpad(),
     provider: getProvider(),
-    endpointProfile: creationSupportsEndpointProfile ? getEndpointProfile() : "",
-    policy: getPolicy(),
     buyProvider: getBuyProvider(),
-    buyEndpointProfile: buySupportsEndpointProfile ? getBuyEndpointProfile() : "",
-    buyPolicy: getBuyPolicy(),
     sellProvider: getSellProvider(),
-    sellEndpointProfile: sellSupportsEndpointProfile ? getSellEndpointProfile() : "",
-    sellPolicy: getSellPolicy(),
     activePresetId: getActivePresetId(),
     mode,
     name: values.name || "",
@@ -2361,7 +2633,7 @@ function readForm() {
     enableJito: getProvider() === "jito-bundle" || Number(getNamedValue("creationTipSol") || 0) > 0,
     jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
     skipPreflight: getNamedValue("skipPreflight") === "true",
-    trackSendBlockHeight: Boolean(trackSendBlockHeightToggle && trackSendBlockHeightToggle.checked),
+    trackSendBlockHeight: true,
     feeSplitEnabled: mode === "regular" && feeSplitEnabled.checked,
     feeSplitRecipients: mode === "regular" && feeSplitEnabled.checked ? collectFeeSplitRecipients() : [],
     postLaunchStrategy: getNamedValue("postLaunchStrategy") || "none",
@@ -2371,7 +2643,9 @@ function readForm() {
     sniperConfigJson: getNamedValue("sniperConfigJson") || "[]",
     automaticDevSellEnabled: isNamedChecked("automaticDevSellEnabled"),
     automaticDevSellPercent: getNamedValue("automaticDevSellPercent") || "0",
-    automaticDevSellDelaySeconds: getNamedValue("automaticDevSellDelaySeconds") || "0",
+    automaticDevSellTriggerMode: getAutoSellTriggerMode(),
+    automaticDevSellDelayMs: String(getAutoSellDelayMs()),
+    automaticDevSellBlockOffset: String(getAutoSellBlockOffset()),
     vanityPrivateKey: getNamedValue("vanityPrivateKey") || "",
     imageFileName: uploadedImage ? uploadedImage.fileName : "",
     metadataUri: metadataUri.value || "",
@@ -2564,8 +2838,8 @@ async function ensureMetadataReadyForAction(action) {
   const formValues = readForm();
   if (!formValues.imageFileName) return;
   if (hasFreshPreuploadedMetadata(formValues)) return;
-  if (action === "send") {
-    await uploadMetadataForCurrentForm("send");
+  if (canPreuploadMetadata(formValues)) {
+    await uploadMetadataForCurrentForm(action === "send" ? "send" : "action");
     return;
   }
   if (metadataUploadState.inFlightPromise) {
@@ -2574,7 +2848,11 @@ async function ensureMetadataReadyForAction(action) {
       return;
     }
   }
-  throw new Error(`Metadata is still uploading. Wait for the pre-upload to finish before ${action}.`);
+  throw new Error(
+    action === "send"
+      ? "Select an image and fill in both name and ticker before deploying."
+      : `Select an image and fill in both name and ticker before ${action}.`,
+  );
 }
 
 function renderWalletOptions(wallets, selectedKey, balanceSol) {
@@ -2605,65 +2883,168 @@ function renderWalletOptions(wallets, selectedKey, balanceSol) {
   renderWalletSummary();
 }
 
+function applySelectedWalletLocally(nextKey) {
+  if (!latestWalletStatus || !Array.isArray(latestWalletStatus.wallets)) return;
+  const selectedWallet = latestWalletStatus.wallets.find((wallet) => wallet.envKey === nextKey) || null;
+  latestWalletStatus = {
+    ...latestWalletStatus,
+    selectedWalletKey: nextKey,
+    connected: Boolean(selectedWallet && selectedWallet.publicKey),
+    wallet: selectedWallet && selectedWallet.publicKey ? selectedWallet.publicKey : null,
+    balanceLamports: selectedWallet && selectedWallet.balanceLamports != null ? selectedWallet.balanceLamports : null,
+    balanceSol: selectedWallet && selectedWallet.balanceSol != null ? selectedWallet.balanceSol : null,
+    usd1Balance: selectedWallet && selectedWallet.usd1Balance != null ? selectedWallet.usd1Balance : null,
+  };
+  if (walletSelect) walletSelect.value = nextKey;
+  renderWalletOptions(latestWalletStatus.wallets, nextKey, latestWalletStatus.balanceSol);
+  renderSniperUI();
+  if (!selectedWallet || !selectedWallet.publicKey) {
+    if (walletBalance) walletBalance.textContent = "-";
+    metaNode.textContent = selectedWallet && selectedWallet.error ? selectedWallet.error : "Wallet unavailable";
+    updateLockedModeFields();
+    return;
+  }
+  if (walletBalance) {
+    walletBalance.textContent = latestWalletStatus.balanceSol == null
+      ? "--"
+      : `${Number(latestWalletStatus.balanceSol).toFixed(4)} SOL`;
+  }
+  metaNode.textContent = `Using ${walletLabel(selectedWallet)}`;
+  updateLockedModeFields();
+}
+
 async function refreshWalletStatus(preserveSelection = true) {
   try {
     const wallet = preserveSelection ? selectedWalletKey() : "";
-    const url = wallet ? `/api/status?wallet=${encodeURIComponent(wallet)}` : "/api/status";
-    const response = await fetch(url);
-    const payload = await response.json();
+    const url = wallet ? `/api/wallet-status?wallet=${encodeURIComponent(wallet)}` : "/api/wallet-status";
+    const result = RequestUtils.fetchJsonLatest
+      ? await RequestUtils.fetchJsonLatest("wallet-status", url, {}, requestStates.walletStatus)
+      : null;
+    if (result && result.aborted) return;
+    const response = result ? result.response : await fetch(url);
+    const payload = result ? result.payload : await response.json();
+    if (result && !result.isLatest) return;
+    walletStatusRequestSerial += 1;
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Failed to load wallet status.");
     }
     applyWalletStatusPayload(payload);
   } catch (error) {
-    if (walletBalance) walletBalance.textContent = "-";
+    if (walletBalance && !latestWalletStatus) walletBalance.textContent = "-";
     metaNode.textContent = error.message;
   }
 }
 
-function applyWalletStatusPayload(payload) {
-  latestWalletStatus = payload;
-  renderWalletOptions(payload.wallets || [], payload.selectedWalletKey || "", payload.balanceSol);
+function applyBootstrapFastPayload(payload) {
+  latestWalletStatus = {
+    ...(latestWalletStatus || {}),
+    selectedWalletKey: payload.selectedWalletKey || "",
+    wallets: Array.isArray(payload.wallets) ? payload.wallets : [],
+    wallet: payload.wallet || null,
+    connected: Boolean(payload.connected),
+    balanceLamports: payload.balanceLamports == null ? null : payload.balanceLamports,
+    balanceSol: payload.balanceSol == null ? null : payload.balanceSol,
+    usd1Balance: payload.usd1Balance == null ? null : payload.usd1Balance,
+    config: payload.config,
+    regionRouting: payload.regionRouting || null,
+    providers: payload.providers || {},
+    launchpads: payload.launchpads || {},
+  };
+  renderWalletOptions(latestWalletStatus.wallets || [], latestWalletStatus.selectedWalletKey || "", latestWalletStatus.balanceSol);
   applyPersistentDefaults(payload.config);
   applyProviderAvailability(payload.providers || {});
   applyLaunchpadAvailability(payload.launchpads || {});
   renderQuickDevBuyButtons(payload.config);
   populateDevBuyPresetEditor(payload.config);
+  updateQuote().catch(() => {});
   renderSniperUI();
+  renderBackendRegionSummary(payload.regionRouting);
+  markBootstrapState({
+    staticLoaded: true,
+    configLoaded: Boolean(payload.config),
+  });
+  setSettingsLoadingState(!hasBootstrapConfig());
+  schedulePopoutAutosize();
+}
 
-  if (!payload.connected) {
+function applyRuntimeStatusPayload(payload) {
+  latestRuntimeStatus = payload;
+  markBootstrapState({ runtimeLoaded: true });
+}
+
+function applyWalletStatusPayload(payload) {
+  latestWalletStatus = {
+    ...(latestWalletStatus || {}),
+    ...payload,
+    config: payload.config || (latestWalletStatus && latestWalletStatus.config) || null,
+    regionRouting: payload.regionRouting || (latestWalletStatus && latestWalletStatus.regionRouting) || null,
+    providers: payload.providers || (latestWalletStatus && latestWalletStatus.providers) || {},
+    launchpads: payload.launchpads || (latestWalletStatus && latestWalletStatus.launchpads) || {},
+  };
+  const wallets = latestWalletStatus.wallets || [];
+  const selectedWalletKeyValue = latestWalletStatus.selectedWalletKey || "";
+  renderWalletOptions(wallets, selectedWalletKeyValue, latestWalletStatus.balanceSol);
+  renderSniperUI();
+  markBootstrapState({ walletsLoaded: true });
+  if (!latestWalletStatus.connected) {
     if (walletBalance) walletBalance.textContent = "-";
     metaNode.textContent = "No wallet configured. Add SOLANA_PRIVATE_KEY to .env.";
     updateLockedModeFields();
+    schedulePopoutAutosize();
     return;
   }
 
-  if (walletBalance) walletBalance.textContent = `${Number(payload.balanceSol).toFixed(4)} SOL`;
-  const selectedWallet = (payload.wallets || []).find((walletEntry) => walletEntry.envKey === payload.selectedWalletKey);
+  if (walletBalance) {
+    walletBalance.textContent = latestWalletStatus.balanceSol == null
+      ? "--"
+      : `${Number(latestWalletStatus.balanceSol).toFixed(4)} SOL`;
+  }
+  const selectedWallet = wallets.find((walletEntry) => walletEntry.envKey === selectedWalletKeyValue);
   metaNode.textContent = selectedWallet ? `Using ${walletLabel(selectedWallet)}` : "Wallet ready";
   updateLockedModeFields();
+  schedulePopoutAutosize();
 }
 
 async function bootstrapApp() {
-  const response = await fetch("/api/bootstrap");
-  const payload = await response.json();
+  markBootstrapState({ started: true });
+  setSettingsLoadingState(true);
+  const storedWalletKey = getStoredSelectedWalletKey();
+  const bootstrapUrl = storedWalletKey
+    ? `/api/bootstrap-fast?wallet=${encodeURIComponent(storedWalletKey)}`
+    : "/api/bootstrap-fast";
+  const result = RequestUtils.fetchJsonLatest
+    ? await RequestUtils.fetchJsonLatest("bootstrap-fast", bootstrapUrl, {}, requestStates.bootstrap)
+    : null;
+  if (result && result.aborted) return;
+  const response = result ? result.response : await fetch(bootstrapUrl);
+  const payload = result ? result.payload : await response.json();
+  if (result && !result.isLatest) return;
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || "Failed to load app bootstrap.");
   }
-  applyWalletStatusPayload(payload);
-  const storedWalletKey = getStoredSelectedWalletKey();
-  const availableWallets = Array.isArray(payload.wallets) ? payload.wallets : [];
-  if (
-    storedWalletKey
-    && storedWalletKey !== (payload.selectedWalletKey || "")
-    && availableWallets.some((wallet) => wallet && wallet.envKey === storedWalletKey)
-    && walletSelect
-  ) {
-    walletSelect.value = storedWalletKey;
-    await refreshWalletStatus(true);
-  }
+  applyBootstrapFastPayload(payload);
+  refreshWalletStatus(true).catch(() => {});
+  refreshRuntimeStatus().catch(() => {});
   fetch("/api/lookup-tables/warm", { method: "POST" }).catch(() => {});
   fetch("/api/pump-global/warm", { method: "POST" }).catch(() => {});
+}
+
+async function refreshRuntimeStatus() {
+  try {
+    const result = RequestUtils.fetchJsonLatest
+      ? await RequestUtils.fetchJsonLatest("runtime-status", "/api/runtime-status", {}, requestStates.runtimeStatus)
+      : null;
+    if (result && result.aborted) return;
+    const response = result ? result.response : await fetch("/api/runtime-status");
+    const payload = result ? result.payload : await response.json();
+    if (result && !result.isLatest) return;
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "Failed to load runtime status.");
+    }
+    applyRuntimeStatusPayload(payload);
+  } catch (_error) {
+    // Keep runtime hydration best-effort so boot remains responsive.
+  }
 }
 
 async function updateQuote() {
@@ -2681,8 +3062,14 @@ async function updateQuote() {
 
   try {
     const mode = getDevBuyMode();
-    const response = await fetch(`/api/quote?mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`);
-    const payload = await response.json();
+    const url = `/api/quote?mode=${encodeURIComponent(mode)}&amount=${encodeURIComponent(buyAmount)}`;
+    const result = RequestUtils.fetchJsonLatest
+      ? await RequestUtils.fetchJsonLatest("quote", url, {}, requestStates.quote)
+      : null;
+    if (result && result.aborted) return;
+    const response = result ? result.response : await fetch(url);
+    const payload = result ? result.payload : await response.json();
+    if (result && !result.isLatest) return;
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Quote failed.");
     }
@@ -2708,25 +3095,24 @@ async function updateQuote() {
 }
 
 function queueQuoteUpdate() {
+  if (RequestUtils.scheduleDebounced) {
+    RequestUtils.scheduleDebounced(requestStates.quote, 250, () => {
+      updateQuote().catch((error) => {
+        quoteOutput.textContent = error.message;
+      });
+    });
+    return;
+  }
   clearTimeout(quoteTimer);
   quoteTimer = setTimeout(updateQuote, 250);
 }
 
 async function uploadSelectedImage(file) {
-  const dataUrl = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error("Failed to read image."));
-    reader.readAsDataURL(file);
-  });
-
+  const formData = new FormData();
+  formData.append("file", file, file.name);
   const response = await fetch("/api/upload-image", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      filename: file.name,
-      dataUrl,
-    }),
+    body: formData,
   });
 
   const payload = await response.json();
@@ -2866,13 +3252,19 @@ const fieldValidators = {
   automaticDevSellPercent(v) {
     if (!isNamedChecked("automaticDevSellEnabled")) return "";
     const n = Number(v);
-    if (isNaN(n) || n < 0 || n > 100) return "Must be between 0 and 100";
+    if (isNaN(n) || n <= 0 || n > 100) return "Must be between 1 and 100";
     return "";
   },
-  automaticDevSellDelaySeconds(v) {
-    if (!isNamedChecked("automaticDevSellEnabled")) return "";
+  automaticDevSellDelayMs(v) {
+    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerMode() !== "submit-delay") return "";
     const n = Number(v);
-    if (isNaN(n) || n < 0 || n > 10) return "Must be between 0 and 10";
+    if (isNaN(n) || n < 0 || n > 1500) return "Must be between 0 and 1500";
+    return "";
+  },
+  automaticDevSellBlockOffset(v) {
+    if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerMode() !== "block-offset") return "";
+    const n = Number(v);
+    if (isNaN(n) || n < 0 || n > 5) return "Must be between 0 and 5";
     return "";
   },
   agentUnlockedBuybackPercent(v) {
@@ -3048,7 +3440,7 @@ function buildDeployPreviewHTML() {
     : "-";
   const sniperText = f.sniperEnabled
     ? (f.sniperWallets.length
-      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} SOL`).join(" | ")
+      ? f.sniperWallets.map((entry) => `#${walletIndexFromEnvKey(entry.envKey)} ${entry.amountSol} SOL @ ${entry.targetBlockOffset != null ? `b${entry.targetBlockOffset}` : (entry.submitWithLaunch ? "same-time" : getSniperTriggerSummary(entry).toLowerCase())}`).join(" | ")
       : "Enabled")
     : "Off";
   const vanityText = f.vanityPrivateKey ? "Custom vanity key attached" : "Off";
@@ -3060,17 +3452,17 @@ function buildDeployPreviewHTML() {
     { label: "Platform", value: f.launchpad || "pump", cls: "" },
     {
       label: "Creation",
-      value: `${PROVIDER_LABELS[f.provider || "helius-sender"] || (f.provider || "helius-sender")}${f.endpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.endpointProfile] || f.endpointProfile}` : ""} / ${f.policy || "safe"}`,
+      value: `${PROVIDER_LABELS[f.provider || "helius-sender"] || (f.provider || "helius-sender")}`,
       cls: "",
     },
     {
       label: "Buy Route",
-      value: `${PROVIDER_LABELS[f.buyProvider || "helius-sender"] || (f.buyProvider || "helius-sender")}${f.buyEndpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.buyEndpointProfile] || f.buyEndpointProfile}` : ""} / ${f.buyPolicy || "safe"} | slip ${f.buySlippagePercent || "90"}%`,
+      value: `${PROVIDER_LABELS[f.buyProvider || "helius-sender"] || (f.buyProvider || "helius-sender")} | slip ${f.buySlippagePercent || "90"}%`,
       cls: "secondary",
     },
     {
       label: "Sell Route",
-      value: `${PROVIDER_LABELS[f.sellProvider || "helius-sender"] || (f.sellProvider || "helius-sender")}${f.sellEndpointProfile ? ` / ${ENDPOINT_PROFILE_LABELS[f.sellEndpointProfile] || f.sellEndpointProfile}` : ""} / ${f.sellPolicy || "safe"} | slip ${f.sellSlippagePercent || "90"}%`,
+      value: `${PROVIDER_LABELS[f.sellProvider || "helius-sender"] || (f.sellProvider || "helius-sender")} | slip ${f.sellSlippagePercent || "90"}%`,
       cls: "secondary",
     },
     { label: "Mode", value: `${modeLabels[f.mode] || f.mode}${f.mayhemMode ? " + Mayhem" : ""}`, cls: "" },
@@ -3079,7 +3471,7 @@ function buildDeployPreviewHTML() {
     { label: "Dev Buy", value: devBuyText, cls: "" },
     ...(f.automaticDevSellEnabled ? [{
       label: "Dev Auto Sell",
-      value: `${f.automaticDevSellPercent || "0"}% after ${Number(f.automaticDevSellDelaySeconds || 0).toFixed(1)}s`,
+      value: getAutoSellSummaryText(f),
       cls: "secondary",
     }] : []),
     { label: "Sniper", value: sniperText, cls: "secondary" },
@@ -3122,6 +3514,7 @@ function hideDeployModal() {
 }
 
 async function run(action) {
+  if (!ensureInteractiveBootstrapReady()) return;
   const actualAction = action === "deploy" ? "send" : action;
   const label = action === "deploy" ? "Deploying..." : action === "simulate" ? "Simulating..." : "Building...";
   const clientActionStartedAt = performance.now();
@@ -3151,28 +3544,36 @@ async function run(action) {
     const wallet = latestWalletStatus && latestWalletStatus.selectedWalletKey
       ? `Using #${walletIndexFromEnvKey(latestWalletStatus.selectedWalletKey)}`
       : "Wallet ready";
-    metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "helius-sender"} | Mint: ${shortAddress(payload.report.mint)}`;
+    const followMeta = payload.report && payload.report.followDaemon && payload.report.followDaemon.enabled
+      ? ` | Follow: ${payload.report.followDaemon.job && payload.report.followDaemon.job.state ? payload.report.followDaemon.job.state : "armed"}`
+      : "";
+    metaNode.textContent = `${wallet} | ${payload.report.launchpad || "pump"} | ${payload.report.execution.resolvedProvider || payload.report.execution.provider || "helius-sender"} | Mint: ${shortAddress(payload.report.mint)}${followMeta}`;
     metadataUri.value = payload.metadataUri || "";
     if (payload.metadataUri) {
       metadataUploadState.completedFingerprint = metadataFingerprintFromForm(readForm());
     }
     output.textContent = payload.text;
+    setBusy(false, statusNode.textContent || "Idle");
     if (payload.sendLogPath) {
-      await refreshReportsTerminal({
+      refreshReportsTerminal({
         preserveSelection: false,
         preferId: extractReportIdFromPath(payload.sendLogPath),
       }).catch((error) => {
         if (reportsTerminalOutput && reportsTerminalSection && !reportsTerminalSection.hidden) {
-          reportsTerminalOutput.textContent = error.message || "Failed to refresh reports.";
+          reportsTerminalState.activePayload = null;
+          reportsTerminalState.activeText = error.message || "Failed to refresh reports.";
+          renderReportsTerminalOutput();
         }
       });
     }
-    await refreshWalletStatus(true);
+    refreshWalletStatus(true).catch(() => {});
   } catch (error) {
     statusNode.textContent = "Error";
     output.textContent = error.message;
   } finally {
-    setBusy(false, statusNode.textContent || "Idle");
+    if (buttons.some((button) => button.disabled)) {
+      setBusy(false, statusNode.textContent || "Idle");
+    }
   }
 }
 
@@ -3188,12 +3589,17 @@ function buildSavedConfigFromForm() {
     activePresetId: f.activePresetId || DEFAULT_PRESET_ID,
     presetEditing: isPresetEditing(base),
     misc: {
-      trackSendBlockHeight: Boolean(f.trackSendBlockHeight),
+      ...(base.defaults && base.defaults.misc ? base.defaults.misc : {}),
+      sniperDraft: normalizeSniperDraftState(sniperFeature.getState()),
+      feeSplitDraft: normalizeFeeSplitDraft(serializeFeeSplitDraft()),
+      agentSplitDraft: normalizeAgentSplitDraft(serializeAgentSplitDraft()),
     },
     automaticDevSell: {
       enabled: Boolean(f.automaticDevSellEnabled),
-      percent: Number(f.automaticDevSellPercent || 0),
-      delaySeconds: Number(f.automaticDevSellDelaySeconds || 0),
+      percent: Number(f.automaticDevSellPercent || 100),
+      triggerMode: normalizeAutoSellTriggerMode(f.automaticDevSellTriggerMode),
+      delayMs: Number(f.automaticDevSellDelayMs || 0),
+      targetBlockOffset: Number(f.automaticDevSellBlockOffset || 0),
     },
   };
 
@@ -3204,8 +3610,6 @@ function buildSavedConfigFromForm() {
         creationSettings: {
           ...preset.creationSettings,
           provider: f.provider || "helius-sender",
-          endpointProfile: f.endpointProfile || "global",
-          policy: f.policy || "safe",
           tipSol: f.creationTipSol || "",
           priorityFeeSol: f.priorityFeeSol || "",
           devBuySol: (preset.creationSettings && preset.creationSettings.devBuySol) || "",
@@ -3213,8 +3617,6 @@ function buildSavedConfigFromForm() {
         buySettings: {
           ...preset.buySettings,
           provider: f.buyProvider || "helius-sender",
-          endpointProfile: f.buyEndpointProfile || "global",
-          policy: f.buyPolicy || "safe",
           priorityFeeSol: f.buyPriorityFeeSol || "",
           tipSol: f.buyTipSol || "",
           slippagePercent: f.buySlippagePercent || "",
@@ -3222,8 +3624,6 @@ function buildSavedConfigFromForm() {
         sellSettings: {
           ...preset.sellSettings,
           provider: f.sellProvider || "helius-sender",
-          endpointProfile: f.sellEndpointProfile || "global",
-          policy: f.sellPolicy || "safe",
           priorityFeeSol: f.sellPriorityFeeSol || "",
           tipSol: f.sellTipSol || "",
           slippagePercent: f.sellSlippagePercent || "",
@@ -3235,24 +3635,40 @@ function buildSavedConfigFromForm() {
 }
 
 async function saveSettings() {
+  if (!hasBootstrapConfig()) {
+    statusNode.textContent = "Loading";
+    metaNode.textContent = "Settings are still loading from the backend.";
+    return;
+  }
   setBusy(true, "Saving defaults...");
   try {
-    const response = await fetch("/api/settings", {
+    const result = RequestUtils.fetchJsonLatest
+      ? await RequestUtils.fetchJsonLatest("settings-save", "/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          config: buildSavedConfigFromForm(),
+        }),
+      })
+      : null;
+    const response = result ? result.response : await fetch("/api/settings", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         config: buildSavedConfigFromForm(),
       }),
     });
-    const payload = await response.json();
+    const payload = result ? result.payload : await response.json();
     if (!response.ok || !payload.ok) {
       throw new Error(payload.error || "Failed to save settings.");
     }
     statusNode.textContent = "Defaults saved";
+    setRegionRouting(payload.regionRouting || (latestWalletStatus && latestWalletStatus.regionRouting));
     setConfig(payload.config);
     metaNode.textContent = "Launch defaults and selected presets saved.";
     renderQuickDevBuyButtons(payload.config);
     populateDevBuyPresetEditor(payload.config);
+    renderBackendRegionSummary(payload.regionRouting);
     hideSettingsModal();
   } catch (error) {
     statusNode.textContent = "Error";
@@ -3263,9 +3679,17 @@ async function saveSettings() {
 }
 
 function showSettingsModal() {
+  if (!hasBootstrapConfig()) {
+    setSettingsLoadingState(true);
+    renderBackendRegionSummary(null);
+    if (settingsModal) settingsModal.hidden = false;
+    return;
+  }
+  setSettingsLoadingState(false);
   renderPresetChips();
   applyPresetToSettingsInputs(getActivePreset(getConfig()), { syncToMainForm: false });
   setPresetEditing(isPresetEditing(getConfig()));
+  renderBackendRegionSummary();
   if (settingsModal) settingsModal.hidden = false;
 }
 
@@ -3297,6 +3721,7 @@ function setOutputSectionVisible(isVisible) {
   } catch (_error) {
     // Ignore storage access failures and keep the UI functional.
   }
+  schedulePopoutAutosize();
 }
 
 function getStoredReportsTerminalVisible() {
@@ -3308,6 +3733,35 @@ function getStoredReportsTerminalVisible() {
     // Ignore storage access failures and fall back to hidden state.
   }
   return false;
+}
+
+function getStoredImageLayoutCompact() {
+  try {
+    return window.localStorage.getItem(IMAGE_LAYOUT_COMPACT_STORAGE_KEY) === "true";
+  } catch (_error) {
+    return false;
+  }
+}
+
+function setImageLayoutCompact(isCompact, { persist = true } = {}) {
+  const compact = Boolean(isCompact);
+  if (tokenSurfaceSection) {
+    tokenSurfaceSection.classList.toggle("is-image-compact", compact);
+  }
+  if (imageLayoutToggle) {
+    imageLayoutToggle.setAttribute("aria-pressed", String(compact));
+    const label = compact ? "Expand image field" : "Compact image field";
+    imageLayoutToggle.setAttribute("aria-label", label);
+    imageLayoutToggle.setAttribute("title", label);
+  }
+  if (persist) {
+    try {
+      window.localStorage.setItem(IMAGE_LAYOUT_COMPACT_STORAGE_KEY, String(compact));
+    } catch (_error) {
+      // Ignore storage failures and keep the UI functional.
+    }
+  }
+  schedulePopoutAutosize();
 }
 
 function getStoredReportsTerminalSort() {
@@ -3334,80 +3788,493 @@ function getCurrentReportsTerminalListWidth() {
   return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
 }
 
-function getStoredReportsTerminalListWidth() {
-  try {
-    return clampReportsTerminalListWidth(window.localStorage.getItem(REPORTS_TERMINAL_LIST_WIDTH_KEY));
-  } catch (_error) {
-    return REPORTS_TERMINAL_DEFAULT_LIST_WIDTH;
-  }
-}
-
-function setReportsTerminalListWidth(width, { persist = true } = {}) {
-  if (!reportsTerminalSection) return;
-  const normalized = clampReportsTerminalListWidth(width);
-  reportsTerminalSection.style.setProperty("--reports-terminal-list-width", `${normalized}px`);
-  if (reportsTerminalResizeHandle) {
-    reportsTerminalResizeHandle.setAttribute("aria-valuemin", String(REPORTS_TERMINAL_MIN_LIST_WIDTH));
-    reportsTerminalResizeHandle.setAttribute("aria-valuemax", String(REPORTS_TERMINAL_MAX_LIST_WIDTH));
-    reportsTerminalResizeHandle.setAttribute("aria-valuenow", String(normalized));
-  }
-  if (!persist) return;
-  try {
-    window.localStorage.setItem(REPORTS_TERMINAL_LIST_WIDTH_KEY, String(normalized));
-  } catch (_error) {
-    // Ignore storage failures and keep the UI functional.
-  }
-}
-
-function setReportsTerminalVisible(isVisible, { persist = true } = {}) {
-  document.documentElement.classList.toggle("reports-hidden", !isVisible);
-  document.body.classList.toggle("reports-hidden", !isVisible);
-  if (reportsTerminalSection) reportsTerminalSection.hidden = !isVisible;
-  if (toggleReportsButton) {
-    toggleReportsButton.classList.toggle("active", isVisible);
-    toggleReportsButton.setAttribute("aria-pressed", String(isVisible));
-  }
-  if (isVisible) {
-    refreshReportsTerminal().catch((error) => {
-      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to load reports.";
-    });
-  }
-  if (!persist) return;
-  try {
-    window.localStorage.setItem(REPORTS_TERMINAL_VISIBILITY_KEY, String(isVisible));
-  } catch (_error) {
-    // Ignore storage failures and keep the UI functional.
-  }
-}
-
-function setReportsTerminalSort(sort, { persist = true } = {}) {
-  reportsTerminalState.sort = sort === "oldest" ? "oldest" : "newest";
-  if (reportsSortButton) {
-    reportsSortButton.textContent = reportsTerminalState.sort === "oldest" ? "Oldest" : "Newest";
-  }
-  if (!persist) return;
-  try {
-    window.localStorage.setItem(REPORTS_TERMINAL_SORT_KEY, reportsTerminalState.sort);
-  } catch (_error) {
-    // Ignore storage failures and keep the UI functional.
-  }
-}
-
 function describeReportEntry(entry) {
   const parts = [];
   if (entry.displayTime) parts.push(entry.displayTime);
   if (entry.provider) parts.push(entry.provider);
   if (entry.signatureCount) parts.push(`${entry.signatureCount} sig${entry.signatureCount === 1 ? "" : "s"}`);
+  if (entry.followEnabled) {
+    const followBits = [];
+    if (entry.followState) followBits.push(`follow ${entry.followState}`);
+    if (entry.followActionCount) followBits.push(`${entry.followConfirmedCount || 0}/${entry.followActionCount} done`);
+    if (entry.followProblemCount) followBits.push(`${entry.followProblemCount} issue${entry.followProblemCount === 1 ? "" : "s"}`);
+    if (followBits.length) parts.push(followBits.join(" | "));
+  }
   return parts.join(" | ");
+}
+
+function normalizeReportsTerminalTab(tab) {
+  const normalized = String(tab || "").trim().toLowerCase();
+  return ["overview", "actions", "benchmarks", "raw"].includes(normalized) ? normalized : "overview";
+}
+
+function currentReportsTerminalEntry() {
+  return reportsTerminalState.entries.find((entry) => entry.id === reportsTerminalState.activeId) || null;
+}
+
+function currentReportsTerminalPayload() {
+  return reportsTerminalState.activePayload && typeof reportsTerminalState.activePayload === "object"
+    ? reportsTerminalState.activePayload
+    : null;
+}
+
+function currentReportsTerminalReport() {
+  const payload = currentReportsTerminalPayload();
+  return payload && payload.report && typeof payload.report === "object" ? payload.report : null;
+}
+
+function currentReportsTerminalFollowJob() {
+  const report = currentReportsTerminalReport();
+  return report && report.followDaemon && report.followDaemon.job && typeof report.followDaemon.job === "object"
+    ? report.followDaemon.job
+    : null;
+}
+
+function currentReportsTerminalFollowActions() {
+  const job = currentReportsTerminalFollowJob();
+  return job && Array.isArray(job.actions) ? job.actions : [];
+}
+
+function currentReportsTerminalBenchmark() {
+  const report = currentReportsTerminalReport();
+  return report && report.benchmark && typeof report.benchmark === "object" ? report.benchmark : null;
+}
+
+function currentReportsTerminalExecution() {
+  const report = currentReportsTerminalReport();
+  return report && report.execution && typeof report.execution === "object" ? report.execution : null;
+}
+
+function currentReportsTerminalTimingProfiles() {
+  const report = currentReportsTerminalReport();
+  return report
+    && report.followDaemon
+    && Array.isArray(report.followDaemon.timingProfiles)
+    ? report.followDaemon.timingProfiles
+    : [];
+}
+
+function formatReportMetric(value, suffix = "", fallback = "--", digits = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return `${numeric.toFixed(digits)}${suffix}`;
+}
+
+function formatReportTimestamp(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "--";
+  try {
+    return new Date(numeric).toLocaleTimeString();
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function formatReportLatencyDelta(startMs, endMs) {
+  const start = Number(startMs);
+  const end = Number(endMs);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "--";
+  return `${Math.round(end - start)}ms`;
+}
+
+function reportStateClass(state) {
+  const normalized = String(state || "").trim().toLowerCase();
+  if (["confirmed", "completed", "success", "healthy"].includes(normalized)) return "is-good";
+  if (["running", "eligible", "armed", "queued", "sent"].includes(normalized)) return "is-warn";
+  if (["failed", "cancelled", "expired", "completed-with-failures"].includes(normalized)) return "is-bad";
+  return "";
+}
+
+function inferReportErrorCategory(message) {
+  const normalized = String(message || "").toLowerCase();
+  if (!normalized) return "";
+  if (normalized.includes("os error 1224") || normalized.includes("user-mapped section")) return "local write race";
+  if (normalized.includes("insufficient funds")) return "insufficient funds";
+  if (normalized.includes("was not found") || normalized.includes("account")) return "account visibility";
+  if (normalized.includes("custom") || normalized.includes("instructionerror")) return "on-chain failure";
+  if (normalized.includes("timeout") || normalized.includes("too many requests") || normalized.includes("unavailable")) return "transport/rpc";
+  return "action failure";
+}
+
+function describeFollowActionTrigger(action) {
+  if (!action || typeof action !== "object") return "Immediate";
+  if (action.requireConfirmation) return "After confirmation";
+  if (action.targetBlockOffset != null) return `Block ${action.targetBlockOffset}`;
+  if (Number(action.submitDelayMs || 0) > 0) return `Submit + ${action.submitDelayMs}ms`;
+  if (Number(action.delayMs || 0) > 0) return `Delay ${action.delayMs}ms`;
+  return "Immediate";
+}
+
+function describeFollowActionSize(action) {
+  if (!action || typeof action !== "object") return "--";
+  if (action.buyAmountSol) return `${action.buyAmountSol} SOL`;
+  if (action.sellPercent != null) return `${action.sellPercent}%`;
+  return "--";
+}
+
+function describeFollowActionWallet(action) {
+  if (!action || !action.walletEnvKey) return "--";
+  return `Wallet #${walletIndexFromEnvKey(action.walletEnvKey)}`;
+}
+
+function shortenReportEndpoint(endpoint) {
+  const raw = String(endpoint || "").trim();
+  if (!raw) return "--";
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    if (host.includes("helius-rpc.com")) {
+      if (host.startsWith("mainnet.")) return "Helius WS";
+      if (host.includes("-sender.")) {
+        const region = host.split("-sender.")[0];
+        return `${region.toUpperCase()} sender`;
+      }
+      return "Helius";
+    }
+    if (host.includes("jito")) return host.replace(/^https?:\/\//, "");
+    const label = host.replace(/^www\./, "");
+    return label.length > 24 ? shortenAddress(label, 10) : label;
+  } catch (_error) {
+    return raw.length > 24 ? shortenAddress(raw, 10) : raw;
+  }
+}
+
+function renderCopyableHash(value, label = "Copy hash") {
+  const raw = String(value || "").trim();
+  if (!raw) return "--";
+  return `
+    <button
+      type="button"
+      class="reports-copy-hash"
+      data-copy-value="${escapeHTML(raw)}"
+      title="${escapeHTML(label)}"
+    >
+      ${escapeHTML(shortenAddress(raw, 8))}
+    </button>
+  `;
+}
+
+function buildFollowActionMetricItems(action, followJob) {
+  const isBuy = String(action && action.kind || "").toLowerCase() === "sniper-buy";
+  const metrics = [
+    { label: "Wallet", value: describeFollowActionWallet(action) },
+    { label: "Trigger", value: describeFollowActionTrigger(action) },
+    { label: "Size", value: describeFollowActionSize(action) },
+    { label: "Start Block", value: action && action.sendObservedBlockHeight != null ? String(action.sendObservedBlockHeight) : isBuy && followJob && followJob.sendObservedBlockHeight != null ? `launch ${followJob.sendObservedBlockHeight}` : "--" },
+    { label: "Confirm Block", value: action && action.confirmedObservedBlockHeight != null ? String(action.confirmedObservedBlockHeight) : "--" },
+    { label: "Blocks", value: action && action.blocksToConfirm != null ? String(action.blocksToConfirm) : "--" },
+    { label: "Endpoint", value: shortenReportEndpoint(action && action.endpoint) },
+    { label: "Attempts", value: String(action && action.attemptCount != null ? action.attemptCount : 0) },
+  ];
+  if (!isBuy) {
+    metrics.push(
+      { label: "Scheduled", value: formatReportTimestamp(action && action.scheduledForMs) },
+      { label: "Started", value: formatReportTimestamp(action && action.submitStartedAtMs) },
+      { label: "Submitted", value: formatReportTimestamp(action && action.submittedAtMs) },
+      { label: "Confirmed", value: formatReportTimestamp(action && action.confirmedAtMs) },
+      { label: "Submit->Confirm", value: formatReportLatencyDelta(action && action.submittedAtMs, action && action.confirmedAtMs) },
+    );
+  } else {
+    metrics.push(
+      { label: "Launch->Submit", value: followJob ? formatReportLatencyDelta(followJob.submitAtMs, action && action.submittedAtMs) : "--" },
+      { label: "Submit Time", value: formatReportTimestamp(action && action.submittedAtMs) },
+    );
+  }
+  return metrics;
+}
+
+function renderReportMetricGrid(items = []) {
+  const visible = items.filter((item) => item && item.value != null && item.value !== "");
+  if (!visible.length) {
+    return '<div class="reports-terminal-empty">No metrics available for this section.</div>';
+  }
+  return `
+    <div class="reports-metric-grid">
+      ${visible.map((item) => `
+        <div class="reports-metric-card">
+          <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
+          <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function buildReportsOverviewMarkup() {
+  const entry = currentReportsTerminalEntry();
+  const payload = currentReportsTerminalPayload();
+  const report = currentReportsTerminalReport();
+  const execution = currentReportsTerminalExecution() || {};
+  const benchmark = currentReportsTerminalBenchmark() || {};
+  const timings = benchmark.timings || execution.timings || {};
+  const health = report && report.followDaemon && report.followDaemon.health ? report.followDaemon.health : null;
+  const job = currentReportsTerminalFollowJob();
+  const actions = currentReportsTerminalFollowActions();
+  const problemCount = actions.filter((action) => ["failed", "cancelled", "expired"].includes(String(action.state || "").toLowerCase())).length;
+  const runningCount = actions.filter((action) => ["running", "eligible", "armed", "queued", "sent"].includes(String(action.state || "").toLowerCase())).length;
+  const overviewCards = [
+    { label: "Action", value: entry && entry.action ? entry.action : payload && payload.action ? payload.action : "--" },
+    { label: "Mint", value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--" },
+    { label: "Provider", value: execution.resolvedProvider || execution.provider || "--" },
+    { label: "Transport", value: execution.transportType || (entry && entry.transportType) || "--" },
+    { label: "Signatures", value: entry ? String(entry.signatureCount || 0) : String(Array.isArray(payload && payload.signatures) ? payload.signatures.length : 0) },
+    { label: "Follow", value: job ? (job.state || "armed") : "Off" },
+    { label: "Selected Wallet", value: job && job.selectedWalletKey ? `Wallet #${walletIndexFromEnvKey(job.selectedWalletKey)}` : "--" },
+    { label: "Follow Actions", value: actions.length ? `${actions.length} total` : "0" },
+    { label: "Problems", value: String(problemCount) },
+    { label: "Running", value: String(runningCount) },
+    { label: "Submit", value: formatReportMetric(timings.sendSubmitMs, "ms") },
+    { label: "Confirm", value: formatReportMetric(timings.sendConfirmMs, "ms") },
+  ];
+  const watcherCards = health
+    ? [
+      { label: "Slot Watcher", value: health.slotWatcher || "--" },
+      { label: "Signature Watcher", value: health.signatureWatcher || "--" },
+      { label: "Market Watcher", value: health.marketWatcher || "--" },
+      { label: "Queue Depth", value: String(health.queueDepth != null ? health.queueDepth : "--") },
+      { label: "Compile Slots", value: String(health.availableCompileSlots != null ? health.availableCompileSlots : "--") },
+      { label: "Send Slots", value: String(health.availableSendSlots != null ? health.availableSendSlots : "--") },
+    ]
+    : [];
+  return `
+    <div class="reports-panel-stack">
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Overview</div>
+        ${renderReportMetricGrid(overviewCards)}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Primary Benchmarks</div>
+        ${renderReportMetricGrid([
+          { label: "Total", value: formatReportMetric(timings.totalElapsedMs, "ms") },
+          { label: "Backend", value: formatReportMetric(timings.backendTotalElapsedMs, "ms") },
+          { label: "Compile", value: formatReportMetric(timings.compileTransactionsMs, "ms") },
+          { label: "Serialize", value: formatReportMetric(timings.compileTxSerializeMs, "ms") },
+          { label: "Send", value: formatReportMetric(timings.sendMs, "ms") },
+          { label: "Persist", value: formatReportMetric(timings.persistReportMs, "ms") },
+        ])}
+      </section>
+      ${watcherCards.length ? `
+        <section class="reports-panel-section">
+          <div class="reports-panel-title">Follow Health</div>
+          ${renderReportMetricGrid(watcherCards)}
+          ${health && health.lastError ? `<div class="reports-callout is-bad">${escapeHTML(String(health.lastError))}</div>` : ""}
+        </section>
+      ` : ""}
+    </div>
+  `;
+}
+
+function buildReportsActionsMarkup() {
+  const execution = currentReportsTerminalExecution() || {};
+  const followJob = currentReportsTerminalFollowJob();
+  const actions = currentReportsTerminalFollowActions();
+  const launchSends = Array.isArray(execution.sent) ? execution.sent : [];
+  if (!launchSends.length && !actions.length) {
+    return '<div class="reports-terminal-empty">No action data available in this report.</div>';
+  }
+  return `
+    <div class="reports-panel-stack">
+      ${launchSends.length ? `
+        <section class="reports-panel-section">
+          <div class="reports-panel-title">Launch Send</div>
+          <div class="reports-action-list">
+            ${launchSends.map((sent) => `
+              <article class="reports-action-card">
+                <div class="reports-action-head">
+                  <div>
+                    <strong>${escapeHTML(sent.label || "launch")}</strong>
+                    <div class="reports-action-subtitle">${escapeHTML(execution.resolvedProvider || execution.provider || execution.transportType || "--")}</div>
+                  </div>
+                  <span class="reports-state-badge ${reportStateClass(sent.confirmationStatus)}">${escapeHTML(sent.confirmationStatus || "sent")}</span>
+                </div>
+                ${renderReportMetricGrid([
+                  { label: "Endpoint", value: shortenReportEndpoint(sent.endpoint) },
+                  { label: "Send Block", value: sent.sendObservedBlockHeight != null ? String(sent.sendObservedBlockHeight) : "--" },
+                  { label: "Confirm Block", value: sent.confirmedObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight) : "--" },
+                  { label: "Blocks", value: sent.confirmedObservedBlockHeight != null && sent.sendObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight - sent.sendObservedBlockHeight) : "--" },
+                  { label: "Format", value: sent.format || "--" },
+                ])}
+                ${sent.signature ? `<div class="reports-action-links">${renderCopyableHash(sent.signature, "Copy signature")} ${sent.explorerUrl ? `<a class="reports-inline-link" href="${escapeHTML(sent.explorerUrl)}" target="_blank" rel="noreferrer">Open explorer</a>` : ""}</div>` : ""}
+              </article>
+            `).join("")}
+          </div>
+        </section>
+      ` : ""}
+      ${actions.length ? `
+        <section class="reports-panel-section">
+          <div class="reports-panel-title">Follow Actions</div>
+          <div class="reports-action-list">
+            ${actions.map((action) => {
+              const errorCategory = inferReportErrorCategory(action.lastError);
+              return `
+                <article class="reports-action-card">
+                  <div class="reports-action-head">
+                    <div>
+                      <strong>${escapeHTML(action.kind || action.actionId || "action")}</strong>
+                      <div class="reports-action-subtitle">${escapeHTML(`${describeFollowActionWallet(action)} | ${describeFollowActionTrigger(action)} | ${describeFollowActionSize(action)}`)}</div>
+                    </div>
+                    <span class="reports-state-badge ${reportStateClass(action.state)}">${escapeHTML(action.state || "--")}</span>
+                  </div>
+                  ${renderReportMetricGrid(buildFollowActionMetricItems(action, followJob))}
+                  ${(action.signature || action.explorerUrl) ? `<div class="reports-action-links">${action.signature ? renderCopyableHash(action.signature, "Copy signature") : ""} ${action.explorerUrl ? `<a class="reports-inline-link" href="${escapeHTML(action.explorerUrl)}" target="_blank" rel="noreferrer">Open explorer</a>` : ""}</div>` : ""}
+                  ${action.lastError ? `<div class="reports-callout is-bad"><strong>${escapeHTML(errorCategory || "error")}</strong> | ${escapeHTML(String(action.lastError))}</div>` : ""}
+                </article>
+              `;
+            }).join("")}
+          </div>
+        </section>
+      ` : ""}
+    </div>
+  `;
+}
+
+function buildReportsBenchmarksMarkup() {
+  const benchmark = currentReportsTerminalBenchmark() || {};
+  const execution = currentReportsTerminalExecution() || {};
+  const timings = benchmark.timings || execution.timings || {};
+  const sent = Array.isArray(benchmark.sent) && benchmark.sent.length ? benchmark.sent : (Array.isArray(execution.sent) ? execution.sent : []);
+  const timingProfiles = currentReportsTerminalTimingProfiles();
+  return `
+    <div class="reports-panel-stack">
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Timing Breakdown</div>
+        ${renderReportMetricGrid([
+          { label: "Total", value: formatReportMetric(timings.totalElapsedMs, "ms") },
+          { label: "Backend", value: formatReportMetric(timings.backendTotalElapsedMs, "ms") },
+          { label: "Pre-request", value: formatReportMetric(timings.clientPreRequestMs, "ms") },
+          { label: "Form", value: formatReportMetric(timings.formToRawConfigMs, "ms") },
+          { label: "Normalize", value: formatReportMetric(timings.normalizeConfigMs, "ms") },
+          { label: "Wallet Load", value: formatReportMetric(timings.walletLoadMs, "ms") },
+          { label: "Compile", value: formatReportMetric(timings.compileTransactionsMs, "ms") },
+          { label: "ALT Load", value: formatReportMetric(timings.compileAltLoadMs, "ms") },
+          { label: "Blockhash", value: formatReportMetric(timings.compileBlockhashFetchMs, "ms") },
+          { label: "Serialize", value: formatReportMetric(timings.compileTxSerializeMs, "ms") },
+          { label: "Send", value: formatReportMetric(timings.sendMs, "ms") },
+          { label: "Submit", value: formatReportMetric(timings.sendSubmitMs, "ms") },
+          { label: "Confirm", value: formatReportMetric(timings.sendConfirmMs, "ms") },
+          { label: "Persist", value: formatReportMetric(timings.persistReportMs, "ms") },
+        ])}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Chain Benchmark</div>
+        ${sent.length ? `
+          <div class="reports-action-list">
+            ${sent.map((item) => `
+              <article class="reports-action-card">
+                <div class="reports-action-head">
+                  <div>
+                    <strong>${escapeHTML(item.label || "tx")}</strong>
+                    <div class="reports-action-subtitle">${escapeHTML(item.signature ? shortenAddress(item.signature, 8) : "--")}</div>
+                  </div>
+                  <span class="reports-state-badge ${reportStateClass(item.confirmationStatus)}">${escapeHTML(item.confirmationStatus || "--")}</span>
+                </div>
+                ${renderReportMetricGrid([
+                  { label: "Send Block", value: item.sendBlockHeight != null ? String(item.sendBlockHeight) : item.sendObservedBlockHeight != null ? String(item.sendObservedBlockHeight) : "--" },
+                  { label: "Confirm Block", value: item.confirmedBlockHeight != null ? String(item.confirmedBlockHeight) : item.confirmedObservedBlockHeight != null ? String(item.confirmedObservedBlockHeight) : "--" },
+                  { label: "Blocks To Confirm", value: item.blocksToConfirm != null ? String(item.blocksToConfirm) : "--" },
+                  { label: "Confirmed Slot", value: item.confirmedSlot != null ? String(item.confirmedSlot) : "--" },
+                ])}
+              </article>
+            `).join("")}
+          </div>
+        ` : '<div class="reports-terminal-empty">No chain benchmark entries recorded.</div>'}
+      </section>
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">Timing Profiles</div>
+        ${timingProfiles.length ? `
+          <div class="reports-action-list">
+            ${timingProfiles.map((profile) => {
+              const rec = profile.recommendation || {};
+              return `
+                <article class="reports-action-card">
+                  <div class="reports-action-head">
+                    <div>
+                      <strong>${escapeHTML(profile.actionType || "unknown")}</strong>
+                      <div class="reports-action-subtitle">${escapeHTML(`${profile.provider || "--"} | confidence ${rec.confidence || "low"}`)}</div>
+                    </div>
+                    <span class="reports-state-badge ${Number(rec.successRate || 0) >= 0.75 ? "is-good" : Number(rec.successRate || 0) >= 0.4 ? "is-warn" : "is-bad"}">${escapeHTML(formatReportMetric(Number(rec.successRate || 0) * 100, "%", "--", 0))}</span>
+                  </div>
+                  ${renderReportMetricGrid([
+                    { label: "Samples", value: String(profile.sampleCount != null ? profile.sampleCount : rec.sampleCount || 0) },
+                    { label: "Success", value: formatReportMetric(Number(rec.successRate || 0) * 100, "%", "--", 0) },
+                    { label: "Quality", value: formatReportMetric(rec.weightedQualityScore, "", "--", 1) },
+                    { label: "P50 Submit", value: formatReportMetric(profile.p50SubmitMs, "ms") },
+                    { label: "P75 Submit", value: formatReportMetric(profile.p75SubmitMs, "ms") },
+                    { label: "P90 Submit", value: formatReportMetric(profile.p90SubmitMs, "ms") },
+                    { label: "Suggest Delay", value: formatReportMetric(rec.suggestedSubmitDelayMs, "ms") },
+                    { label: "Suggest Jitter", value: formatReportMetric(rec.suggestedJitterMs, "ms") },
+                  ])}
+                </article>
+              `;
+            }).join("")}
+          </div>
+        ` : '<div class="reports-terminal-empty">No timing profiles recorded yet.</div>'}
+      </section>
+    </div>
+  `;
+}
+
+function buildReportsRawMarkup() {
+  return `<pre class="console reports-console">${escapeHTML(reportsTerminalState.activeText || "Report is empty.")}</pre>`;
+}
+
+function buildReportsTerminalOutputMarkup() {
+  const payload = currentReportsTerminalPayload();
+  const tab = normalizeReportsTerminalTab(reportsTerminalState.activeTab);
+  const tabs = [
+    { id: "overview", label: "Overview" },
+    { id: "actions", label: "Actions" },
+    { id: "benchmarks", label: "Benchmarks" },
+    { id: "raw", label: "Raw" },
+  ];
+  const fallbackMessage = reportsTerminalState.activeText || "Structured report data is unavailable for this entry.";
+  const content = !payload && tab !== "raw"
+    ? `<div class="reports-callout">${escapeHTML(fallbackMessage)}</div>`
+    : tab === "actions"
+      ? buildReportsActionsMarkup()
+      : tab === "benchmarks"
+        ? buildReportsBenchmarksMarkup()
+        : tab === "raw"
+          ? buildReportsRawMarkup()
+          : buildReportsOverviewMarkup();
+  return `
+    <div class="reports-terminal-tabs">
+      ${tabs.map((item) => `
+        <button
+          type="button"
+          class="reports-terminal-tab${tab === item.id ? " active" : ""}"
+          data-report-tab="${item.id}"
+        >
+          ${escapeHTML(item.label)}
+        </button>
+      `).join("")}
+    </div>
+    <div class="reports-terminal-content">${content}</div>
+  `;
+}
+
+function renderReportsTerminalOutput() {
+  if (!reportsTerminalOutput) return;
+  const markup = buildReportsTerminalOutputMarkup();
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "reportsOutput", reportsTerminalOutput, markup);
+  } else {
+    reportsTerminalOutput.innerHTML = markup;
+  }
 }
 
 function renderReportsTerminalList() {
   if (!reportsTerminalList) return;
   if (!reportsTerminalState.entries.length) {
-    reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">No persisted reports found yet.</div>';
+    const emptyMarkup = '<div class="reports-terminal-empty">No persisted reports found yet.</div>';
+    if (RenderUtils.setCachedHTML) {
+      RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, emptyMarkup);
+    } else {
+      reportsTerminalList.innerHTML = emptyMarkup;
+    }
     return;
   }
-  reportsTerminalList.innerHTML = reportsTerminalState.entries.map((entry) => `
+  const markup = reportsTerminalState.entries.map((entry) => `
     <button
       type="button"
       class="reports-terminal-item${entry.id === reportsTerminalState.activeId ? " active" : ""}"
@@ -3418,31 +4285,61 @@ function renderReportsTerminalList() {
       <span class="reports-terminal-item-meta">${escapeHTML(describeReportEntry(entry) || "No metadata")}</span>
     </button>
   `).join("");
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, markup);
+  } else {
+    reportsTerminalList.innerHTML = markup;
+  }
 }
 
 async function loadReportsTerminalEntry(id) {
   if (!id || !reportsTerminalOutput) return;
-  reportsTerminalOutput.textContent = "Loading report...";
-  const response = await fetch(`/api/reports/view?id=${encodeURIComponent(id)}`);
-  const payload = await response.json();
+  reportsTerminalState.activePayload = null;
+  reportsTerminalState.activeText = "Loading report...";
+  renderReportsTerminalOutput();
+  const url = `/api/reports/view?id=${encodeURIComponent(id)}`;
+  const result = RequestUtils.fetchJsonLatest
+    ? await RequestUtils.fetchJsonLatest("report-view", url, {}, requestStates.reportView)
+    : null;
+  if (result && result.aborted) return;
+  const response = result ? result.response : await fetch(url);
+  const payload = result ? result.payload : await response.json();
+  if (result && !result.isLatest) return;
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || "Failed to load report.");
   }
   reportsTerminalState.activeId = payload.entry && payload.entry.id ? payload.entry.id : id;
+  reportsTerminalState.activePayload = payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  reportsTerminalState.activeText = payload.text || "Report is empty.";
   if (reportsTerminalMeta) {
     reportsTerminalMeta.textContent = payload.entry
-      ? `${payload.entry.displayTime || "Unknown time"} | ${payload.entry.action || "unknown"} | ${payload.entry.provider || "unknown route"}`
+      ? [
+          payload.entry.displayTime || "Unknown time",
+          payload.entry.action || "unknown",
+          payload.entry.provider || "unknown route",
+          payload.entry.followEnabled && payload.entry.followState ? `follow ${payload.entry.followState}` : "",
+        ].filter(Boolean).join(" | ")
       : "Report loaded.";
   }
-  reportsTerminalOutput.textContent = payload.text || "Report is empty.";
+  renderReportsTerminalOutput();
   renderReportsTerminalList();
 }
 
 async function refreshReportsTerminal({ preserveSelection = true, preferId = "" } = {}) {
   if (!reportsTerminalList || !reportsTerminalOutput) return;
-  reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
-  const response = await fetch(`/api/reports?sort=${encodeURIComponent(reportsTerminalState.sort)}`);
-  const payload = await response.json();
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, '<div class="reports-terminal-empty">Loading reports...</div>');
+  } else {
+    reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
+  }
+  const url = `/api/reports?sort=${encodeURIComponent(reportsTerminalState.sort)}`;
+  const result = RequestUtils.fetchJsonLatest
+    ? await RequestUtils.fetchJsonLatest("reports", url, {}, requestStates.reports)
+    : null;
+  if (result && result.aborted) return;
+  const response = result ? result.response : await fetch(url);
+  const payload = result ? result.payload : await response.json();
+  if (result && !result.isLatest) return;
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || "Failed to list reports.");
   }
@@ -3459,71 +4356,13 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   reportsTerminalState.activeId = nextId;
   renderReportsTerminalList();
   if (!nextId) {
+    reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeText = "Run Build, Simulate, or Deploy to create persisted reports.";
     if (reportsTerminalMeta) reportsTerminalMeta.textContent = "No persisted reports available yet.";
-    reportsTerminalOutput.textContent = "Run Build, Simulate, or Deploy to create persisted reports.";
+    renderReportsTerminalOutput();
     return;
   }
   await loadReportsTerminalEntry(nextId);
-}
-
-function startReportsTerminalResize(event) {
-  if (!reportsTerminalSection || !reportsTerminalResizeHandle || window.innerWidth <= 680) return;
-  reportsTerminalResizeState = {
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startWidth: getCurrentReportsTerminalListWidth(),
-  };
-  reportsTerminalSection.classList.add("is-resizing");
-  reportsTerminalResizeHandle.classList.add("is-active");
-  reportsTerminalResizeHandle.setPointerCapture(event.pointerId);
-  event.preventDefault();
-}
-
-function updateReportsTerminalResize(event) {
-  if (!reportsTerminalResizeState) return;
-  const delta = event.clientX - reportsTerminalResizeState.startX;
-  setReportsTerminalListWidth(reportsTerminalResizeState.startWidth + delta, { persist: false });
-}
-
-function finishReportsTerminalResize(event) {
-  if (!reportsTerminalResizeState || !reportsTerminalSection || !reportsTerminalResizeHandle) return;
-  const activePointerId = reportsTerminalResizeState.pointerId;
-  reportsTerminalResizeState = null;
-  reportsTerminalSection.classList.remove("is-resizing");
-  reportsTerminalResizeHandle.classList.remove("is-active");
-  if (typeof activePointerId === "number" && reportsTerminalResizeHandle.hasPointerCapture(activePointerId)) {
-    reportsTerminalResizeHandle.releasePointerCapture(activePointerId);
-  }
-  setReportsTerminalListWidth(getCurrentReportsTerminalListWidth());
-}
-
-function handleReportsTerminalResizeKeydown(event) {
-  if (!reportsTerminalSection || window.innerWidth <= 680) return;
-  const step = event.shiftKey ? 40 : 20;
-  if (event.key === "ArrowLeft") {
-    event.preventDefault();
-    setReportsTerminalListWidth(getCurrentReportsTerminalListWidth() - step);
-    return;
-  }
-  if (event.key === "ArrowRight") {
-    event.preventDefault();
-    setReportsTerminalListWidth(getCurrentReportsTerminalListWidth() + step);
-    return;
-  }
-  if (event.key === "Home") {
-    event.preventDefault();
-    setReportsTerminalListWidth(REPORTS_TERMINAL_MIN_LIST_WIDTH);
-    return;
-  }
-  if (event.key === "End") {
-    event.preventDefault();
-    setReportsTerminalListWidth(REPORTS_TERMINAL_MAX_LIST_WIDTH);
-    return;
-  }
-  if (event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    setReportsTerminalListWidth(REPORTS_TERMINAL_DEFAULT_LIST_WIDTH);
-  }
 }
 
 function extractReportIdFromPath(filePath) {
@@ -3566,70 +4405,135 @@ function completeInitialBoot() {
     window.clearTimeout(window.__launchdeckBootFallback);
     window.__launchdeckBootFallback = null;
   }
+  if (isPopoutMode) {
+    resizePopoutToVisibleLayout();
+  }
   requestAnimationFrame(() => {
     document.documentElement.classList.remove("boot-pending");
+    schedulePopoutAutosize();
+    if (isPopoutMode) {
+      window.setTimeout(() => {
+        schedulePopoutAutosize();
+      }, 120);
+    }
+  });
+}
+
+function isOutputSectionCurrentlyVisible() {
+  return Boolean(outputSection && !outputSection.hidden);
+}
+
+function isReportsTerminalCurrentlyVisible() {
+  return Boolean(reportsTerminalSection && !reportsTerminalSection.hidden);
+}
+
+function measureVisibleWorkspaceContent() {
+  if (!workspaceShell) {
+    return { width: 0, height: 0 };
+  }
+  const visibleChildren = Array.from(workspaceShell.children).filter((node) => !node.hidden);
+  if (!visibleChildren.length) {
+    return { width: 0, height: 0 };
+  }
+  const workspaceStyles = window.getComputedStyle(workspaceShell);
+  const gap = Number.parseFloat(workspaceStyles.columnGap || workspaceStyles.gap || "0") || 0;
+  const width = visibleChildren.reduce((sum, node, index) => {
+    const rect = node.getBoundingClientRect();
+    return sum + Math.ceil(rect.width) + (index > 0 ? gap : 0);
+  }, 0);
+  const workspaceRect = workspaceShell.getBoundingClientRect();
+  const height = Math.ceil(
+    Math.max(
+      workspaceRect ? workspaceRect.height : 0,
+      ...visibleChildren.map((node) => {
+        const rect = node.getBoundingClientRect();
+        return rect.height;
+      }),
+    ),
+  );
+  return { width, height };
+}
+
+function getPreferredPopoutContentWidth() {
+  const measuredWidth = measureVisibleWorkspaceContent().width;
+  let preferredWidth = 0;
+  if (form && !form.hidden) {
+    preferredWidth += POPOUT_FORM_WIDTH;
+  }
+  if (reportsTerminalSection && !reportsTerminalSection.hidden) {
+    preferredWidth += preferredWidth > 0 ? POPOUT_WORKSPACE_GAP : 0;
+    preferredWidth += POPOUT_REPORTS_WIDTH;
+  }
+  return Math.max(measuredWidth, preferredWidth);
+}
+
+function getPreferredPopoutContentHeight() {
+  return measureVisibleWorkspaceContent().height;
+}
+
+function resizePopoutToVisibleLayout() {
+  if (!isPopoutMode) return;
+  const contentWidth = getPreferredPopoutContentWidth();
+  const contentHeight = getPreferredPopoutContentHeight();
+  if (!contentWidth || !contentHeight) return;
+  const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
+  const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
+  const maxOuterWidth = Math.max(420, window.screen.availWidth - 24);
+  const maxOuterHeight = Math.max(560, window.screen.availHeight - 24);
+  const targetWidth = Math.min(Math.max(420, contentWidth + chromeWidth + 4), maxOuterWidth);
+  const targetHeight = Math.min(Math.max(560, contentHeight + chromeHeight + 4), maxOuterHeight);
+  if (Math.abs(window.outerWidth - targetWidth) < 4 && Math.abs(window.outerHeight - targetHeight) < 4) {
+    return;
+  }
+  try {
+    window.resizeTo(targetWidth, targetHeight);
+  } catch (_error) {
+    // Ignore resize failures on browsers that restrict popup resizing.
+  }
+}
+
+function schedulePopoutAutosize() {
+  if (!isPopoutMode) return;
+  if (popoutAutosizeFrame) {
+    window.cancelAnimationFrame(popoutAutosizeFrame);
+  }
+  popoutAutosizeFrame = window.requestAnimationFrame(() => {
+    popoutAutosizeFrame = 0;
+    window.requestAnimationFrame(() => {
+      resizePopoutToVisibleLayout();
+    });
   });
 }
 
 function openPopoutWindow() {
   const popoutUrl = new URL(window.location.href);
   popoutUrl.searchParams.set("popout", "1");
+  const outputVisible = isOutputSectionCurrentlyVisible();
+  const reportsVisible = isReportsTerminalCurrentlyVisible();
+  popoutUrl.searchParams.set("output", outputVisible ? "1" : "0");
+  popoutUrl.searchParams.set("reports", reportsVisible ? "1" : "0");
+  const contentWidth = getPreferredPopoutContentWidth();
+  const contentHeight = getPreferredPopoutContentHeight();
+  const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
+  const chromeHeight = Math.max(0, window.outerHeight - window.innerHeight);
+  const width = Math.min(
+    Math.max(420, (contentWidth || 720) + chromeWidth + 4),
+    Math.max(420, window.screen.availWidth - 24),
+  );
+  const height = Math.min(
+    Math.max(560, (contentHeight || 760) + chromeHeight + 4),
+    Math.max(560, window.screen.availHeight - 24),
+  );
   window.open(
     popoutUrl.toString(),
     "launchdeck-popout",
-    "popup=yes,width=560,height=920,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes",
+    `popup=yes,width=${width},height=${height},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`,
   );
-}
-
-function toggleDevAutoSellPanel(forceOpen) {
-  if (!devAutoSellPanel) return;
-  const shouldOpen = typeof forceOpen === "boolean" ? forceOpen : devAutoSellPanel.hidden;
-  devAutoSellPanel.hidden = !shouldOpen;
-}
-
-async function updateImageRecord(id, updates) {
-  const response = await fetch("/api/images/update", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id, ...updates }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to update image.");
-  }
-  imageLibraryState.images = Array.isArray(payload.images) ? payload.images : imageLibraryState.images;
-  imageLibraryState.categories = Array.isArray(payload.categories) ? payload.categories : imageLibraryState.categories;
-  const updated = payload.image || imageLibraryState.images.find((entry) => entry.id === id);
-  if (uploadedImage && uploadedImage.id === id && updated) {
-    setSelectedImage(updated);
-  }
-  renderImageCategoryChips();
-  renderImageDetailsCategoryOptions(updated ? updated.category || "" : imageDetailsCategory ? imageDetailsCategory.value : "");
-  renderImageLibraryGrid();
-}
-
-async function deleteImageRecord(id) {
-  const response = await fetch("/api/images/delete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to delete image.");
-  }
-  imageLibraryState.images = Array.isArray(payload.images) ? payload.images : [];
-  imageLibraryState.categories = Array.isArray(payload.categories) ? payload.categories : [];
-  if (uploadedImage && uploadedImage.id === id) {
-    setSelectedImage(null);
-  }
-  renderImageCategoryChips();
-  renderImageDetailsCategoryOptions(imageDetailsCategory ? imageDetailsCategory.value : "");
-  renderImageLibraryGrid();
 }
 
 form.querySelectorAll('input[name="mode"]').forEach((node) => {
   node.addEventListener("change", () => {
+    setStoredLaunchMode(getMode());
     updateModeVisibility();
   });
 });
@@ -3745,13 +4649,11 @@ if (providerSelect) providerSelect.addEventListener("change", () => {
   syncActivePresetFromInputs();
   updateJitoVisibility();
 });
-if (endpointProfileSelect) endpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 if (buyProviderSelect) buyProviderSelect.addEventListener("change", syncActivePresetFromInputs);
-if (buyEndpointProfileSelect) buyEndpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 if (sellProviderSelect) sellProviderSelect.addEventListener("change", syncActivePresetFromInputs);
-if (sellEndpointProfileSelect) sellEndpointProfileSelect.addEventListener("change", syncActivePresetFromInputs);
 feeSplitPill.addEventListener("click", () => {
-  if (getMode() !== "regular") return;
+  const mode = getMode();
+  if (mode !== "regular" && mode !== "agent-custom") return;
   if (!feeSplitEnabled.checked) {
     feeSplitEnabled.checked = true;
     showFeeSplitModal();
@@ -3777,12 +4679,15 @@ if (walletDropdownList) {
     if (!nextKey) return;
     walletSelect.value = nextKey;
     setStoredSelectedWalletKey(nextKey);
+    applySelectedWalletLocally(nextKey);
     setWalletDropdownOpen(false);
     refreshWalletStatus(true);
   });
 }
 walletSelect.addEventListener("change", () => {
-  setStoredSelectedWalletKey(selectedWalletKey());
+  const nextKey = selectedWalletKey();
+  setStoredSelectedWalletKey(nextKey);
+  applySelectedWalletLocally(nextKey);
   refreshWalletStatus(true);
 });
 document.addEventListener("click", (event) => {
@@ -3796,6 +4701,7 @@ feeSplitAdd.addEventListener("click", () => {
   if (getFeeSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) return;
   feeSplitList.appendChild(createFeeSplitRow({ type: "wallet", sharePercent: "" }));
   syncFeeSplitTotals();
+  setStoredFeeSplitDraft(serializeFeeSplitDraft());
 });
 
 feeSplitReset.addEventListener("click", () => {
@@ -3804,6 +4710,7 @@ feeSplitReset.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = "0";
   });
   syncFeeSplitTotals();
+  setStoredFeeSplitDraft(serializeFeeSplitDraft());
 });
 
 feeSplitEven.addEventListener("click", () => {
@@ -3823,6 +4730,7 @@ feeSplitEven.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = String(share);
   });
   syncFeeSplitTotals();
+  setStoredFeeSplitDraft(serializeFeeSplitDraft());
 });
 
 feeSplitList.addEventListener("click", (event) => {
@@ -3831,17 +4739,20 @@ feeSplitList.addEventListener("click", (event) => {
     const row = lockToggle.closest(".fee-split-row");
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
     syncFeeSplitTotals();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
     return;
   }
   const tab = event.target.closest(".recipient-type-tab");
   if (tab) {
     updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
     return;
   }
   const removeButton = event.target.closest(".recipient-remove");
   if (removeButton) {
     removeButton.closest(".fee-split-row").remove();
     syncFeeSplitTotals();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
   }
 });
 
@@ -3855,6 +4766,7 @@ feeSplitList.addEventListener("input", (event) => {
     row.querySelector(".recipient-slider").value = event.target.value || "0";
   }
   syncFeeSplitTotals();
+  setStoredFeeSplitDraft(serializeFeeSplitDraft());
 });
 
 agentSplitAdd.addEventListener("click", () => {
@@ -3865,6 +4777,7 @@ agentSplitAdd.addEventListener("click", () => {
   agentSplitList.appendChild(createAgentSplitRow({ type: "wallet", sharePercent: "" }));
   normalizeAgentSplitStructure({ afterAdd: true });
   syncAgentSplitTotals();
+  setStoredAgentSplitDraft(serializeAgentSplitDraft());
   setAgentSplitModalError("");
 });
 
@@ -3874,6 +4787,7 @@ agentSplitReset.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = "0";
   });
   syncAgentSplitTotals();
+  setStoredAgentSplitDraft(serializeAgentSplitDraft());
   setAgentSplitModalError("");
 });
 
@@ -3894,6 +4808,7 @@ agentSplitEven.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = String(share);
   });
   syncAgentSplitTotals();
+  setStoredAgentSplitDraft(serializeAgentSplitDraft());
   setAgentSplitModalError("");
 });
 
@@ -3903,6 +4818,7 @@ agentSplitList.addEventListener("click", (event) => {
     const row = lockToggle.closest(".fee-split-row");
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
     syncAgentSplitTotals();
+    setStoredAgentSplitDraft(serializeAgentSplitDraft());
     setAgentSplitModalError("");
     return;
   }
@@ -3910,6 +4826,7 @@ agentSplitList.addEventListener("click", (event) => {
   if (tab && tab.dataset.type) {
     updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
     syncAgentSplitTotals();
+    setStoredAgentSplitDraft(serializeAgentSplitDraft());
     setAgentSplitModalError("");
     return;
   }
@@ -3918,6 +4835,7 @@ agentSplitList.addEventListener("click", (event) => {
     removeButton.closest(".fee-split-row").remove();
     normalizeAgentSplitStructure();
     syncAgentSplitTotals();
+    setStoredAgentSplitDraft(serializeAgentSplitDraft());
     setAgentSplitModalError("");
   }
 });
@@ -3935,6 +4853,7 @@ agentSplitList.addEventListener("input", (event) => {
     delete row.dataset.defaultReceiver;
   }
   syncAgentSplitTotals();
+  setStoredAgentSplitDraft(serializeAgentSplitDraft());
   setAgentSplitModalError("");
 });
 
@@ -3947,8 +4866,10 @@ Object.keys(fieldValidators).forEach((name) => {
   });
 });
 
-if (openImageLibraryButton) {
-  openImageLibraryButton.addEventListener("click", showImageLibraryModal);
+if (imageLayoutToggle) {
+  imageLayoutToggle.addEventListener("click", () => {
+    setImageLayoutCompact(!(tokenSurfaceSection && tokenSurfaceSection.classList.contains("is-image-compact")));
+  });
 }
 imageInput.addEventListener("change", async () => {
   const [file] = imageInput.files || [];
@@ -3963,196 +4884,10 @@ imageInput.addEventListener("change", async () => {
     imageInput.value = "";
   }
 });
-if (imageLibraryClose) imageLibraryClose.addEventListener("click", hideImageLibraryModal);
-if (imageLibraryModal) {
-  imageLibraryModal.addEventListener("click", (event) => {
-    if (event.target === imageLibraryModal) hideImageLibraryModal();
-  });
-}
-if (imageLibraryUploadButton) {
-  imageLibraryUploadButton.addEventListener("click", () => {
-    imageInput.value = "";
-    imageInput.click();
-  });
-}
-if (imageLibrarySearchInput) {
-  imageLibrarySearchInput.addEventListener("input", () => {
-    imageLibraryState.search = imageLibrarySearchInput.value.trim();
-    fetchImageLibrary().catch((error) => {
-      imageStatus.textContent = error.message;
-    });
-  });
-}
-document.querySelectorAll("[data-image-category]").forEach((button) => {
-  button.addEventListener("click", () => {
-    imageLibraryState.category = button.getAttribute("data-image-category") || "all";
-    fetchImageLibrary().catch((error) => {
-      imageStatus.textContent = error.message;
-    });
-  });
-});
-if (imageCategoryChips) {
-  imageCategoryChips.addEventListener("click", (event) => {
-    const chip = event.target.closest("[data-image-category]");
-    if (!chip) return;
-    imageLibraryState.category = chip.getAttribute("data-image-category") || "all";
-    fetchImageLibrary().catch((error) => {
-      imageStatus.textContent = error.message;
-    });
-  });
-}
-if (newImageCategoryButton) {
-  newImageCategoryButton.addEventListener("click", () => showImageCategoryModal("library"));
-}
-if (imageLibraryGrid) {
-  imageLibraryGrid.addEventListener("click", (event) => {
-    const uploadTile = event.target.closest("[data-image-upload-tile]");
-    if (uploadTile) {
-      imageInput.value = "";
-      imageInput.click();
-      return;
-    }
-    const menuButton = event.target.closest("[data-image-menu-id]");
-    if (menuButton) {
-      event.stopPropagation();
-      openImageItemMenu(menuButton.getAttribute("data-image-menu-id"), menuButton);
-      return;
-    }
-    const imageButton = event.target.closest("[data-image-id]");
-    if (!imageButton) return;
-    const image = imageLibraryState.images.find((entry) => entry.id === imageButton.getAttribute("data-image-id"));
-    if (!image) return;
-    imageLibraryState.activeImageId = image.id;
-    setSelectedImage(image);
-    hideImageLibraryModal();
-  });
-}
-if (imageMenuFavorite) {
-  imageMenuFavorite.addEventListener("click", async () => {
-    const image = imageLibraryState.images.find((entry) => entry.id === activeImageMenuId);
-    if (!image) return;
-    try {
-      await updateImageRecord(image.id, { isFavorite: !image.isFavorite });
-      hideImageItemMenu();
-    } catch (error) {
-      imageStatus.textContent = error.message;
-    }
-  });
-}
-if (imageMenuEdit) {
-  imageMenuEdit.addEventListener("click", () => {
-    const image = imageLibraryState.images.find((entry) => entry.id === activeImageMenuId);
-    if (!image) return;
-    hideImageItemMenu();
-    showImageDetailsModal(image);
-  });
-}
-if (imageMenuDelete) {
-  imageMenuDelete.addEventListener("click", async () => {
-    const image = imageLibraryState.images.find((entry) => entry.id === activeImageMenuId);
-    if (!image) return;
-    if (!window.confirm(`Delete image "${image.name}"?`)) return;
-    try {
-      await deleteImageRecord(image.id);
-      hideImageItemMenu();
-    } catch (error) {
-      imageStatus.textContent = error.message;
-    }
-  });
-}
-if (imageDetailsClose) imageDetailsClose.addEventListener("click", hideImageDetailsModal);
-if (imageDetailsCancel) imageDetailsCancel.addEventListener("click", hideImageDetailsModal);
-if (imageDetailsNewCategory) {
-  imageDetailsNewCategory.addEventListener("click", () => showImageCategoryModal("details"));
-}
-if (imageCategoryClose) imageCategoryClose.addEventListener("click", hideImageCategoryModal);
-if (imageCategoryCancel) imageCategoryCancel.addEventListener("click", hideImageCategoryModal);
-if (imageCategoryName) {
-  imageCategoryName.addEventListener("keydown", async (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    if (imageCategorySave) imageCategorySave.click();
-  });
-}
-if (imageCategorySave) {
-  imageCategorySave.addEventListener("click", async () => {
-    setImageCategoryError("");
-    imageCategorySave.disabled = true;
-    imageCategorySave.textContent = "Creating...";
-    try {
-      const createdCategory = await createImageCategory(imageCategoryName ? imageCategoryName.value : "");
-      if (imageCategoryModalContext === "details") {
-        renderImageDetailsCategoryOptions(createdCategory);
-        if (imageDetailsCategory) imageDetailsCategory.value = createdCategory;
-      } else {
-        imageLibraryState.category = createdCategory;
-        await fetchImageLibrary();
-      }
-      hideImageCategoryModal();
-    } catch (error) {
-      setImageCategoryError(error.message || "Failed to create category.");
-    } finally {
-      imageCategorySave.disabled = false;
-      imageCategorySave.textContent = "Create Category";
-    }
-  });
-}
-if (imageDetailsAddTag) {
-  imageDetailsAddTag.addEventListener("click", () => {
-    addImageDetailTag(imageDetailsTags ? imageDetailsTags.value : "");
-  });
-}
-if (imageDetailsTags) {
-  imageDetailsTags.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === ",") {
-      event.preventDefault();
-      addImageDetailTag(imageDetailsTags.value);
-    }
-  });
-}
-if (imageDetailsTagList) {
-  imageDetailsTagList.addEventListener("click", (event) => {
-    const chip = event.target.closest("[data-image-tag-index]");
-    if (!chip) return;
-    const index = Number(chip.getAttribute("data-image-tag-index"));
-    if (!Number.isInteger(index) || index < 0) return;
-    imageDetailsTagsState.splice(index, 1);
-    renderImageDetailsTags();
-  });
-}
-if (imageDetailsSave) {
-  imageDetailsSave.addEventListener("click", async () => {
-    if (!activeImageDetailsId) return;
-    setImageDetailsError("");
-    addImageDetailTag(imageDetailsTags ? imageDetailsTags.value : "");
-    imageDetailsSave.disabled = true;
-    imageDetailsSave.textContent = "Saving...";
-    try {
-      await updateImageRecord(activeImageDetailsId, {
-        name: imageDetailsName ? imageDetailsName.value.trim() : "",
-        tags: imageDetailsTagsState,
-        category: imageDetailsCategory ? imageDetailsCategory.value.trim() : "",
-      });
-      if (isEditingNewImageUpload) {
-        imageStatus.textContent = "Image saved to library.";
-        imagePath.textContent = "";
-      }
-      hideImageDetailsModal();
-    } catch (error) {
-      setImageDetailsError(error.message || "Failed to save image details.");
-    } finally {
-      imageDetailsSave.disabled = false;
-      imageDetailsSave.textContent = "Save Changes";
-    }
-  });
-}
 
 testFillButton.addEventListener("click", async () => {
   await applyTestPreset();
 });
-if (openPopoutButton) {
-  openPopoutButton.addEventListener("click", openPopoutWindow);
-}
 if (openVampButton) {
   openVampButton.addEventListener("click", showVampModal);
 }
@@ -4161,56 +4896,6 @@ if (themeToggleButton) {
     const nextMode = document.documentElement.classList.contains("theme-light") ? "dark" : "light";
     setThemeMode(nextMode);
   });
-}
-if (toggleOutputButton) {
-  toggleOutputButton.addEventListener("click", () => {
-    setOutputSectionVisible(outputSection ? outputSection.hidden : true);
-  });
-}
-if (toggleReportsButton) {
-  toggleReportsButton.addEventListener("click", () => {
-    setReportsTerminalVisible(reportsTerminalSection ? reportsTerminalSection.hidden : true);
-  });
-}
-if (reportsRefreshButton) {
-  reportsRefreshButton.addEventListener("click", async () => {
-    try {
-      await refreshReportsTerminal();
-    } catch (error) {
-      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to refresh reports.";
-    }
-  });
-}
-if (reportsSortButton) {
-  reportsSortButton.addEventListener("click", async () => {
-    setReportsTerminalSort(reportsTerminalState.sort === "newest" ? "oldest" : "newest");
-    try {
-      await refreshReportsTerminal({ preserveSelection: false });
-    } catch (error) {
-      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to sort reports.";
-    }
-  });
-}
-if (reportsTerminalList) {
-  reportsTerminalList.addEventListener("click", async (event) => {
-    const button = event.target.closest("[data-report-id]");
-    if (!button) return;
-    try {
-      await loadReportsTerminalEntry(button.getAttribute("data-report-id") || "");
-    } catch (error) {
-      if (reportsTerminalOutput) reportsTerminalOutput.textContent = error.message || "Failed to load report.";
-    }
-  });
-}
-if (reportsTerminalResizeHandle) {
-  reportsTerminalResizeHandle.addEventListener("pointerdown", startReportsTerminalResize);
-  reportsTerminalResizeHandle.addEventListener("pointermove", updateReportsTerminalResize);
-  reportsTerminalResizeHandle.addEventListener("pointerup", finishReportsTerminalResize);
-  reportsTerminalResizeHandle.addEventListener("pointercancel", finishReportsTerminalResize);
-  reportsTerminalResizeHandle.addEventListener("dblclick", () => {
-    setReportsTerminalListWidth(REPORTS_TERMINAL_DEFAULT_LIST_WIDTH);
-  });
-  reportsTerminalResizeHandle.addEventListener("keydown", handleReportsTerminalResizeKeydown);
 }
 if (openSettingsButton) {
   openSettingsButton.addEventListener("click", showSettingsModal);
@@ -4280,6 +4965,9 @@ if (presetEditToggle) {
   input.addEventListener(eventName, () => {
     syncActivePresetFromInputs();
     if (input.name) validateFieldByName(input.name);
+    if (sniperModal && !sniperModal.hidden) {
+      renderSniperUI();
+    }
   });
 });
 if (devBuyQuickButtons) {
@@ -4309,143 +4997,21 @@ if (devBuyCustomDeployButton) {
     await triggerDeployWithDevBuy(mode, amount, lastDevBuyEditSource);
   });
 }
-if (devAutoSellButton) {
-  devAutoSellButton.addEventListener("click", (event) => {
-    event.stopPropagation();
-    toggleDevAutoSellPanel();
-  });
-}
-if (modeSniperButton) {
-  modeSniperButton.addEventListener("click", () => {
-    showSniperModal();
-  });
-}
 if (modeVanityButton) {
   modeVanityButton.addEventListener("click", () => {
     showVanityModal();
   });
 }
-if (autoSellEnabledInput) {
-  autoSellEnabledInput.addEventListener("change", () => {
-    syncDevAutoSellUI();
-    syncActivePresetFromInputs();
-    validateFieldByName("automaticDevSellPercent");
-    validateFieldByName("automaticDevSellDelaySeconds");
-  });
-}
-if (autoSellDelaySlider) {
-  autoSellDelaySlider.addEventListener("input", () => {
-    setNamedValue("automaticDevSellDelaySeconds", autoSellDelaySlider.value);
-    syncDevAutoSellUI();
-    syncActivePresetFromInputs();
-    validateFieldByName("automaticDevSellDelaySeconds");
-  });
-}
-if (autoSellPercentSlider) {
-  autoSellPercentSlider.addEventListener("input", () => {
-    setNamedValue("automaticDevSellPercent", autoSellPercentSlider.value);
-    syncDevAutoSellUI();
-    syncActivePresetFromInputs();
-    validateFieldByName("automaticDevSellPercent");
-  });
-}
-if (sniperEnabledToggle) {
-  sniperEnabledToggle.addEventListener("change", () => {
-    sniperState.enabled = sniperEnabledToggle.checked;
-    setSniperModalError("");
-    renderSniperUI();
-  });
-}
-if (sniperWalletList) {
-  sniperWalletList.addEventListener("change", (event) => {
-    const checkbox = event.target.closest("[data-sniper-wallet-checkbox]");
-    if (!checkbox) return;
-    const envKey = checkbox.getAttribute("data-sniper-wallet-checkbox");
-    if (!envKey) return;
-    sniperState.wallets[envKey] = {
-      ...(sniperState.wallets[envKey] || {}),
-      selected: checkbox.checked,
-      amountSol: checkbox.checked ? (sniperState.wallets[envKey] && sniperState.wallets[envKey].amountSol) || "" : "",
-    };
-    setSniperModalError("");
-    renderSniperUI();
-  });
-  sniperWalletList.addEventListener("input", (event) => {
-    const amountInput = event.target.closest("[data-sniper-wallet-amount]");
-    if (!amountInput) return;
-    const envKey = amountInput.getAttribute("data-sniper-wallet-amount");
-    if (!envKey) return;
-    const normalized = normalizeDecimalInput(amountInput.value);
-    amountInput.value = normalized;
-    sniperState.wallets[envKey] = {
-      ...(sniperState.wallets[envKey] || {}),
-      selected: true,
-      amountSol: normalized,
-    };
-    applySniperStateToForm();
-    renderSniperButtonState();
-    setSniperModalError("");
-  });
-  sniperWalletList.addEventListener("click", (event) => {
-    const presetButton = event.target.closest("[data-sniper-preset]");
-    if (!presetButton) return;
-    const envKey = presetButton.getAttribute("data-sniper-preset");
-    const ratio = Number(presetButton.getAttribute("data-sniper-ratio") || 0);
-    const wallet = latestWalletStatus && Array.isArray(latestWalletStatus.wallets)
-      ? latestWalletStatus.wallets.find((entry) => entry.envKey === envKey)
-      : null;
-    if (!envKey || !wallet || !Number.isFinite(ratio)) return;
-    const balance = getWalletBalanceForSniper(wallet);
-    const amount = normalizeDecimalInput((balance * ratio).toFixed(6));
-    sniperState.wallets[envKey] = {
-      ...(sniperState.wallets[envKey] || {}),
-      selected: true,
-      amountSol: amount,
-    };
-    setSniperModalError("");
-    renderSniperUI();
-  });
-}
-if (sniperRefreshButton) {
-  sniperRefreshButton.addEventListener("click", async () => {
-    setSniperModalError("");
-    try {
-      await refreshWalletStatus(true);
-    } catch (error) {
-      setSniperModalError(error.message || "Failed to refresh balances.");
-    }
-  });
-}
-if (sniperResetButton) {
-  sniperResetButton.addEventListener("click", () => {
-    setSniperModalError("");
-    resetSniperState();
-  });
-}
-if (sniperSave) {
-  sniperSave.addEventListener("click", () => {
-    const errors = validateSniperState();
-    if (errors.length > 0) {
-      setSniperModalError(errors[0]);
-      return;
-    }
-    setSniperModalError("");
-    hideSniperModal();
-  });
-}
-if (sniperClose) sniperClose.addEventListener("click", hideSniperModal);
-if (sniperCancel) sniperCancel.addEventListener("click", hideSniperModal);
-if (sniperModal) {
-  sniperModal.addEventListener("click", (event) => {
-    if (event.target === sniperModal) hideSniperModal();
-  });
-}
 if (feeSplitClose) feeSplitClose.addEventListener("click", hideFeeSplitModal);
-if (feeSplitSave) feeSplitSave.addEventListener("click", hideFeeSplitModal);
+if (feeSplitSave) feeSplitSave.addEventListener("click", () => {
+  setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  hideFeeSplitModal();
+});
 if (feeSplitDisable) {
   feeSplitDisable.addEventListener("click", () => {
     feeSplitEnabled.checked = false;
     updateFeeSplitVisibility();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
     hideFeeSplitModal();
   });
 }
@@ -4508,16 +5074,6 @@ if (vampModal) {
     if (event.target === vampModal) hideVampModal();
   });
 }
-document.addEventListener("click", (event) => {
-  if (!imageItemMenu.hidden) {
-    const clickedMenu = imageItemMenu.contains(event.target);
-    const clickedTrigger = event.target.closest("[data-image-menu-id]");
-    if (!clickedMenu && !clickedTrigger) hideImageItemMenu();
-  }
-  if (!devAutoSellPanel || devAutoSellPanel.hidden) return;
-  if (devAutoSellPanel.contains(event.target) || (devAutoSellButton && devAutoSellButton.contains(event.target))) return;
-  toggleDevAutoSellPanel(false);
-});
 deployModal.addEventListener("click", (event) => {
   if (event.target === deployModal) hideDeployModal();
 });
@@ -4526,15 +5082,14 @@ updateModeVisibility();
 updateJitoVisibility();
 syncDevAutoSellUI();
 hydrateModeActionState();
-renderPresetChips();
-renderQuickDevBuyButtons();
-populateDevBuyPresetEditor();
 updateTokenFieldCounts();
 updateDescriptionDisclosure();
-updateQuote();
+setSettingsLoadingState(true);
+renderBackendRegionSummary(null);
+renderSniperUI();
+renderReportsTerminalOutput();
+completeInitialBoot();
 Promise.resolve(bootstrapApp()).catch((error) => {
   if (walletBalance) walletBalance.textContent = "-";
   metaNode.textContent = error.message;
-}).finally(() => {
-  completeInitialBoot();
 });

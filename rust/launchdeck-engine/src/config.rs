@@ -43,6 +43,8 @@ pub struct RawConfig {
     #[serde(default)]
     pub postLaunch: RawPostLaunch,
     #[serde(default)]
+    pub followLaunch: RawFollowLaunch,
+    #[serde(default)]
     pub presets: RawPresets,
     #[serde(default)]
     pub imageLocalPath: String,
@@ -237,6 +239,90 @@ pub struct RawAutomaticDevSell {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawFollowLaunch {
+    #[serde(default)]
+    pub enabled: Option<Value>,
+    #[serde(default)]
+    pub schemaVersion: Option<Value>,
+    #[serde(default)]
+    pub snipes: Vec<RawFollowLaunchSnipe>,
+    #[serde(default)]
+    pub devAutoSell: Option<RawFollowLaunchSell>,
+    #[serde(default)]
+    pub constraints: RawFollowLaunchConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawFollowLaunchSnipe {
+    #[serde(default)]
+    pub actionId: String,
+    #[serde(default)]
+    pub enabled: Option<Value>,
+    #[serde(default)]
+    pub walletEnvKey: String,
+    #[serde(default)]
+    pub buyAmountSol: String,
+    #[serde(default)]
+    pub submitWithLaunch: Option<Value>,
+    #[serde(default)]
+    pub retryOnFailure: Option<Value>,
+    #[serde(default)]
+    pub submitDelayMs: Option<Value>,
+    #[serde(default)]
+    pub targetBlockOffset: Option<Value>,
+    #[serde(default)]
+    pub jitterMs: Option<Value>,
+    #[serde(default)]
+    pub feeJitterBps: Option<Value>,
+    #[serde(default)]
+    pub postBuySell: Option<RawFollowLaunchSell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawFollowLaunchSell {
+    #[serde(default)]
+    pub actionId: String,
+    #[serde(default)]
+    pub enabled: Option<Value>,
+    #[serde(default)]
+    pub walletEnvKey: String,
+    #[serde(default)]
+    pub percent: Option<Value>,
+    #[serde(default)]
+    pub delayMs: Option<Value>,
+    #[serde(default)]
+    pub targetBlockOffset: Option<Value>,
+    #[serde(default)]
+    pub marketCap: RawFollowLaunchMarketCapTrigger,
+    #[serde(default)]
+    pub precheckRequired: Option<Value>,
+    #[serde(default)]
+    pub requireConfirmation: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawFollowLaunchMarketCapTrigger {
+    #[serde(default)]
+    pub enabled: Option<Value>,
+    #[serde(default)]
+    pub direction: String,
+    #[serde(default)]
+    pub threshold: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RawFollowLaunchConstraints {
+    #[serde(default)]
+    pub pumpOnly: Option<Value>,
+    #[serde(default)]
+    pub retryBudget: Option<Value>,
+    #[serde(default)]
+    pub requireDaemonReadiness: Option<Value>,
+    #[serde(default)]
+    pub blockOnRequiredPrechecks: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RawPresets {
     #[serde(default)]
     pub activePresetId: String,
@@ -273,6 +359,7 @@ pub struct NormalizedConfig {
     pub execution: NormalizedExecution,
     pub devBuy: Option<NormalizedDevBuy>,
     pub postLaunch: NormalizedPostLaunch,
+    pub followLaunch: NormalizedFollowLaunch,
     pub presets: NormalizedPresets,
     pub imageLocalPath: String,
     pub selectedWalletKey: String,
@@ -333,7 +420,7 @@ pub struct NormalizedCreatorFee {
     pub githubUserId: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedExecution {
     pub simulate: bool,
     pub send: bool,
@@ -343,7 +430,6 @@ pub struct NormalizedExecution {
     pub trackSendBlockHeight: bool,
     pub provider: String,
     pub endpointProfile: String,
-    pub policy: String,
     pub autoGas: bool,
     pub autoMode: String,
     pub priorityFeeSol: String,
@@ -352,7 +438,6 @@ pub struct NormalizedExecution {
     pub maxTipSol: String,
     pub buyProvider: String,
     pub buyEndpointProfile: String,
-    pub buyPolicy: String,
     pub buyAutoGas: bool,
     pub buyAutoMode: String,
     pub buyPriorityFeeSol: String,
@@ -362,7 +447,6 @@ pub struct NormalizedExecution {
     pub buyMaxTipSol: String,
     pub sellProvider: String,
     pub sellEndpointProfile: String,
-    pub sellPolicy: String,
     pub sellPriorityFeeSol: String,
     pub sellTipSol: String,
     pub sellSlippagePercent: String,
@@ -393,6 +477,61 @@ pub struct NormalizedAutomaticDevSell {
     pub enabled: bool,
     pub percent: i64,
     pub delaySeconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedFollowLaunch {
+    pub enabled: bool,
+    pub source: String,
+    pub schemaVersion: u32,
+    pub snipes: Vec<NormalizedFollowLaunchSnipe>,
+    pub devAutoSell: Option<NormalizedFollowLaunchSell>,
+    pub constraints: NormalizedFollowLaunchConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedFollowLaunchSnipe {
+    pub actionId: String,
+    pub enabled: bool,
+    pub walletEnvKey: String,
+    pub buyAmountSol: String,
+    pub submitWithLaunch: bool,
+    #[serde(default)]
+    pub retryOnFailure: bool,
+    pub submitDelayMs: u64,
+    pub targetBlockOffset: Option<u8>,
+    pub jitterMs: u64,
+    pub feeJitterBps: u16,
+    #[serde(default)]
+    pub skipIfTokenBalancePositive: bool,
+    pub postBuySell: Option<NormalizedFollowLaunchSell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedFollowLaunchSell {
+    pub actionId: String,
+    pub enabled: bool,
+    pub walletEnvKey: String,
+    pub percent: u8,
+    pub delayMs: u64,
+    pub targetBlockOffset: Option<u8>,
+    pub marketCap: Option<NormalizedFollowLaunchMarketCapTrigger>,
+    pub precheckRequired: bool,
+    pub requireConfirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedFollowLaunchMarketCapTrigger {
+    pub direction: String,
+    pub threshold: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizedFollowLaunchConstraints {
+    pub pumpOnly: bool,
+    pub retryBudget: u32,
+    pub requireDaemonReadiness: bool,
+    pub blockOnRequiredPrechecks: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -709,6 +848,293 @@ fn normalize_dev_buy(raw: &RawConfig) -> Result<Option<NormalizedDevBuy>, Config
     Ok(None)
 }
 
+fn normalize_follow_sell(
+    raw: &RawFollowLaunchSell,
+    fallback_wallet_env_key: &str,
+    fallback_action_id: &str,
+) -> Result<Option<NormalizedFollowLaunchSell>, ConfigError> {
+    let enabled = parse_bool(&raw.enabled, false);
+    let market_cap_enabled =
+        parse_bool(&raw.marketCap.enabled, false) && !raw.marketCap.threshold.trim().is_empty();
+    let has_payload = enabled
+        || raw.percent.is_some()
+        || raw.delayMs.is_some()
+        || raw.targetBlockOffset.is_some()
+        || market_cap_enabled
+        || !raw.walletEnvKey.trim().is_empty();
+    if !has_payload {
+        return Ok(None);
+    }
+    let percent = parse_int(
+        &raw.percent,
+        &format!("{fallback_action_id}.percent"),
+        Some(0),
+        Some(100),
+        Some(100),
+    )?
+    .unwrap_or(100) as u8;
+    let delay_ms = parse_int(
+        &raw.delayMs,
+        &format!("{fallback_action_id}.delayMs"),
+        Some(0),
+        None,
+        Some(0),
+    )?
+    .unwrap_or(0) as u64;
+    let target_block_offset = parse_int(
+        &raw.targetBlockOffset,
+        &format!("{fallback_action_id}.targetBlockOffset"),
+        Some(0),
+        Some(32),
+        None,
+    )?
+    .map(|value| value as u8);
+    let direction = if raw.marketCap.direction.trim().is_empty() {
+        "gte".to_string()
+    } else {
+        parse_choice(
+            &raw.marketCap.direction,
+            &format!("{fallback_action_id}.marketCap.direction"),
+            &["gte", "lte"],
+            "gte",
+        )?
+    };
+    Ok(Some(NormalizedFollowLaunchSell {
+        actionId: if raw.actionId.trim().is_empty() {
+            fallback_action_id.to_string()
+        } else {
+            raw.actionId.trim().to_string()
+        },
+        enabled: enabled || percent > 0,
+        walletEnvKey: if raw.walletEnvKey.trim().is_empty() {
+            fallback_wallet_env_key.trim().to_string()
+        } else {
+            raw.walletEnvKey.trim().to_string()
+        },
+        percent,
+        delayMs: delay_ms,
+        targetBlockOffset: target_block_offset,
+        marketCap: if market_cap_enabled {
+            Some(NormalizedFollowLaunchMarketCapTrigger {
+                direction,
+                threshold: raw.marketCap.threshold.trim().to_string(),
+            })
+        } else {
+            None
+        },
+        precheckRequired: parse_bool(&raw.precheckRequired, false),
+        requireConfirmation: parse_bool(&raw.requireConfirmation, true),
+    }))
+}
+
+fn follow_sell_has_payload(raw: &RawFollowLaunchSell) -> bool {
+    parse_bool(&raw.enabled, false)
+        || raw.percent.is_some()
+        || raw.delayMs.is_some()
+        || raw.targetBlockOffset.is_some()
+        || (parse_bool(&raw.marketCap.enabled, false) && !raw.marketCap.threshold.trim().is_empty())
+        || !raw.walletEnvKey.trim().is_empty()
+}
+
+fn legacy_follow_launch(
+    raw: &RawConfig,
+    post_launch_strategy: &str,
+) -> Result<NormalizedFollowLaunch, ConfigError> {
+    let mut snipes = Vec::new();
+    if post_launch_strategy == "snipe-own-launch"
+        && !raw.postLaunch.snipeOwnLaunch.buyAmountSol.trim().is_empty()
+    {
+        snipes.push(NormalizedFollowLaunchSnipe {
+            actionId: "legacy-snipe-1".to_string(),
+            enabled: true,
+            walletEnvKey: raw.selectedWalletKey.trim().to_string(),
+            buyAmountSol: raw
+                .postLaunch
+                .snipeOwnLaunch
+                .buyAmountSol
+                .trim()
+                .to_string(),
+            submitWithLaunch: false,
+            retryOnFailure: false,
+            submitDelayMs: 0,
+            targetBlockOffset: None,
+            jitterMs: 0,
+            feeJitterBps: 0,
+            skipIfTokenBalancePositive: false,
+            postBuySell: None,
+        });
+    }
+    let dev_auto_sell = if post_launch_strategy == "automatic-dev-sell"
+        || parse_bool(&raw.postLaunch.automaticDevSell.enabled, false)
+    {
+        Some(NormalizedFollowLaunchSell {
+            actionId: "legacy-dev-auto-sell".to_string(),
+            enabled: true,
+            walletEnvKey: raw.selectedWalletKey.trim().to_string(),
+            percent: parse_int(
+                &raw.postLaunch.automaticDevSell.percent,
+                "postLaunch.automaticDevSell.percent",
+                Some(0),
+                Some(100),
+                Some(100),
+            )?
+            .unwrap_or(100) as u8,
+            delayMs: (parse_int(
+                &raw.postLaunch.automaticDevSell.delaySeconds,
+                "postLaunch.automaticDevSell.delaySeconds",
+                Some(0),
+                Some(10),
+                Some(0),
+            )?
+            .unwrap_or(0) as u64)
+                * 1000,
+            targetBlockOffset: None,
+            marketCap: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+        })
+    } else {
+        None
+    };
+    Ok(NormalizedFollowLaunch {
+        enabled: !snipes.is_empty() || dev_auto_sell.is_some(),
+        source: "legacy-postLaunch".to_string(),
+        schemaVersion: 1,
+        snipes,
+        devAutoSell: dev_auto_sell,
+        constraints: NormalizedFollowLaunchConstraints {
+            pumpOnly: true,
+            retryBudget: 1,
+            requireDaemonReadiness: true,
+            blockOnRequiredPrechecks: true,
+        },
+    })
+}
+
+fn normalize_follow_launch(
+    raw: &RawConfig,
+    post_launch_strategy: &str,
+) -> Result<NormalizedFollowLaunch, ConfigError> {
+    let follow = &raw.followLaunch;
+    let explicit_schema = parse_int(
+        &follow.schemaVersion,
+        "followLaunch.schemaVersion",
+        Some(1),
+        Some(i64::from(u32::MAX)),
+        Some(1),
+    )?
+    .unwrap_or(1) as u32;
+    let mut snipes = Vec::new();
+    for (index, entry) in follow.snipes.iter().enumerate() {
+        let enabled = parse_bool(&entry.enabled, true);
+        let amount = entry.buyAmountSol.trim().to_string();
+        let wallet_env_key = entry.walletEnvKey.trim().to_string();
+        let has_payload = enabled || !amount.is_empty() || !wallet_env_key.is_empty();
+        if !has_payload {
+            continue;
+        }
+        let target_block_offset = parse_int(
+            &entry.targetBlockOffset,
+            &format!("followLaunch.snipes[{index}].targetBlockOffset"),
+            Some(0),
+            Some(5),
+            None,
+        )?
+        .map(|value| value as u8);
+        let submit_with_launch = parse_bool(&entry.submitWithLaunch, false);
+        let submit_delay_ms = parse_int(
+            &entry.submitDelayMs,
+            &format!("followLaunch.snipes[{index}].submitDelayMs"),
+            Some(0),
+            None,
+            Some(0),
+        )?
+        .unwrap_or(0) as u64;
+        if submit_with_launch && (submit_delay_ms > 0 || target_block_offset.is_some()) {
+            return Err(ConfigError::Message(format!(
+                "followLaunch.snipes[{index}] cannot use submitWithLaunch together with submitDelayMs or targetBlockOffset."
+            )));
+        }
+        if let Some(sell) = &entry.postBuySell {
+            if follow_sell_has_payload(sell) {
+                return Err(ConfigError::Message(format!(
+                    "followLaunch.snipes[{index}].postBuySell is not shipped yet. Phase 1 supports multi-sniper buys plus dev auto-sell only."
+                )));
+            }
+        }
+        let post_buy_sell = match &entry.postBuySell {
+            Some(sell) => {
+                normalize_follow_sell(sell, &wallet_env_key, &format!("snipe-{}-sell", index + 1))?
+            }
+            None => None,
+        };
+        snipes.push(NormalizedFollowLaunchSnipe {
+            actionId: if entry.actionId.trim().is_empty() {
+                format!("snipe-{}-buy", index + 1)
+            } else {
+                entry.actionId.trim().to_string()
+            },
+            enabled,
+            walletEnvKey: wallet_env_key,
+            buyAmountSol: amount,
+            submitWithLaunch: submit_with_launch,
+            retryOnFailure: parse_bool(&entry.retryOnFailure, false),
+            submitDelayMs: submit_delay_ms,
+            targetBlockOffset: target_block_offset,
+            jitterMs: parse_int(
+                &entry.jitterMs,
+                &format!("followLaunch.snipes[{index}].jitterMs"),
+                Some(0),
+                None,
+                Some(0),
+            )?
+            .unwrap_or(0) as u64,
+            feeJitterBps: parse_int(
+                &entry.feeJitterBps,
+                &format!("followLaunch.snipes[{index}].feeJitterBps"),
+                Some(0),
+                Some(10_000),
+                Some(0),
+            )?
+            .unwrap_or(0) as u16,
+            skipIfTokenBalancePositive: false,
+            postBuySell: post_buy_sell,
+        });
+    }
+    let dev_auto_sell = match &follow.devAutoSell {
+        Some(sell) => normalize_follow_sell(sell, raw.selectedWalletKey.trim(), "dev-auto-sell")?,
+        None => None,
+    };
+    let explicit_enabled = parse_bool(&follow.enabled, false);
+    let has_explicit_payload = explicit_enabled || !snipes.is_empty() || dev_auto_sell.is_some();
+    if !has_explicit_payload {
+        return legacy_follow_launch(raw, post_launch_strategy);
+    }
+    Ok(NormalizedFollowLaunch {
+        enabled: explicit_enabled || !snipes.is_empty() || dev_auto_sell.is_some(),
+        source: "followLaunch".to_string(),
+        schemaVersion: explicit_schema,
+        snipes,
+        devAutoSell: dev_auto_sell,
+        constraints: NormalizedFollowLaunchConstraints {
+            pumpOnly: parse_bool(&follow.constraints.pumpOnly, true),
+            retryBudget: parse_int(
+                &follow.constraints.retryBudget,
+                "followLaunch.constraints.retryBudget",
+                Some(0),
+                Some(32),
+                Some(1),
+            )?
+            .unwrap_or(1) as u32,
+            requireDaemonReadiness: parse_bool(&follow.constraints.requireDaemonReadiness, true),
+            blockOnRequiredPrechecks: parse_bool(
+                &follow.constraints.blockOnRequiredPrechecks,
+                true,
+            ),
+        },
+    })
+}
+
 pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigError> {
     let requested_mode = if raw.mode.trim().is_empty() {
         "regular".to_string()
@@ -864,12 +1290,6 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     "global",
                 )?
             },
-            policy: parse_choice(
-                &raw.execution.policy,
-                "execution.policy",
-                &["fast", "safe"],
-                "fast",
-            )?,
             autoGas: parse_bool(&raw.execution.autoGas, true),
             autoMode: if is_blank(&raw.execution.autoMode) {
                 "launchAuto".to_string()
@@ -896,12 +1316,6 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     "global",
                 )?
             },
-            buyPolicy: parse_choice(
-                &raw.execution.buyPolicy,
-                "execution.buyPolicy",
-                &["fast", "safe"],
-                "fast",
-            )?,
             buyAutoGas: parse_bool(&raw.execution.buyAutoGas, true),
             buyAutoMode: if is_blank(&raw.execution.buyAutoMode) {
                 "buyAuto".to_string()
@@ -929,12 +1343,6 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     "global",
                 )?
             },
-            sellPolicy: parse_choice(
-                &raw.execution.sellPolicy,
-                "execution.sellPolicy",
-                &["fast", "safe"],
-                "safe",
-            )?,
             sellPriorityFeeSol: raw.execution.sellPriorityFeeSol.trim().to_string(),
             sellTipSol: raw.execution.sellTipSol.trim().to_string(),
             sellSlippagePercent: raw.execution.sellSlippagePercent.trim().to_string(),
@@ -972,6 +1380,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                 .unwrap_or(0),
             },
         },
+        followLaunch: normalize_follow_launch(&raw, &post_launch_strategy)?,
         presets: NormalizedPresets {
             activePresetId: raw.presets.activePresetId.trim().to_string(),
             selectedLaunchPresetId: raw.presets.selectedLaunchPresetId.trim().to_string(),
@@ -1097,12 +1506,10 @@ mod tests {
                 "skipPreflight": true,
                 "provider": "helius-sender",
                 "endpointProfile": "global",
-                "policy": "fast",
                 "autoGas": true,
                 "autoMode": "launchAuto",
                 "buyProvider": "helius-sender",
                 "buyEndpointProfile": "global",
-                "buyPolicy": "fast",
                 "buyAutoGas": true,
                 "buyAutoMode": "buyAuto",
                 "sellProvider": "helius-sender",
@@ -1134,6 +1541,22 @@ mod tests {
         assert_eq!(normalized.execution.buyProvider, "helius-sender");
         assert_eq!(normalized.execution.buyEndpointProfile, "global");
         assert!(normalized.devBuy.is_none());
+        assert!(!normalized.followLaunch.enabled);
+    }
+
+    #[test]
+    fn ignores_legacy_policy_fields_during_normalization() {
+        let mut raw = sample_raw_config();
+        raw.execution.policy = "not-a-valid-policy-anymore".to_string();
+        raw.execution.buyPolicy = "fast".to_string();
+        raw.execution.sellPolicy = "safe".to_string();
+
+        let normalized =
+            normalize_raw_config(raw).expect("legacy policy fields should be ignored");
+
+        assert_eq!(normalized.execution.provider, "helius-sender");
+        assert_eq!(normalized.execution.buyProvider, "helius-sender");
+        assert_eq!(normalized.execution.sellProvider, "helius-sender");
     }
 
     #[test]
@@ -1170,5 +1593,82 @@ mod tests {
         assert!(error.to_string().contains(
             "execution.provider must be one of standard-rpc, helius-sender, jito-bundle"
         ));
+    }
+
+    #[test]
+    fn migrates_legacy_post_launch_into_follow_launch() {
+        let mut raw = sample_raw_config();
+        raw.selectedWalletKey = "SOLANA_PRIVATE_KEY2".to_string();
+        raw.postLaunch.strategy = "automatic-dev-sell".to_string();
+        raw.postLaunch.automaticDevSell.enabled = Some(json!(true));
+        raw.postLaunch.automaticDevSell.percent = Some(json!(75));
+        raw.postLaunch.automaticDevSell.delaySeconds = Some(json!(2));
+        let normalized = normalize_raw_config(raw).expect("legacy postLaunch should migrate");
+        assert!(normalized.followLaunch.enabled);
+        let dev_auto_sell = normalized
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        assert_eq!(dev_auto_sell.walletEnvKey, "SOLANA_PRIVATE_KEY2");
+        assert_eq!(dev_auto_sell.percent, 75);
+        assert_eq!(dev_auto_sell.delayMs, 2000);
+    }
+
+    #[test]
+    fn normalizes_explicit_follow_launch_snipes() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "snipes": [
+                {
+                    "walletEnvKey": "SOLANA_PRIVATE_KEY2",
+                    "buyAmountSol": "0.25",
+                    "submitDelayMs": 30,
+                    "targetBlockOffset": 1,
+                    "jitterMs": 5,
+                    "feeJitterBps": 250
+                }
+            ]
+        }))
+        .expect("follow launch raw");
+        let normalized = normalize_raw_config(raw).expect("follow launch should normalize");
+        assert!(normalized.followLaunch.enabled);
+        assert_eq!(normalized.followLaunch.snipes.len(), 1);
+        let snipe = &normalized.followLaunch.snipes[0];
+        assert_eq!(snipe.walletEnvKey, "SOLANA_PRIVATE_KEY2");
+        assert_eq!(snipe.buyAmountSol, "0.25");
+        assert_eq!(snipe.submitDelayMs, 30);
+        assert_eq!(snipe.targetBlockOffset, Some(1));
+        assert_eq!(snipe.jitterMs, 5);
+        assert_eq!(snipe.feeJitterBps, 250);
+    }
+
+    #[test]
+    fn rejects_phase_two_post_buy_sell_in_follow_launch() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "snipes": [
+                {
+                    "walletEnvKey": "SOLANA_PRIVATE_KEY2",
+                    "buyAmountSol": "0.25",
+                    "postBuySell": {
+                        "enabled": true,
+                        "percent": 100,
+                        "delayMs": 2500
+                    }
+                }
+            ]
+        }))
+        .expect("follow launch raw");
+        let error =
+            normalize_raw_config(raw).expect_err("phase two post buy sell should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("followLaunch.snipes[0].postBuySell is not shipped yet")
+        );
     }
 }

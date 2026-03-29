@@ -108,19 +108,29 @@
           </div>
           </div>
 
-        <div class="launch-surface-section launch-surface-token">
+        <div id="token-surface-section" class="launch-surface-section launch-surface-token">
           <div class="stack">
             <div class="image-panel-wrap">
               <input id="image-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
-              <button id="open-image-library-button" type="button" class="image-panel">
-                <div class="image-preview-wrap">
-                  <img id="image-preview" alt="Token preview" hidden>
-                  <div id="image-empty" class="image-empty">
-                    <span class="image-empty-title">Select Image</span>
-                    <span class="tag required image-empty-tag">required</span>
+              <div class="image-panel-shell">
+                <button
+                  id="image-layout-toggle"
+                  type="button"
+                  class="image-layout-toggle"
+                  aria-pressed="false"
+                  aria-label="Compact image field"
+                  title="Compact image field"
+                ></button>
+                <button id="open-image-library-button" type="button" class="image-panel">
+                  <div class="image-preview-wrap">
+                    <img id="image-preview" alt="Token preview" hidden>
+                    <div id="image-empty" class="image-empty">
+                      <span class="image-empty-title">Select Image</span>
+                      <span class="tag required image-empty-tag">required</span>
+                    </div>
                   </div>
-                </div>
-              </button>
+                </button>
+              </div>
               <div class="image-meta">
                 <div id="image-status" class="muted small"></div>
                 <div id="image-path" class="mono small"></div>
@@ -138,7 +148,7 @@
                 <span class="field-head">
                   <span class="field-head-main">Ticker <span class="tag required">required</span></span>
                   <span class="field-head-actions">
-                    <button id="ticker-caps-toggle" type="button" class="field-mini-toggle">All Caps</button>
+                    <button id="ticker-caps-toggle" type="button" class="field-mini-toggle field-icon-toggle" aria-label="Toggle all caps ticker" title="Toggle all caps ticker">Aa</button>
                     <span id="symbol-char-count" class="field-count">0/10</span>
                   </span>
                 </span>
@@ -284,22 +294,52 @@
                     </label>
                   </div>
                   <div id="auto-sell-settings" class="auto-sell-settings" hidden>
-                    <div class="auto-sell-slider-block">
+                    <div class="auto-sell-trigger-block">
                       <div class="auto-sell-slider-head">
-                        <span>Delay</span>
-                        <strong id="auto-sell-delay-value">0.0s</strong>
+                        <span>Trigger</span>
+                        <strong id="auto-sell-trigger-value">Safe</strong>
                       </div>
-                      <input id="auto-sell-delay-slider" class="auto-sell-slider" type="range" min="0" max="10" step="0.1" value="0">
-                      <input name="automaticDevSellDelaySeconds" type="hidden" value="0">
-                      <div class="field-error" data-error-for="automaticDevSellDelaySeconds"></div>
+                      <div class="auto-sell-trigger-grid">
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="confirmation">Safe Confirmed</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="submit-delay">On Submit + Delay</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-trigger-mode="block-offset">Block Offset</button>
+                      </div>
+                      <div id="auto-sell-trigger-description" class="auto-sell-help-text"></div>
+                      <input name="automaticDevSellTriggerMode" type="hidden" value="confirmation">
+                    </div>
+                    <div id="auto-sell-delay-control" class="auto-sell-slider-block" hidden>
+                      <div class="auto-sell-slider-head">
+                        <span>Submit Delay</span>
+                        <strong id="auto-sell-delay-value">0ms</strong>
+                      </div>
+                      <input id="auto-sell-delay-slider" class="auto-sell-slider" type="range" min="0" max="1500" step="25" value="0">
+                      <input name="automaticDevSellDelayMs" type="hidden" value="0">
+                      <div class="field-error" data-error-for="automaticDevSellDelayMs"></div>
+                    </div>
+                    <div id="auto-sell-block-control" class="auto-sell-trigger-block" hidden>
+                      <div class="auto-sell-slider-head">
+                        <span>Target Block</span>
+                        <strong id="auto-sell-block-value">Block 0</strong>
+                      </div>
+                      <div class="auto-sell-trigger-grid auto-sell-block-grid">
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="0">Block 0</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="1">Block 1</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="2">Block 2</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="3">Block 3</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="4">Block 4</button>
+                        <button type="button" class="auto-sell-trigger-chip" data-auto-sell-block-offset="5">Block 5</button>
+                      </div>
+                      <div class="auto-sell-help-text">Send the sell transaction as soon as the launcher reaches the selected observed block offset.</div>
+                      <input name="automaticDevSellBlockOffset" type="hidden" value="0">
+                      <div class="field-error" data-error-for="automaticDevSellBlockOffset"></div>
                     </div>
                     <div class="auto-sell-slider-block">
                       <div class="auto-sell-slider-head">
                         <span>Sell Amount</span>
-                        <strong id="auto-sell-percent-value">0%</strong>
+                        <strong id="auto-sell-percent-value">100%</strong>
                       </div>
-                      <input id="auto-sell-percent-slider" class="auto-sell-slider" type="range" min="0" max="100" step="1" value="0">
-                      <input name="automaticDevSellPercent" type="hidden" value="0">
+                      <input id="auto-sell-percent-slider" class="auto-sell-slider" type="range" min="1" max="100" step="1" value="100">
+                      <input name="automaticDevSellPercent" type="hidden" value="100">
                       <div class="field-error" data-error-for="automaticDevSellPercent"></div>
                     </div>
                   </div>
@@ -400,7 +440,7 @@
             tabindex="0"
             title="Drag to resize report list"
           ></div>
-          <pre id="reports-terminal-output" class="console reports-console">Reports terminal hidden.</pre>
+          <div id="reports-terminal-output" class="reports-terminal-output">Reports terminal hidden.</div>
         </div>
       </aside>
       </div>
@@ -408,179 +448,149 @@
 
     <div id="settings-modal" class="modal-overlay" hidden>
       <div class="modal settings-modal">
-        <div class="modal-header">
-          <h3>Settings</h3>
+        <div class="modal-header settings-modal-header">
+          <div class="settings-modal-heading">
+            <h3>Settings</h3>
+            <div class="settings-modal-subtitle">Preset routes, fee defaults, and backend routing summary.</div>
+          </div>
           <button type="button" id="settings-close" class="modal-close">&times;</button>
         </div>
         <div class="modal-body settings-modal-body">
-          <section class="settings-preset-toolbar">
-            <div class="settings-preset-copy">
-              <span class="settings-preset-label">Active Preset</span>
-              <div id="settings-preset-chip-bar" class="preset-chip-bar settings-preset-chip-bar"></div>
-            </div>
-            <button type="button" id="preset-edit-toggle" class="preset-edit-toggle button subtle" aria-pressed="false" title="Unlock preset editing">&#9998;</button>
-          </section>
+          <div class="settings-modal-layout">
+            <section class="stack settings-section settings-section-modern settings-main-panel">
+              <section class="settings-preset-toolbar settings-main-panel-toolbar">
+                <div class="settings-preset-copy">
+                  <span class="settings-preset-label">Active Preset</span>
+                  <div id="settings-preset-chip-bar" class="preset-chip-bar settings-preset-chip-bar"></div>
+                </div>
+                <button type="button" id="preset-edit-toggle" class="preset-edit-toggle button subtle" aria-pressed="false" title="Unlock preset editing">&#9998;</button>
+              </section>
 
-          <section class="stack settings-section settings-section-modern">
-            <div class="settings-section-title-row">
-              <div>
-                <h4>Creation Settings</h4>
-                <p class="settings-section-copy">Launch route, creation fees, and preset quick deploy amount.</p>
-              </div>
-              <span class="settings-section-pill">Creation</span>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span>Route</span>
-                <select name="creationProvider" id="provider-select">
-                  <option value="helius-sender" selected>Helius Sender</option>
-                  <option value="standard-rpc">Standard RPC</option>
-                  <option value="jito-bundle">Jito Bundle</option>
-                </select>
-              </label>
-              <label>
-                <span>Endpoint Profile</span>
-                <select name="endpointProfile" id="endpoint-profile-select">
-                  <option value="global" selected>Global</option>
-                  <option value="us">US</option>
-                  <option value="eu">EU</option>
-                  <option value="west">West</option>
-                  <option value="asia">Asia</option>
-                </select>
-              </label>
-              <label>
-                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
-                <div class="field-error" data-error-for="creationTipSol"></div>
-              </label>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
-                <div class="field-error" data-error-for="creationPriorityFeeSol"></div>
-              </label>
-            </div>
-          </section>
+              <div class="settings-main-panel-body">
+                <section class="settings-row-group">
+                  <div class="settings-row-header">
+                  <div>
+                    <h4>Creation</h4>
+                    <p class="settings-section-copy">Launch route plus default fee values for the active preset.</p>
+                  </div>
+                  <span class="settings-section-pill">Creation</span>
+                  </div>
+                  <div class="settings-grid settings-grid-three settings-route-grid">
+                  <label>
+                    <span>Route</span>
+                    <select name="creationProvider" id="provider-select">
+                      <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="standard-rpc">Standard RPC</option>
+                      <option value="jito-bundle">Jito Bundle</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="creationPriorityFeeSol" id="creation-priority-input" type="text" placeholder="0.001">
+                    <div class="field-error" data-error-for="creationPriorityFeeSol"></div>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="creationTipSol" id="creation-tip-input" type="text" placeholder="0.01">
+                    <div class="field-error" data-error-for="creationTipSol"></div>
+                  </label>
+                  </div>
+                </section>
 
-          <section class="stack settings-section settings-section-modern">
-            <div class="settings-section-title-row">
-              <div>
-                <h4>Buy Settings</h4>
-                <p class="settings-section-copy">Sniper buy route, fees, slippage, and post-launch buy defaults.</p>
-              </div>
-              <span class="settings-section-pill">Buy</span>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span>Route</span>
-                <select name="buyProvider" id="buy-provider-select">
-                  <option value="helius-sender" selected>Helius Sender</option>
-                  <option value="standard-rpc">Standard RPC</option>
-                  <option value="jito-bundle">Jito Bundle</option>
-                </select>
-              </label>
-              <label>
-                <span>Endpoint Profile</span>
-                <select name="buyEndpointProfile" id="buy-endpoint-profile-select">
-                  <option value="global" selected>Global</option>
-                  <option value="us">US</option>
-                  <option value="eu">EU</option>
-                  <option value="west">West</option>
-                  <option value="asia">Asia</option>
-                </select>
-              </label>
-              <label>
-                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
-                <div class="field-error" data-error-for="buyPriorityFeeSol"></div>
-              </label>
-              <label>
-                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
-                <div class="field-error" data-error-for="buyTipSol"></div>
-              </label>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span>Slippage (%)</span>
-                <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
-                <div class="field-error" data-error-for="buySlippagePercent"></div>
-              </label>
-            </div>
-          </section>
+                <section class="settings-row-group">
+                  <div class="settings-row-header">
+                  <div>
+                    <h4>Buy</h4>
+                    <p class="settings-section-copy">Sniper and post-launch buy defaults for the active preset.</p>
+                  </div>
+                  <span class="settings-section-pill">Buy</span>
+                  </div>
+                  <div class="settings-grid settings-grid-four settings-route-grid">
+                  <label>
+                    <span>Route</span>
+                    <select name="buyProvider" id="buy-provider-select">
+                      <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="standard-rpc">Standard RPC</option>
+                      <option value="jito-bundle">Jito Bundle</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="buyPriorityFeeSol" id="buy-priority-fee-input" type="text" placeholder="0.009">
+                    <div class="field-error" data-error-for="buyPriorityFeeSol"></div>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="buyTipSol" id="buy-tip-input" type="text" placeholder="0.01">
+                    <div class="field-error" data-error-for="buyTipSol"></div>
+                  </label>
+                  <label>
+                    <span>Slippage (%)</span>
+                    <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
+                    <div class="field-error" data-error-for="buySlippagePercent"></div>
+                  </label>
+                  </div>
+                </section>
 
-          <section class="stack settings-section settings-section-modern">
-            <div class="settings-section-title-row">
-              <div>
-                <h4>Sell Settings</h4>
-                <p class="settings-section-copy">Sell-side routing for sniper sell and dev auto-sell defaults.</p>
+                <section class="settings-row-group">
+                  <div class="settings-row-header">
+                  <div>
+                    <h4>Sell</h4>
+                    <p class="settings-section-copy">Sniper sell and dev auto-sell defaults for the active preset.</p>
+                  </div>
+                  <span class="settings-section-pill">Sell</span>
+                  </div>
+                  <div class="settings-grid settings-grid-four settings-route-grid">
+                  <label>
+                    <span>Route</span>
+                    <select name="sellProvider" id="sell-provider-select">
+                      <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="standard-rpc">Standard RPC</option>
+                      <option value="jito-bundle">Jito Bundle</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
+                    <div class="field-error" data-error-for="sellPriorityFeeSol"></div>
+                  </label>
+                  <label>
+                    <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
+                    <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
+                    <div class="field-error" data-error-for="sellTipSol"></div>
+                  </label>
+                  <label>
+                    <span>Slippage (%)</span>
+                    <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
+                    <div class="field-error" data-error-for="sellSlippagePercent"></div>
+                  </label>
+                  </div>
+                </section>
               </div>
-              <span class="settings-section-pill">Sell</span>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span>Route</span>
-                <select name="sellProvider" id="sell-provider-select">
-                  <option value="helius-sender" selected>Helius Sender</option>
-                  <option value="standard-rpc">Standard RPC</option>
-                  <option value="jito-bundle">Jito Bundle</option>
-                </select>
-              </label>
-              <label>
-                <span>Endpoint Profile</span>
-                <select name="sellEndpointProfile" id="sell-endpoint-profile-select">
-                  <option value="global" selected>Global</option>
-                  <option value="us">US</option>
-                  <option value="eu">EU</option>
-                  <option value="west">West</option>
-                  <option value="asia">Asia</option>
-                </select>
-              </label>
-              <label>
-                <span class="field-label-with-icon">Priority Fee <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="sellPriorityFeeSol" id="sell-priority-fee-input" type="text" placeholder="0.009">
-                <div class="field-error" data-error-for="sellPriorityFeeSol"></div>
-              </label>
-              <label>
-                <span class="field-label-with-icon">Tip <img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
-                <input name="sellTipSol" id="sell-tip-input" type="text" placeholder="0.01">
-                <div class="field-error" data-error-for="sellTipSol"></div>
-              </label>
-            </div>
-            <div class="settings-grid settings-grid-three">
-              <label>
-                <span>Slippage (%)</span>
-                <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
-                <div class="field-error" data-error-for="sellSlippagePercent"></div>
-              </label>
-            </div>
-          </section>
+            </section>
 
-          <section class="stack settings-section settings-section-modern">
-            <div class="settings-section-title-row">
-              <div>
-                <h4>Miscellaneous Settings</h4>
-                <p class="settings-section-copy">Optional diagnostics and non-routing runtime behavior.</p>
-              </div>
-              <span class="settings-section-pill">Misc</span>
-            </div>
-            <div class="settings-grid">
-              <label class="settings-checkbox-row">
-                <input name="trackSendBlockHeight" id="track-send-block-height-toggle" type="checkbox">
-                <span class="settings-checkbox-copy">
-                  <strong>Track send block height</strong>
-                  <span>Fetch the current block height after a successful submit and store it in send reports for speed tracking.</span>
-                </span>
-              </label>
-            </div>
-          </section>
+            <aside class="settings-modal-sidebar">
+              <section class="stack settings-section settings-section-modern settings-sidebar-section">
+                <div class="settings-section-title-row">
+                  <div>
+                    <h4>Backend Routing</h4>
+                    <p class="settings-section-copy">Read-only runtime defaults from backend env.</p>
+                  </div>
+                  <span class="settings-section-pill">Routing</span>
+                </div>
+                <div id="settings-backend-region-summary" class="settings-grid">
+                  <div class="settings-section-copy">Loading backend routing defaults...</div>
+                </div>
+              </section>
+
+            </aside>
+          </div>
 
           <input name="skipPreflight" type="hidden" value="false">
         </div>
-        <div class="modal-footer">
-          <button type="button" id="settings-cancel" class="button">Close</button>
-          <button type="button" id="save-settings-button" class="button deploy">Save Settings</button>
+        <div class="modal-footer settings-modal-footer">
+          <button type="button" id="settings-cancel" class="button subtle">Close</button>
+          <button type="button" id="save-settings-button" class="button deploy">Save</button>
         </div>
       </div>
     </div>
@@ -619,7 +629,7 @@
         <div class="modal-header sniper-modal-header">
           <div>
             <h3>Sniper Configuration</h3>
-            <div class="muted small">Select wallets and configure amounts.</div>
+            <div class="muted small">Compact multi-wallet launch snipes.</div>
           </div>
           <div class="sniper-modal-actions">
             <button type="button" id="sniper-refresh-button" class="button subtle sniper-header-button">Refresh</button>
@@ -634,7 +644,7 @@
                 <span class="sniper-card-icon"><img src="/solana-mark.png" alt="SOL" class="sol-logo inline-sol-logo"></span>
                 <div>
                   <strong>Sniper</strong>
-                  <div class="muted small">Buy in next blocks with selected wallets after creation.</div>
+                  <div class="muted small">Multi-wallet launch snipes.</div>
                 </div>
               </div>
               <label class="auto-sell-toggle sniper-enable-toggle">
@@ -644,13 +654,22 @@
             </div>
             <div id="sniper-wallets-section" class="sniper-wallets-section" hidden>
               <div class="sniper-wallets-header">
-                <div class="muted small">Selected deployer wallet is disabled because it already creates the token.</div>
-                <div id="sniper-selection-summary" class="muted small">0 wallets selected</div>
+                <div class="sniper-wallets-header-copy">
+                  <strong>Wallets</strong>
+                  <span class="tooltip-dot inline" title="The selected deployer wallet is pinned first for visibility and cannot snipe the same launch.">?</span>
+                </div>
+                <div class="sniper-wallets-summary">
+                  <div id="sniper-selection-summary" class="muted small">0 wallets selected</div>
+                </div>
               </div>
               <div id="sniper-wallet-list" class="sniper-wallet-list"></div>
               <div id="sniper-modal-error" class="field-error sniper-modal-error"></div>
             </div>
           </div>
+        </div>
+        <div class="sniper-footer-summary">
+          <span>Total Buy</span>
+          <strong id="sniper-total-summary" class="sniper-total-summary">0 SOL</strong>
         </div>
         <div class="modal-footer">
           <button type="button" id="sniper-cancel" class="button">Close</button>
@@ -860,6 +879,12 @@
       </div>
     </div>
 
+    <script src="/request-utils.js"></script>
+    <script src="/render-utils.js"></script>
+    <script src="/reports-feature.js"></script>
+    <script src="/images-feature.js"></script>
+    <script src="/auto-sell-feature.js"></script>
+    <script src="/sniper-feature.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -7,6 +7,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::Path,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +47,12 @@ pub struct ImageLibraryPayload {
     pub ok: bool,
     pub images: Vec<SerializedImageRecord>,
     pub categories: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedImageLibrary {
+    modified_ms: u128,
+    library: ImageLibrary,
 }
 
 fn now_ms() -> u128 {
@@ -94,6 +101,19 @@ pub fn ensure_local_dirs() -> Result<(), String> {
 pub fn read_image_library() -> Result<ImageLibrary, String> {
     ensure_local_dirs()?;
     let path = paths::image_library_path();
+    let modified_ms = fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let cache = image_library_cache();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.modified_ms == modified_ms
+    {
+        return Ok(cached.library.clone());
+    }
     let raw = fs::read_to_string(&path).unwrap_or_default();
     if raw.trim().is_empty() {
         return Ok(ImageLibrary::default());
@@ -159,7 +179,14 @@ pub fn read_image_library() -> Result<ImageLibrary, String> {
     categories.extend(image_categories);
     categories.sort_by_key(|entry| entry.to_lowercase());
     categories.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    Ok(ImageLibrary { images, categories })
+    let library = ImageLibrary { images, categories };
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedImageLibrary {
+            modified_ms,
+            library: library.clone(),
+        });
+    }
+    Ok(library)
 }
 
 pub fn write_image_library(library: &ImageLibrary) -> Result<(), String> {
@@ -168,7 +195,9 @@ pub fn write_image_library(library: &ImageLibrary) -> Result<(), String> {
         paths::image_library_path(),
         serde_json::to_vec_pretty(library).map_err(|error| error.to_string())?,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    invalidate_image_library_cache();
+    Ok(())
 }
 
 pub fn serialize_image_record(record: &ImageRecord) -> SerializedImageRecord {
@@ -308,6 +337,17 @@ pub fn save_image_bytes(
 fn chrono_like_timestamp() -> String {
     let now = now_ms();
     now.to_string()
+}
+
+fn image_library_cache() -> &'static Mutex<Option<CachedImageLibrary>> {
+    static CACHE: OnceLock<Mutex<Option<CachedImageLibrary>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn invalidate_image_library_cache() {
+    if let Ok(mut guard) = image_library_cache().lock() {
+        *guard = None;
+    }
 }
 
 pub fn update_image(

@@ -2,7 +2,7 @@
 
 ## Pump
 
-Pump is the verified launch flow currently migrated into `LaunchDeck`.
+Pump is the only active launch flow in the current initial version of `LaunchDeck`.
 
 The current implementation supports:
 
@@ -77,25 +77,12 @@ When a Pump launch also includes an immediate dev buy, the launch transaction ca
 
 ## Bonk
 
-Bonk is modeled as a Raydium-backed launchpad integration.
+Bonk is not active in the current initial version.
 
-Rules:
-
-- use official Raydium SDK surfaces
-- prefer SDK v2 when it exposes the required flow cleanly
-- do not copy community bot code as the implementation source
-
-Bonk is currently marked unverified until live validation is complete.
+Do not treat Bonk as a supported launch target yet.
 
 ## Bagsapp
 
-Bagsapp is modeled using the official Bags launch flow.
+Bagsapp is not active in the current initial version.
 
-Important constraints:
-
-- creator BPS must be explicit
-- total fee-claimer BPS must equal `10000`
-- LUT-aware config creation may be required for larger fee-claimer sets
-- `BAGS_API_KEY` is treated as a launchpad credential, not a provider credential
-
-Bagsapp is currently marked unverified until live validation is complete.
+Do not treat Bagsapp as a supported launch target yet.

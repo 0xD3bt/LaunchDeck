@@ -29,6 +29,7 @@ const DEFAULT_JITO_BUNDLE_BASE_URLS: [&str; 9] = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
     "https://dublin.mainnet.block-engine.jito.wtf",
 ];
+const DEFAULT_ENDPOINT_PROFILE: &str = "global";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JitoBundleEndpoint {
@@ -55,6 +56,8 @@ pub struct TransportPlan {
     pub maxRetries: u32,
     pub heliusSenderEndpoint: Option<String>,
     pub heliusSenderEndpoints: Vec<String>,
+    pub watchEndpoint: Option<String>,
+    pub watchEndpoints: Vec<String>,
     pub jitoBundleEndpoints: Vec<JitoBundleEndpoint>,
     pub warnings: Vec<String>,
 }
@@ -67,30 +70,88 @@ fn normalize_provider(provider: &str) -> String {
     }
 }
 
+fn normalized_supported_region(region: &str) -> Option<String> {
+    match region.trim().to_lowercase().as_str() {
+        "global" | "us" | "eu" | "west" | "asia" => Some(region.trim().to_lowercase()),
+        _ => None,
+    }
+}
+
+fn first_non_empty_env(keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| {
+            let value = env::var(key).unwrap_or_default();
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn provider_region_env_key(provider: &str) -> Option<&'static str> {
+    match normalize_provider(provider).as_str() {
+        "helius-sender" => Some("USER_REGION_HELIUS_SENDER"),
+        "jito-bundle" => Some("USER_REGION_JITO_BUNDLE"),
+        _ => None,
+    }
+}
+
+fn default_endpoint_profile_from_user_region(user_region: &str) -> String {
+    normalized_supported_region(user_region).unwrap_or_else(|| DEFAULT_ENDPOINT_PROFILE.to_string())
+}
+
+fn resolve_default_endpoint_profile_for_provider(
+    provider: &str,
+    provider_region: &str,
+    shared_region: &str,
+) -> String {
+    if normalize_provider(provider) == "standard-rpc" {
+        return String::new();
+    }
+    normalized_supported_region(provider_region)
+        .or_else(|| normalized_supported_region(shared_region))
+        .unwrap_or_else(|| DEFAULT_ENDPOINT_PROFILE.to_string())
+}
+
+pub fn configured_shared_region() -> String {
+    first_non_empty_env(&["USER_REGION"])
+}
+
+pub fn configured_provider_region(provider: &str) -> String {
+    provider_region_env_key(provider)
+        .map(|key| first_non_empty_env(&[key]))
+        .unwrap_or_default()
+}
+
+pub fn default_endpoint_profile() -> String {
+    default_endpoint_profile_from_user_region(&configured_shared_region())
+}
+
+pub fn default_endpoint_profile_for_provider(provider: &str) -> String {
+    resolve_default_endpoint_profile_for_provider(
+        provider,
+        &configured_provider_region(provider),
+        &configured_shared_region(),
+    )
+}
+
 fn normalize_endpoint_profile(provider: &str, endpoint_profile: &str) -> String {
     let normalized_provider = normalize_provider(provider);
     if normalized_provider == "standard-rpc" {
         return String::new();
     }
     match endpoint_profile.trim().to_lowercase().as_str() {
-        "" => "global".to_string(),
+        "" => default_endpoint_profile_for_provider(provider),
         "global" | "us" | "eu" | "west" | "asia" => endpoint_profile.trim().to_lowercase(),
-        _ => "global".to_string(),
+        _ => default_endpoint_profile_for_provider(provider),
     }
-}
-
-fn append_api_key(endpoint: &str, api_key: &str) -> String {
-    if api_key.is_empty() {
-        return endpoint.to_string();
-    }
-    let separator = if endpoint.contains('?') { "&" } else { "?" };
-    format!("{endpoint}{separator}api-key={api_key}")
 }
 
 fn configured_helius_sender_override() -> Option<String> {
-    let explicit = env::var("HELIUS_SENDER_ENDPOINT")
-        .or_else(|_| env::var("HELIUS_SENDER_URL"))
-        .unwrap_or_default();
+    let explicit = env::var("HELIUS_SENDER_ENDPOINT").unwrap_or_default();
     let trimmed_explicit = explicit.trim();
     if !trimmed_explicit.is_empty() {
         return Some(trimmed_explicit.to_string());
@@ -107,24 +168,25 @@ fn configured_helius_sender_override() -> Option<String> {
     None
 }
 
+pub fn helius_sender_endpoint_override_active() -> bool {
+    configured_helius_sender_override().is_some()
+}
+
 pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) -> Vec<String> {
     if let Some(override_endpoint) = configured_helius_sender_override() {
         return vec![override_endpoint];
     }
 
-    let api_key = env::var("HELIUS_SENDER_API_KEY")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let global_endpoint = append_api_key(DEFAULT_HELIUS_SENDER_ENDPOINT, &api_key);
+    let resolved_endpoint_profile = normalize_endpoint_profile("helius-sender", endpoint_profile);
+    let global_endpoint = DEFAULT_HELIUS_SENDER_ENDPOINT.to_string();
     let regional = |codes: &[&str]| {
         DEFAULT_HELIUS_SENDER_REGIONAL_ENDPOINTS
             .iter()
             .filter(|(code, _)| codes.contains(code))
-            .map(|(_, endpoint)| append_api_key(endpoint, &api_key))
+            .map(|(_, endpoint)| endpoint.to_string())
             .collect::<Vec<_>>()
     };
-    match endpoint_profile {
+    match resolved_endpoint_profile.as_str() {
         "us" => regional(&["slc", "ewr"]),
         "eu" => regional(&["lon", "fra", "ams"]),
         "asia" => regional(&["sg", "tyo"]),
@@ -134,10 +196,25 @@ pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) ->
 }
 
 pub fn configured_helius_sender_endpoint() -> String {
-    configured_helius_sender_endpoints_for_profile("global")
+    configured_helius_sender_endpoints_for_profile(&default_endpoint_profile_for_provider(
+        "helius-sender",
+    ))
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_HELIUS_SENDER_ENDPOINT.to_string())
+}
+
+pub fn configured_watch_endpoints_for_provider(
+    provider: &str,
+    endpoint_profile: &str,
+) -> Vec<String> {
+    let _ = normalize_provider(provider);
+    let _ = normalize_endpoint_profile(provider, endpoint_profile);
+    let explicit_ws = env::var("SOLANA_WS_URL").unwrap_or_default();
+    if !explicit_ws.trim().is_empty() {
+        return vec![explicit_ws.trim().to_string()];
+    }
+    vec![]
 }
 
 pub fn resolved_provider(execution: &NormalizedExecution, transaction_count: usize) -> String {
@@ -200,6 +277,7 @@ fn jito_endpoint_matches_profile(endpoint: &JitoBundleEndpoint, endpoint_profile
 pub fn configured_jito_bundle_endpoints_for_profile(
     endpoint_profile: &str,
 ) -> Vec<JitoBundleEndpoint> {
+    let resolved_endpoint_profile = normalize_endpoint_profile("jito-bundle", endpoint_profile);
     let explicit_send = env::var("JITO_SEND_BUNDLE_ENDPOINT")
         .unwrap_or_default()
         .trim()
@@ -219,9 +297,7 @@ pub fn configured_jito_bundle_endpoints_for_profile(
         return vec![];
     }
 
-    let configured_bases = env::var("JITO_BUNDLE_BASE_URLS")
-        .or_else(|_| env::var("JITO_BUNDLE_BASE_URL"))
-        .unwrap_or_default();
+    let configured_bases = env::var("JITO_BUNDLE_BASE_URLS").unwrap_or_default();
     let bases: Vec<String> = if configured_bases.trim().is_empty() {
         DEFAULT_JITO_BUNDLE_BASE_URLS
             .iter()
@@ -245,12 +321,26 @@ pub fn configured_jito_bundle_endpoints_for_profile(
             send: format!("{base}/api/v1/bundles"),
             status: format!("{base}/api/v1/getBundleStatuses"),
         })
-        .filter(|endpoint| jito_endpoint_matches_profile(endpoint, endpoint_profile))
+        .filter(|endpoint| jito_endpoint_matches_profile(endpoint, &resolved_endpoint_profile))
         .collect()
 }
 
+pub fn jito_bundle_endpoint_override_active() -> bool {
+    let explicit_send = env::var("JITO_SEND_BUNDLE_ENDPOINT")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let explicit_status = env::var("JITO_BUNDLE_STATUS_ENDPOINT")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    !explicit_send.is_empty() || !explicit_status.is_empty()
+}
+
 pub fn configured_jito_bundle_endpoints() -> Vec<JitoBundleEndpoint> {
-    configured_jito_bundle_endpoints_for_profile("global")
+    configured_jito_bundle_endpoints_for_profile(&default_endpoint_profile_for_provider(
+        "jito-bundle",
+    ))
 }
 
 pub fn build_transport_plan(
@@ -277,6 +367,8 @@ pub fn build_transport_plan(
     } else {
         vec![]
     };
+    let watch_endpoints =
+        configured_watch_endpoints_for_provider(&resolved, &resolved_endpoint_profile);
     let mut warnings = Vec::new();
     if !meta.verified {
         warnings.push(format!(
@@ -327,6 +419,8 @@ pub fn build_transport_plan(
             None
         },
         heliusSenderEndpoints: helius_sender_endpoints,
+        watchEndpoint: watch_endpoints.first().cloned(),
+        watchEndpoints: watch_endpoints,
         jitoBundleEndpoints: jito_bundle_endpoints,
         warnings,
     }
@@ -437,5 +531,41 @@ mod tests {
         assert_eq!(plan.resolvedEndpointProfile, "");
         assert!(plan.heliusSenderEndpoints.is_empty());
         assert!(plan.jitoBundleEndpoints.is_empty());
+    }
+
+    #[test]
+    fn user_region_defaults_endpoint_profile() {
+        assert_eq!(default_endpoint_profile_from_user_region("EU"), "eu");
+        assert_eq!(default_endpoint_profile_from_user_region("asia"), "asia");
+        assert_eq!(default_endpoint_profile_from_user_region(""), "global");
+        assert_eq!(default_endpoint_profile_from_user_region("nope"), "global");
+    }
+
+    #[test]
+    fn provider_specific_region_overrides_shared_default() {
+        assert_eq!(
+            resolve_default_endpoint_profile_for_provider("helius-sender", "eu", "us"),
+            "eu"
+        );
+        assert_eq!(
+            resolve_default_endpoint_profile_for_provider("jito-bundle", "", "asia"),
+            "asia"
+        );
+        assert_eq!(
+            resolve_default_endpoint_profile_for_provider("jito-bundle", "invalid", "us"),
+            "us"
+        );
+        assert_eq!(
+            resolve_default_endpoint_profile_for_provider("helius-sender", "", ""),
+            "global"
+        );
+    }
+
+    #[test]
+    fn standard_rpc_has_no_default_endpoint_profile() {
+        assert_eq!(
+            resolve_default_endpoint_profile_for_provider("standard-rpc", "eu", "us"),
+            ""
+        );
     }
 }

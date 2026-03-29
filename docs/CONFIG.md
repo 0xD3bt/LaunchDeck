@@ -7,16 +7,16 @@ Provider and launchpad credentials stay env-only.
 Key variables:
 
 - `SOLANA_PRIVATE_KEY`
-- `HELIUS_RPC_URL`
-- `HELIUS_API_KEY`
+- `SOLANA_RPC_URL`
+- `SOLANA_WS_URL`
+- `USER_REGION`
+- `USER_REGION_HELIUS_SENDER`
+- `USER_REGION_JITO_BUNDLE`
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER`
 - `PINATA_JWT`
-- `LAUNCHDECK_PINATA_JWT`
 - `BAGS_API_KEY`
 - `HELIUS_SENDER_ENDPOINT`
-- `HELIUS_SENDER_URL`
 - `HELIUS_SENDER_BASE_URL`
-- `HELIUS_SENDER_API_KEY`
 - `JITO_BUNDLE_BASE_URLS`
 - `JITO_SEND_BUNDLE_ENDPOINT`
 - `JITO_BUNDLE_STATUS_ENDPOINT`
@@ -27,7 +27,7 @@ Metadata upload behavior:
 - default provider: `pump-fun`
 - optional provider: `pinata`
 - supported values for `LAUNCHDECK_METADATA_UPLOAD_PROVIDER`: `pump-fun`, `pinata`
-- `PINATA_JWT` or `LAUNCHDECK_PINATA_JWT` is required when `pinata` is selected
+- `PINATA_JWT` is required when `pinata` is selected
 
 ## Host Runtime
 
@@ -37,17 +37,23 @@ Primary runtime variables:
 
 - `LAUNCHDECK_PORT`
 - `LAUNCHDECK_ENGINE_AUTH_TOKEN`
-
-Legacy compatibility variables:
-
-- `LAUNCHDECK_ENGINE_PORT`
+- `LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT`
+- `LAUNCHDECK_FOLLOW_DAEMON_URL`
+- `LAUNCHDECK_FOLLOW_DAEMON_PORT`
+- `LAUNCHDECK_FOLLOW_DAEMON_AUTH_TOKEN`
+- `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS`
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES`
+- `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
+- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 
 Current behavior:
 
 - `LAUNCHDECK_PORT` is the primary host port for both `/api/*` and `/engine/*`
-- `LAUNCHDECK_ENGINE_PORT` is only used as a fallback during migration compatibility
-- `npm run bot` starts the Rust host through `start-bot.ps1`
+- `npm start` starts the Rust host and follow daemon through `start.ps1`
+- `npm stop` stops both local processes through `stop.ps1`
+- `npm restart` performs the same clean recycle explicitly
 - `npm run ui` starts the Rust host directly
+- the follow daemon defaults to `http://127.0.0.1:8790`
 
 ## Persisted App Config
 
@@ -63,6 +69,8 @@ It stores:
 - preset provider selections
 - default post-launch strategy
 - default automatic dev-sell settings
+- sniper draft state
+- selected launch mode and fee-split drafts
 
 Legacy provider values are migrated forward when persisted config is read, so older `auto` or removed provider IDs do not remain live in settings.
 
@@ -82,10 +90,8 @@ Important runtime fields:
 - `launchpad`
 - `mode`
 - `execution.provider`
-- `execution.policy`
 - `execution.skipPreflight`
 - `execution.buyProvider`
-- `execution.buyPolicy`
 - `execution.sellProvider`
 - `tx.computeUnitPriceMicroLamports`
 - `tx.jitoTipLamports`
@@ -98,9 +104,7 @@ Important runtime fields:
 The app defaults are designed so a normal user can open the UI and get a sensible baseline without manually tuning every field:
 
 - launch provider: `helius-sender`
-- launch policy: `fast`
 - buy provider: `helius-sender`
-- buy policy: `fast`
 - sell provider: `helius-sender`
 - post-launch strategy: `none`
 - automatic dev sell: off
@@ -114,6 +118,7 @@ Examples:
 - `Helius Sender` requires tip, priority fee, and `skipPreflight=true`.
 - `Standard RPC` ignores tip.
 - `Jito Bundle` creation may accept a priority fee input in the UI, but the engine can drop it for multi-transaction creation flows where it would only waste money.
+- explicit sender or bundle endpoint overrides bypass normal region fanout
 
 ## Endpoint Profiles
 
@@ -134,6 +139,12 @@ Current providers with endpoint-profile support:
 
 Current runtime behavior uses the selected profile as an endpoint group and fans out submission across that group.
 
+Current region resolution order:
+
+- provider-specific override such as `USER_REGION_HELIUS_SENDER`
+- shared `USER_REGION`
+- provider default/global fallback
+
 ## Runtime Reports
 
 Durable send reports are written under the local runtime area by default:
@@ -141,6 +152,13 @@ Durable send reports are written under the local runtime area by default:
 `LaunchDeck/.local/launchdeck/send-reports`
 
 Each report captures the planned transport strategy and the actual send outcome per transaction.
+
+When follow behavior is enabled, persisted reports can also include:
+
+- follow-job snapshot
+- follow-action outcomes
+- watcher health
+- follow timing profiles
 
 The local runtime area also stores:
 
@@ -185,3 +203,9 @@ Benchmark timing output now separates user-visible wait from backend execution:
 - `form`, `normalize`, `wallet`, `compile`, `send`, `persist`
 - compile sub-timings: `altLoad`, `blockhash`, `global`, `followUpPrep`, `serialize`
 - send sub-timings: `submit`, `confirm`
+
+Follow timing profiles can also surface historical submit percentiles such as:
+
+- `P50 Submit`
+- `P75 Submit`
+- `P90 Submit`

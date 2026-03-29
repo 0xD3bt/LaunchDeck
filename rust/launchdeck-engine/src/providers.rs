@@ -63,17 +63,14 @@ pub fn provider_registry() -> Vec<ProviderMeta> {
 }
 
 pub fn provider_availability_registry() -> BTreeMap<String, ProviderAvailability> {
-    let helius_configured = env::var("HELIUS_RPC_URL")
+    let solana_rpc_configured = env::var("SOLANA_RPC_URL")
         .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-        || env::var("HELIUS_API_KEY")
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false);
+        .unwrap_or(false);
     provider_registry()
         .into_iter()
         .map(|provider| {
-            let reason = if provider.id == "helius-sender" && !helius_configured {
-                "Using the default Helius Sender endpoint; set HELIUS_API_KEY or HELIUS_RPC_URL for a dedicated confirmation RPC.".to_string()
+            let reason = if provider.id == "helius-sender" && !solana_rpc_configured {
+                "Using the default Helius Sender endpoint with the localhost RPC fallback; set SOLANA_RPC_URL for a dedicated confirmation RPC.".to_string()
             } else {
                 String::new()
             };

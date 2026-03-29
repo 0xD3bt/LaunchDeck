@@ -65,18 +65,6 @@ fn configured_rpc_url() -> String {
             return trimmed.to_string();
         }
     }
-    if let Ok(explicit) = env::var("HELIUS_RPC_URL") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    if let Ok(api_key) = env::var("HELIUS_API_KEY") {
-        let trimmed = api_key.trim();
-        if !trimmed.is_empty() {
-            return format!("https://mainnet.helius-rpc.com/?api-key={trimmed}");
-        }
-    }
     "http://127.0.0.1:8899".to_string()
 }
 

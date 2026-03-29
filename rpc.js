@@ -10,10 +10,7 @@ function sleep(ms) {
 
 function getRpcUrl(args = {}) {
   if (args["rpc-url"]) return args["rpc-url"];
-  if (process.env.HELIUS_RPC_URL) return process.env.HELIUS_RPC_URL;
-  if (process.env.HELIUS_API_KEY) {
-    return `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
-  }
+  if (process.env.SOLANA_RPC_URL) return process.env.SOLANA_RPC_URL;
   return DEFAULT_RPC_URL;
 }
 

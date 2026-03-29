@@ -1,8 +1,10 @@
 #![allow(non_snake_case, dead_code)]
 
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use solana_sdk::transaction::VersionedTransaction;
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
@@ -359,6 +361,16 @@ fn commitment_satisfied(actual: &str, required: &str) -> bool {
     commitment_rank(actual) >= commitment_rank(required)
 }
 
+fn signature_from_serialized_base64(serialized_base64: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let bytes = BASE64.decode(serialized_base64).ok()?;
+    let transaction: VersionedTransaction = bincode::deserialize(&bytes).ok()?;
+    transaction
+        .signatures
+        .first()
+        .map(|signature| signature.to_string())
+}
+
 async fn wait_for_confirmation(
     rpc_url: &str,
     signature: &str,
@@ -419,19 +431,18 @@ async fn wait_for_confirmation(
     ))
 }
 
-pub async fn send_transactions_sequential(
+pub async fn submit_transactions_sequential(
     rpc_url: &str,
     transactions: &[CompiledTransaction],
     commitment: &str,
     skip_preflight: bool,
     track_send_block_height: bool,
-) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
     let mut results = Vec::new();
     let warnings = Vec::new();
-    let mut timing = SendTimingBreakdown::default();
+    let submit_started = std::time::Instant::now();
     for transaction in transactions {
         let max_retries = 3;
-        let submit_started = std::time::Instant::now();
         let signature = rpc_request(
             rpc_url,
             "sendTransaction",
@@ -447,19 +458,14 @@ pub async fn send_transactions_sequential(
         )
         .await?
         .as_str()
-        .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?
-        .to_string();
-        timing.submit_ms += submit_started.elapsed().as_millis();
+        .map(str::to_string)
+        .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+        .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
         let send_observed_block_height = if track_send_block_height {
             fetch_current_block_height(rpc_url, commitment).await.ok()
         } else {
             None
         };
-        let confirm_started = std::time::Instant::now();
-        let confirmation =
-            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
-                .await?;
-        timing.confirm_ms += confirm_started.elapsed().as_millis();
         results.push(SentResult {
             label: transaction.label.clone(),
             format: transaction.format.clone(),
@@ -470,14 +476,10 @@ pub async fn send_transactions_sequential(
             attemptedEndpoints: vec![rpc_url.to_string()],
             skipPreflight: skip_preflight,
             maxRetries: max_retries,
-            confirmationStatus: confirmation
-                .status
-                .get("confirmationStatus")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            confirmationStatus: None,
             sendObservedBlockHeight: send_observed_block_height,
-            confirmedObservedBlockHeight: confirmation.confirmed_observed_block_height,
-            confirmedSlot: confirmation.confirmed_slot,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
             inlineTipLamports: transaction.inlineTipLamports,
@@ -486,7 +488,586 @@ pub async fn send_transactions_sequential(
             attemptedBundleIds: vec![],
         });
     }
-    Ok((results, warnings, timing))
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
+}
+
+async fn submit_single_transaction_rpc(
+    rpc_url: &str,
+    transaction: &CompiledTransaction,
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<SentResult, String> {
+    let max_retries = 3;
+    let signature = rpc_request(
+        rpc_url,
+        "sendTransaction",
+        json!([
+            transaction.serializedBase64,
+            {
+                "encoding": "base64",
+                "skipPreflight": skip_preflight,
+                "preflightCommitment": commitment,
+                "maxRetries": max_retries,
+            }
+        ]),
+    )
+    .await?
+    .as_str()
+    .map(str::to_string)
+    .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+    .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
+    let send_observed_block_height = if track_send_block_height {
+        fetch_current_block_height(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
+    Ok(SentResult {
+        label: transaction.label.clone(),
+        format: transaction.format.clone(),
+        signature: Some(signature.clone()),
+        explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+        transportType: "standard-rpc-sequential".to_string(),
+        endpoint: Some(rpc_url.to_string()),
+        attemptedEndpoints: vec![rpc_url.to_string()],
+        skipPreflight: skip_preflight,
+        maxRetries: max_retries,
+        confirmationStatus: None,
+        sendObservedBlockHeight: send_observed_block_height,
+        confirmedObservedBlockHeight: None,
+        confirmedSlot: None,
+        computeUnitLimit: transaction.computeUnitLimit,
+        computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+        inlineTipLamports: transaction.inlineTipLamports,
+        inlineTipAccount: transaction.inlineTipAccount.clone(),
+        bundleId: None,
+        attemptedBundleIds: vec![],
+    })
+}
+
+pub async fn submit_transactions_parallel(
+    rpc_url: &str,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    let submit_started = std::time::Instant::now();
+    let results = join_all(transactions.iter().map(|transaction| {
+        submit_single_transaction_rpc(
+            rpc_url,
+            transaction,
+            commitment,
+            skip_preflight,
+            track_send_block_height,
+        )
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok((results, vec![], submit_started.elapsed().as_millis()))
+}
+
+pub async fn confirm_transactions_sequential(
+    rpc_url: &str,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<u128, String> {
+    let confirm_started = std::time::Instant::now();
+    for result in submitted {
+        let signature = result.signature.clone().ok_or_else(|| {
+            format!(
+                "Submitted transaction {} is missing a signature.",
+                result.label
+            )
+        })?;
+        let confirmation =
+            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
+                .await?;
+        result.confirmationStatus = confirmation
+            .status
+            .get("confirmationStatus")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        result.confirmedObservedBlockHeight = confirmation.confirmed_observed_block_height;
+        result.confirmedSlot = confirmation.confirmed_slot;
+    }
+    Ok(confirm_started.elapsed().as_millis())
+}
+
+pub async fn submit_transactions_helius_sender(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    let mut results = Vec::new();
+    let mut warnings = Vec::new();
+    if endpoints.is_empty() {
+        return Err("Helius Sender endpoint is not configured.".to_string());
+    }
+    let submit_started = std::time::Instant::now();
+    for transaction in transactions {
+        validate_helius_sender_transaction(transaction)?;
+        let mut successful_endpoints = Vec::new();
+        let mut returned_signatures = Vec::new();
+        let mut errors = Vec::new();
+        let local_signature = signature_from_serialized_base64(&transaction.serializedBase64);
+        for endpoint in endpoints {
+            match rpc_request(
+                endpoint,
+                "sendTransaction",
+                json!([
+                    transaction.serializedBase64,
+                    {
+                        "encoding": "base64",
+                        "skipPreflight": true,
+                        "maxRetries": 0,
+                    }
+                ]),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let Some(signature) = result.as_str() {
+                        returned_signatures.push(signature.to_string());
+                    }
+                    successful_endpoints.push(endpoint.clone());
+                }
+                Err(error) => errors.push(format!("{endpoint}: {error}")),
+            }
+        }
+        if successful_endpoints.is_empty() {
+            return Err(format!(
+                "Helius Sender failed for transaction {} on all attempted endpoints: {}",
+                transaction.label,
+                errors.join(" | ")
+            ));
+        }
+        if !errors.is_empty() {
+            warnings.push(format!(
+                "Helius Sender fanout had partial failures for {}: {}",
+                transaction.label,
+                errors.join(" | ")
+            ));
+        }
+        let signature = local_signature
+            .or_else(|| returned_signatures.first().cloned())
+            .ok_or_else(|| {
+                format!(
+                    "Helius Sender did not return a signature for {}.",
+                    transaction.label
+                )
+            })?;
+        let send_observed_block_height = if track_send_block_height {
+            fetch_current_block_height(rpc_url, commitment).await.ok()
+        } else {
+            None
+        };
+        results.push(SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: Some(signature.clone()),
+            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "helius-sender".to_string(),
+            endpoint: successful_endpoints.first().cloned(),
+            attemptedEndpoints: endpoints.to_vec(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: None,
+            sendObservedBlockHeight: send_observed_block_height,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
+        });
+    }
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
+}
+
+async fn submit_single_transaction_helius_sender(
+    rpc_url: &str,
+    endpoints: &[String],
+    transaction: &CompiledTransaction,
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(SentResult, Vec<String>), String> {
+    validate_helius_sender_transaction(transaction)?;
+    let endpoint_results = join_all(endpoints.iter().map(|endpoint| async move {
+        (
+            endpoint.clone(),
+            rpc_request(
+                endpoint,
+                "sendTransaction",
+                json!([
+                    transaction.serializedBase64,
+                    {
+                        "encoding": "base64",
+                        "skipPreflight": true,
+                        "maxRetries": 0,
+                    }
+                ]),
+            )
+            .await,
+        )
+    }))
+    .await;
+    let mut successful_endpoints = Vec::new();
+    let mut returned_signatures = Vec::new();
+    let mut errors = Vec::new();
+    for (endpoint, result) in endpoint_results {
+        match result {
+            Ok(value) => {
+                if let Some(signature) = value.as_str() {
+                    returned_signatures.push(signature.to_string());
+                }
+                successful_endpoints.push(endpoint);
+            }
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if successful_endpoints.is_empty() {
+        return Err(format!(
+            "Helius Sender failed for transaction {} on all attempted endpoints: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !errors.is_empty() {
+        warnings.push(format!(
+            "Helius Sender fanout had partial failures for {}: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let local_signature = signature_from_serialized_base64(&transaction.serializedBase64);
+    let signature = local_signature
+        .or_else(|| returned_signatures.first().cloned())
+        .ok_or_else(|| {
+            format!(
+                "Helius Sender did not return a signature for {}.",
+                transaction.label
+            )
+        })?;
+    let send_observed_block_height = if track_send_block_height {
+        fetch_current_block_height(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
+    Ok((
+        SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: Some(signature.clone()),
+            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "helius-sender".to_string(),
+            endpoint: successful_endpoints.first().cloned(),
+            attemptedEndpoints: endpoints.to_vec(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: None,
+            sendObservedBlockHeight: send_observed_block_height,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
+        },
+        warnings,
+    ))
+}
+
+pub async fn submit_transactions_helius_sender_parallel(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    if endpoints.is_empty() {
+        return Err("Helius Sender endpoint is not configured.".to_string());
+    }
+    let submit_started = std::time::Instant::now();
+    let results = join_all(transactions.iter().map(|transaction| {
+        submit_single_transaction_helius_sender(
+            rpc_url,
+            endpoints,
+            transaction,
+            commitment,
+            track_send_block_height,
+        )
+    }))
+    .await;
+    let mut sent = Vec::with_capacity(results.len());
+    let mut warnings = Vec::new();
+    for result in results {
+        let (entry, entry_warnings) = result?;
+        sent.push(entry);
+        warnings.extend(entry_warnings);
+    }
+    Ok((sent, warnings, submit_started.elapsed().as_millis()))
+}
+
+pub async fn submit_transactions_bundle(
+    rpc_url: &str,
+    endpoints: &[JitoBundleEndpoint],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    if transactions.is_empty() {
+        return Ok((vec![], vec![], 0));
+    }
+    if transactions.len() > 5 {
+        return Err(format!(
+            "Jito bundles support at most 5 transactions. Got: {}",
+            transactions.len()
+        ));
+    }
+    if endpoints.is_empty() {
+        return Err("No Jito bundle endpoints configured.".to_string());
+    }
+    let encoded: Vec<String> = transactions
+        .iter()
+        .map(|entry| entry.serializedBase64.clone())
+        .collect();
+    let local_signatures = transactions
+        .iter()
+        .map(|transaction| signature_from_serialized_base64(&transaction.serializedBase64))
+        .collect::<Vec<_>>();
+    let mut attempts = Vec::new();
+    let mut send_errors = Vec::new();
+    let submit_started = std::time::Instant::now();
+    for endpoint in endpoints {
+        match jito_request(
+            &endpoint.send,
+            "sendBundle",
+            json!([encoded, { "encoding": "base64" }]),
+        )
+        .await
+        {
+            Ok(result) => {
+                let bundle_id = result
+                    .as_str()
+                    .ok_or_else(|| "Jito sendBundle did not return a bundle id.".to_string())?
+                    .to_string();
+                attempts.push((endpoint.clone(), bundle_id));
+            }
+            Err(error) => send_errors.push(format!("{}: {}", endpoint.name, error)),
+        }
+    }
+    if attempts.is_empty() {
+        return Err(format!(
+            "Jito bundle submission failed for all endpoints in the selected profile: {}",
+            send_errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !send_errors.is_empty() {
+        warnings.push(format!(
+            "Jito fanout had partial submission failures: {}",
+            send_errors.join(" | ")
+        ));
+    }
+    let attempted_endpoints = attempts
+        .iter()
+        .map(|(attempt_endpoint, _)| attempt_endpoint.send.clone())
+        .collect::<Vec<_>>();
+    let attempted_bundle_ids = attempts
+        .iter()
+        .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
+        .collect::<Vec<_>>();
+    let send_observed_block_height = if track_send_block_height {
+        fetch_current_block_height(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
+    let results = transactions
+        .iter()
+        .enumerate()
+        .map(|(index, transaction)| SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: local_signatures.get(index).cloned().flatten(),
+            explorerUrl: local_signatures
+                .get(index)
+                .and_then(|signature| signature.as_ref())
+                .map(|signature| format!("https://solscan.io/tx/{signature}")),
+            transportType: "jito-bundle".to_string(),
+            endpoint: attempts.first().map(|(endpoint, _)| endpoint.send.clone()),
+            attemptedEndpoints: attempted_endpoints.clone(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: None,
+            sendObservedBlockHeight: send_observed_block_height,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: attempts.first().map(|(_, bundle_id)| bundle_id.clone()),
+            attemptedBundleIds: attempted_bundle_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
+}
+
+pub async fn confirm_transactions_bundle(
+    rpc_url: &str,
+    endpoints: &[JitoBundleEndpoint],
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<String>, u128), String> {
+    if submitted.is_empty() {
+        return Ok((vec![], 0));
+    }
+    let attempted_bundle_ids = submitted[0].attemptedBundleIds.clone();
+    if attempted_bundle_ids.is_empty() {
+        return Err("Submitted Jito bundle results are missing bundle ids.".to_string());
+    }
+    let attempts = endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let bundle_id = submitted[0]
+                .attemptedEndpoints
+                .iter()
+                .position(|attempted| attempted == &endpoint.send)
+                .and_then(|index| attempted_bundle_ids.get(index))
+                .cloned()?;
+            Some((endpoint.clone(), bundle_id))
+        })
+        .collect::<Vec<_>>();
+    let confirm_started = std::time::Instant::now();
+    for _ in 0..20 {
+        let mut observed_errors = Vec::new();
+        for (endpoint, bundle_id) in &attempts {
+            let status_payload = jito_request(
+                &endpoint.status,
+                "getBundleStatuses",
+                json!([[bundle_id.clone()]]),
+            )
+            .await?;
+            let maybe_status = status_payload
+                .get("value")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find(|entry| {
+                        entry.get("bundle_id").and_then(Value::as_str) == Some(bundle_id.as_str())
+                    })
+                })
+                .cloned();
+            if let Some(status) = maybe_status {
+                if let Some(err) = status.get("err") {
+                    if !err.is_null() {
+                        observed_errors.push(format!("{}:{}={}", endpoint.name, bundle_id, err));
+                        continue;
+                    }
+                }
+                let actual = status
+                    .get("confirmation_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("processed");
+                if !commitment_satisfied(actual, commitment) {
+                    continue;
+                }
+                let signatures = status
+                    .get("transactions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let confirmed_observed_block_height = if track_send_block_height {
+                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                } else {
+                    None
+                };
+                let confirmed_slot = status.get("slot").and_then(Value::as_u64);
+                for (index, result) in submitted.iter_mut().enumerate() {
+                    let signature = signatures
+                        .get(index)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| result.signature.clone());
+                    result.signature = signature.clone();
+                    result.explorerUrl = signature
+                        .as_ref()
+                        .map(|value| format!("https://solscan.io/tx/{value}"));
+                    result.confirmationStatus = Some(actual.to_string());
+                    result.confirmedObservedBlockHeight = confirmed_observed_block_height;
+                    result.confirmedSlot = confirmed_slot;
+                    result.bundleId = Some(bundle_id.clone());
+                    result.endpoint = Some(endpoint.send.clone());
+                }
+                let mut warnings = vec![format!(
+                    "Sent via Jito bundle {} using {} after fanout to {} endpoints.",
+                    bundle_id,
+                    endpoint.name,
+                    endpoints.len()
+                )];
+                if !observed_errors.is_empty() {
+                    warnings.push(format!(
+                        "Jito fanout observed non-winning endpoint errors: {}",
+                        observed_errors.join(" | ")
+                    ));
+                }
+                return Ok((warnings, confirm_started.elapsed().as_millis()));
+            }
+        }
+        sleep(Duration::from_millis(1500)).await;
+    }
+    Err(format!(
+        "Timed out waiting for fanout Jito bundle submissions to reach {}. Bundle ids: {}",
+        commitment,
+        attempted_bundle_ids.join(", ")
+    ))
+}
+
+pub async fn confirm_transactions_helius_sender(
+    rpc_url: &str,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<u128, String> {
+    confirm_transactions_sequential(rpc_url, submitted, commitment, track_send_block_height).await
+}
+
+pub async fn send_transactions_sequential(
+    rpc_url: &str,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
+    let (mut results, warnings, submit_ms) = submit_transactions_sequential(
+        rpc_url,
+        transactions,
+        commitment,
+        skip_preflight,
+        track_send_block_height,
+    )
+    .await?;
+    let confirm_ms =
+        confirm_transactions_sequential(rpc_url, &mut results, commitment, track_send_block_height)
+            .await?;
+    Ok((
+        results,
+        warnings,
+        SendTimingBreakdown {
+            submit_ms,
+            confirm_ms,
+        },
+    ))
 }
 
 fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Result<(), String> {
@@ -512,100 +1093,29 @@ pub async fn send_transactions_helius_sender(
     commitment: &str,
     track_send_block_height: bool,
 ) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
-    let mut results = Vec::new();
-    let mut warnings = Vec::new();
-    let mut timing = SendTimingBreakdown::default();
-    if endpoints.is_empty() {
-        return Err("Helius Sender endpoint is not configured.".to_string());
-    }
-    for transaction in transactions {
-        validate_helius_sender_transaction(transaction)?;
-        let mut successful_endpoints = Vec::new();
-        let mut signatures = Vec::new();
-        let mut errors = Vec::new();
-        let submit_started = std::time::Instant::now();
-        for endpoint in endpoints {
-            match rpc_request(
-                endpoint,
-                "sendTransaction",
-                json!([
-                    transaction.serializedBase64,
-                    {
-                        "encoding": "base64",
-                        "skipPreflight": true,
-                        "maxRetries": 0,
-                    }
-                ]),
-            )
-            .await
-            {
-                Ok(result) => {
-                    let signature = result
-                        .as_str()
-                        .ok_or_else(|| "Helius Sender did not return a signature.".to_string())?
-                        .to_string();
-                    successful_endpoints.push(endpoint.clone());
-                    signatures.push(signature);
-                }
-                Err(error) => errors.push(format!("{endpoint}: {error}")),
-            }
-        }
-        timing.submit_ms += submit_started.elapsed().as_millis();
-        if signatures.is_empty() {
-            return Err(format!(
-                "Helius Sender failed for transaction {} on all attempted endpoints: {}",
-                transaction.label,
-                errors.join(" | ")
-            ));
-        }
-        if !errors.is_empty() {
-            warnings.push(format!(
-                "Helius Sender fanout had partial failures for {}: {}",
-                transaction.label,
-                errors.join(" | ")
-            ));
-        }
-        let signature = signatures
-            .first()
-            .cloned()
-            .ok_or_else(|| "Helius Sender did not return a signature.".to_string())?;
-        let send_observed_block_height = if track_send_block_height {
-            fetch_current_block_height(rpc_url, commitment).await.ok()
-        } else {
-            None
-        };
-        let confirm_started = std::time::Instant::now();
-        let confirmation =
-            wait_for_confirmation(rpc_url, &signature, commitment, 20, track_send_block_height)
-                .await?;
-        timing.confirm_ms += confirm_started.elapsed().as_millis();
-        results.push(SentResult {
-            label: transaction.label.clone(),
-            format: transaction.format.clone(),
-            signature: Some(signature.clone()),
-            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
-            transportType: "helius-sender".to_string(),
-            endpoint: successful_endpoints.first().cloned(),
-            attemptedEndpoints: endpoints.to_vec(),
-            skipPreflight: true,
-            maxRetries: 0,
-            confirmationStatus: confirmation
-                .status
-                .get("confirmationStatus")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            sendObservedBlockHeight: send_observed_block_height,
-            confirmedObservedBlockHeight: confirmation.confirmed_observed_block_height,
-            confirmedSlot: confirmation.confirmed_slot,
-            computeUnitLimit: transaction.computeUnitLimit,
-            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
-            inlineTipLamports: transaction.inlineTipLamports,
-            inlineTipAccount: transaction.inlineTipAccount.clone(),
-            bundleId: None,
-            attemptedBundleIds: vec![],
-        });
-    }
-    Ok((results, warnings, timing))
+    let (mut results, warnings, submit_ms) = submit_transactions_helius_sender(
+        rpc_url,
+        endpoints,
+        transactions,
+        commitment,
+        track_send_block_height,
+    )
+    .await?;
+    let confirm_ms = confirm_transactions_helius_sender(
+        rpc_url,
+        &mut results,
+        commitment,
+        track_send_block_height,
+    )
+    .await?;
+    Ok((
+        results,
+        warnings,
+        SendTimingBreakdown {
+            submit_ms,
+            confirm_ms,
+        },
+    ))
 }
 
 async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Value, String> {
@@ -651,176 +1161,30 @@ pub async fn send_transactions_bundle(
     commitment: &str,
     track_send_block_height: bool,
 ) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
-    if transactions.is_empty() {
-        return Ok((vec![], vec![], SendTimingBreakdown::default()));
-    }
-    if transactions.len() > 5 {
-        return Err(format!(
-            "Jito bundles support at most 5 transactions. Got: {}",
-            transactions.len()
-        ));
-    }
-    if endpoints.is_empty() {
-        return Err("No Jito bundle endpoints configured.".to_string());
-    }
-    let encoded: Vec<String> = transactions
-        .iter()
-        .map(|entry| entry.serializedBase64.clone())
-        .collect();
-    let mut attempts = Vec::new();
-    let mut send_errors = Vec::new();
-    let mut timing = SendTimingBreakdown::default();
-    let submit_started = std::time::Instant::now();
-    for endpoint in endpoints {
-        match jito_request(
-            &endpoint.send,
-            "sendBundle",
-            json!([encoded, { "encoding": "base64" }]),
-        )
-        .await
-        {
-            Ok(result) => {
-                let bundle_id = result
-                    .as_str()
-                    .ok_or_else(|| "Jito sendBundle did not return a bundle id.".to_string())?
-                    .to_string();
-                attempts.push((endpoint.clone(), bundle_id));
-            }
-            Err(error) => send_errors.push(format!("{}: {}", endpoint.name, error)),
-        }
-    }
-    timing.submit_ms += submit_started.elapsed().as_millis();
-    if attempts.is_empty() {
-        return Err(format!(
-            "Jito bundle submission failed for all endpoints in the selected profile: {}",
-            send_errors.join(" | ")
-        ));
-    }
-    let mut warnings = Vec::new();
-    if !send_errors.is_empty() {
-        warnings.push(format!(
-            "Jito fanout had partial submission failures: {}",
-            send_errors.join(" | ")
-        ));
-    }
-    let send_observed_block_height = if track_send_block_height {
-        fetch_current_block_height(rpc_url, commitment).await.ok()
-    } else {
-        None
-    };
-
-    let confirm_started = std::time::Instant::now();
-    for _ in 0..20 {
-        let mut observed_errors = Vec::new();
-        for (endpoint, bundle_id) in &attempts {
-            let status_payload = jito_request(
-                &endpoint.status,
-                "getBundleStatuses",
-                json!([[bundle_id.clone()]]),
-            )
-            .await?;
-            let maybe_status = status_payload
-                .get("value")
-                .and_then(Value::as_array)
-                .and_then(|items| {
-                    items.iter().find(|entry| {
-                        entry.get("bundle_id").and_then(Value::as_str) == Some(bundle_id.as_str())
-                    })
-                })
-                .cloned();
-            if let Some(status) = maybe_status {
-                if let Some(err) = status.get("err") {
-                    if !err.is_null() {
-                        observed_errors.push(format!("{}:{}={}", endpoint.name, bundle_id, err));
-                        continue;
-                    }
-                }
-                let actual = status
-                    .get("confirmation_status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("processed");
-                if !commitment_satisfied(actual, commitment) {
-                    continue;
-                }
-                let signatures = status
-                    .get("transactions")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let attempted_endpoints = attempts
-                    .iter()
-                    .map(|(attempt_endpoint, _)| attempt_endpoint.send.clone())
-                    .collect::<Vec<_>>();
-                let attempted_bundle_ids = attempts
-                    .iter()
-                    .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
-                    .collect::<Vec<_>>();
-                let confirmed_observed_block_height = if track_send_block_height {
-                    fetch_current_block_height(rpc_url, commitment).await.ok()
-                } else {
-                    None
-                };
-                let confirmed_slot = status.get("slot").and_then(Value::as_u64);
-                let results = transactions
-                    .iter()
-                    .enumerate()
-                    .map(|(index, transaction)| {
-                        let signature = signatures
-                            .get(index)
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        SentResult {
-                            label: transaction.label.clone(),
-                            format: transaction.format.clone(),
-                            explorerUrl: signature
-                                .as_ref()
-                                .map(|value| format!("https://solscan.io/tx/{value}")),
-                            signature,
-                            transportType: "jito-bundle".to_string(),
-                            endpoint: Some(endpoint.send.clone()),
-                            attemptedEndpoints: attempted_endpoints.clone(),
-                            skipPreflight: true,
-                            maxRetries: 0,
-                            confirmationStatus: Some(actual.to_string()),
-                            sendObservedBlockHeight: send_observed_block_height,
-                            confirmedObservedBlockHeight: confirmed_observed_block_height,
-                            confirmedSlot: confirmed_slot,
-                            computeUnitLimit: transaction.computeUnitLimit,
-                            computeUnitPriceMicroLamports: transaction
-                                .computeUnitPriceMicroLamports,
-                            inlineTipLamports: transaction.inlineTipLamports,
-                            inlineTipAccount: transaction.inlineTipAccount.clone(),
-                            bundleId: Some(bundle_id.clone()),
-                            attemptedBundleIds: attempted_bundle_ids.clone(),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                warnings.push(format!(
-                    "Sent via Jito bundle {} using {} after fanout to {} endpoints.",
-                    bundle_id,
-                    endpoint.name,
-                    attempts.len()
-                ));
-                if !observed_errors.is_empty() {
-                    warnings.push(format!(
-                        "Jito fanout observed non-winning endpoint errors: {}",
-                        observed_errors.join(" | ")
-                    ));
-                }
-                timing.confirm_ms += confirm_started.elapsed().as_millis();
-                return Ok((results, warnings, timing));
-            }
-        }
-        sleep(Duration::from_millis(1500)).await;
-    }
-    Err(format!(
-        "Timed out waiting for fanout Jito bundle submissions to reach {}. Bundle ids: {}",
+    let (mut results, mut warnings, submit_ms) = submit_transactions_bundle(
+        rpc_url,
+        endpoints,
+        transactions,
         commitment,
-        attempts
-            .iter()
-            .map(|(_, bundle_id)| bundle_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+        track_send_block_height,
+    )
+    .await?;
+    let (confirm_warnings, confirm_ms) = confirm_transactions_bundle(
+        rpc_url,
+        endpoints,
+        &mut results,
+        commitment,
+        track_send_block_height,
+    )
+    .await?;
+    warnings.extend(confirm_warnings);
+    Ok((
+        results,
+        warnings,
+        SendTimingBreakdown {
+            submit_ms,
+            confirm_ms,
+        },
     ))
 }
 
@@ -862,6 +1226,131 @@ pub async fn send_transactions_for_transport(
                 track_send_block_height,
             )
             .await
+        }
+    }
+}
+
+pub async fn submit_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    match transport_plan.transportType.as_str() {
+        "jito-bundle" => {
+            submit_transactions_bundle(
+                rpc_url,
+                &transport_plan.jitoBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "helius-sender" => {
+            submit_transactions_helius_sender(
+                rpc_url,
+                &transport_plan.heliusSenderEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        _ => {
+            submit_transactions_sequential(
+                rpc_url,
+                transactions,
+                commitment,
+                skip_preflight,
+                track_send_block_height,
+            )
+            .await
+        }
+    }
+}
+
+pub async fn submit_independent_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    match transport_plan.transportType.as_str() {
+        "jito-bundle" => {
+            submit_transactions_bundle(
+                rpc_url,
+                &transport_plan.jitoBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "helius-sender" => {
+            submit_transactions_helius_sender_parallel(
+                rpc_url,
+                &transport_plan.heliusSenderEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        _ => {
+            submit_transactions_parallel(
+                rpc_url,
+                transactions,
+                commitment,
+                skip_preflight,
+                track_send_block_height,
+            )
+            .await
+        }
+    }
+}
+
+pub async fn confirm_submitted_transactions_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    submitted: &mut [SentResult],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<String>, u128), String> {
+    match transport_plan.transportType.as_str() {
+        "jito-bundle" => {
+            confirm_transactions_bundle(
+                rpc_url,
+                &transport_plan.jitoBundleEndpoints,
+                submitted,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "helius-sender" => {
+            let confirm_ms = confirm_transactions_helius_sender(
+                rpc_url,
+                submitted,
+                commitment,
+                track_send_block_height,
+            )
+            .await?;
+            Ok((vec![], confirm_ms))
+        }
+        _ => {
+            let confirm_ms = confirm_transactions_sequential(
+                rpc_url,
+                submitted,
+                commitment,
+                track_send_block_height,
+            )
+            .await?;
+            Ok((vec![], confirm_ms))
         }
     }
 }

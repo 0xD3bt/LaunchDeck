@@ -3,7 +3,11 @@
 use crate::paths;
 use serde::Serialize;
 use serde_json::Value;
-use std::{fs, time::UNIX_EPOCH};
+use std::{
+    fs,
+    sync::{Mutex, OnceLock},
+    time::UNIX_EPOCH,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportSummaryEntry {
@@ -17,6 +21,26 @@ pub struct ReportSummaryEntry {
     pub provider: String,
     pub transportType: String,
     pub signatureCount: usize,
+    pub followEnabled: bool,
+    pub followState: String,
+    pub followActionCount: usize,
+    pub followConfirmedCount: usize,
+    pub followRunningCount: usize,
+    pub followProblemCount: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportCacheFileMeta {
+    file_name: String,
+    modified_ms: u128,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReportSummaryCache {
+    files: Vec<ReportCacheFileMeta>,
+    newest: Vec<ReportSummaryEntry>,
+    oldest: Vec<ReportSummaryEntry>,
 }
 
 fn format_report_time(written_at_ms: u128) -> String {
@@ -30,25 +54,33 @@ fn safe_json_parse(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::Object(Default::default()))
 }
 
-pub fn build_report_summary_entry(file_name: &str) -> Result<ReportSummaryEntry, String> {
-    let file_path = paths::reports_dir().join(file_name);
-    let stat = fs::metadata(&file_path).map_err(|error| error.to_string())?;
-    let raw = fs::read_to_string(&file_path).map_err(|error| error.to_string())?;
-    let payload = safe_json_parse(&raw);
+fn follow_actions(report: &Value) -> Vec<Value> {
+    report
+        .get("followDaemon")
+        .and_then(|follow| follow.get("job"))
+        .and_then(|job| job.get("actions"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn build_report_summary_entry_from_payload(
+    file_name: &str,
+    payload: &Value,
+    written_at_ms: u128,
+) -> ReportSummaryEntry {
     let report = payload.get("report").cloned().unwrap_or(Value::Null);
     let execution = report.get("execution").cloned().unwrap_or(Value::Null);
-    let written_at_ms = payload
-        .get("writtenAtMs")
-        .and_then(Value::as_u64)
-        .map(|value| value as u128)
-        .unwrap_or_else(|| {
-            stat.modified()
-                .ok()
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_millis())
-                .unwrap_or(0)
-        });
-    Ok(ReportSummaryEntry {
+    let follow_actions = follow_actions(&report);
+    let follow_state = report
+        .get("followDaemon")
+        .and_then(|follow| follow.get("job"))
+        .and_then(|job| job.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ReportSummaryEntry {
         id: file_name.to_string(),
         fileName: file_name.to_string(),
         action: payload
@@ -90,7 +122,64 @@ pub fn build_report_summary_entry(file_name: &str) -> Result<ReportSummaryEntry,
             .and_then(Value::as_array)
             .map(|entries| entries.len())
             .unwrap_or(0),
-    })
+        followEnabled: report
+            .get("followDaemon")
+            .and_then(|follow| follow.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        followState: follow_state,
+        followActionCount: follow_actions.len(),
+        followConfirmedCount: follow_actions
+            .iter()
+            .filter(|action| {
+                action
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| state == "confirmed")
+            })
+            .count(),
+        followRunningCount: follow_actions
+            .iter()
+            .filter(|action| {
+                action
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| matches!(state, "running" | "eligible" | "armed" | "sent"))
+            })
+            .count(),
+        followProblemCount: follow_actions
+            .iter()
+            .filter(|action| {
+                action
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| matches!(state, "failed" | "cancelled" | "expired"))
+            })
+            .count(),
+    }
+}
+
+pub fn build_report_summary_entry(file_name: &str) -> Result<ReportSummaryEntry, String> {
+    let file_path = paths::reports_dir().join(file_name);
+    let stat = fs::metadata(&file_path).map_err(|error| error.to_string())?;
+    let raw = fs::read_to_string(&file_path).map_err(|error| error.to_string())?;
+    let payload = safe_json_parse(&raw);
+    let written_at_ms = payload
+        .get("writtenAtMs")
+        .and_then(Value::as_u64)
+        .map(|value| value as u128)
+        .unwrap_or_else(|| {
+            stat.modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_millis())
+                .unwrap_or(0)
+        });
+    Ok(build_report_summary_entry_from_payload(
+        file_name,
+        &payload,
+        written_at_ms,
+    ))
 }
 
 pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
@@ -98,24 +187,59 @@ pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
     let Ok(entries) = fs::read_dir(&dir) else {
         return vec![];
     };
-    let mut reports = entries
+    let mut files = entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let file_name = entry.file_name().to_string_lossy().to_string();
             if !file_name.to_ascii_lowercase().ends_with(".json") {
                 return None;
             }
-            build_report_summary_entry(&file_name).ok()
+            let metadata = entry.metadata().ok()?;
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_millis())
+                .unwrap_or(0);
+            Some(ReportCacheFileMeta {
+                file_name,
+                modified_ms,
+                len: metadata.len(),
+            })
         })
         .collect::<Vec<_>>();
-    reports.sort_by(|left, right| {
-        if sort == "oldest" {
-            left.writtenAtMs.cmp(&right.writtenAtMs)
+    files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    let cache = report_summary_cache();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.files == files
+    {
+        return if sort == "oldest" {
+            cached.oldest.clone()
         } else {
-            right.writtenAtMs.cmp(&left.writtenAtMs)
-        }
-    });
-    reports
+            cached.newest.clone()
+        };
+    }
+    let mut newest = files
+        .iter()
+        .filter_map(|entry| build_report_summary_entry(&entry.file_name).ok())
+        .collect::<Vec<_>>();
+    newest.sort_by(|left, right| right.writtenAtMs.cmp(&left.writtenAtMs));
+    let mut oldest = newest.clone();
+    oldest.reverse();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(ReportSummaryCache {
+            files,
+            newest: newest.clone(),
+            oldest: oldest.clone(),
+        });
+    }
+    if sort == "oldest" { oldest } else { newest }
+}
+
+fn report_summary_cache() -> &'static Mutex<Option<ReportSummaryCache>> {
+    static CACHE: OnceLock<Mutex<Option<ReportSummaryCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> String {
@@ -232,6 +356,144 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
             }
         }
     }
+    if let Some(follow) = report.get("followDaemon").and_then(Value::as_object) {
+        let enabled = follow
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            lines.push(String::new());
+            lines.push("Follow daemon:".to_string());
+            if let Some(transport) = follow.get("transport").and_then(Value::as_str)
+                && !transport.is_empty()
+            {
+                lines.push(format!("  Transport: {transport}"));
+            }
+            if let Some(job) = follow.get("job").and_then(Value::as_object) {
+                if let Some(state) = job.get("state").and_then(Value::as_str) {
+                    lines.push(format!("  Job state: {state}"));
+                }
+                if let Some(last_error) = job.get("lastError").and_then(Value::as_str)
+                    && !last_error.is_empty()
+                {
+                    lines.push(format!("  Last error: {last_error}"));
+                }
+                if let Some(actions) = job.get("actions").and_then(Value::as_array) {
+                    let confirmed = actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .is_some_and(|state| state == "confirmed")
+                        })
+                        .count();
+                    let problems = actions
+                        .iter()
+                        .filter(|action| {
+                            action
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .is_some_and(|state| {
+                                    matches!(state, "failed" | "cancelled" | "expired")
+                                })
+                        })
+                        .count();
+                    lines.push(format!(
+                        "  Actions: {} total | {} confirmed | {} problem",
+                        actions.len(),
+                        confirmed,
+                        problems
+                    ));
+                    for action in actions {
+                        let mut summary = format!(
+                            "  - {} [{}]",
+                            action
+                                .get("actionId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("(unknown)"),
+                            action
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        );
+                        if let Some(kind) = action.get("kind").and_then(Value::as_str) {
+                            summary.push_str(&format!(" | kind={kind}"));
+                        }
+                        if let Some(signature) = action.get("signature").and_then(Value::as_str)
+                            && !signature.is_empty()
+                        {
+                            summary.push_str(&format!(" | sig={signature}"));
+                        }
+                        if let Some(attempt_count) =
+                            action.get("attemptCount").and_then(Value::as_u64)
+                        {
+                            summary.push_str(&format!(" | attempts={attempt_count}"));
+                        }
+                        if let Some(last_error) = action.get("lastError").and_then(Value::as_str)
+                            && !last_error.is_empty()
+                        {
+                            summary.push_str(&format!(" | error={last_error}"));
+                        }
+                        lines.push(summary);
+                    }
+                }
+            }
+            if let Some(profiles) = follow.get("timingProfiles").and_then(Value::as_array)
+                && !profiles.is_empty()
+            {
+                lines.push(
+                    "  Advisory only: suggestions do not auto-change your configured follow timings."
+                        .to_string(),
+                );
+                lines.push("  Timing profiles:".to_string());
+                for profile in profiles {
+                    let action_type = profile
+                        .get("actionType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let sample_count = profile
+                        .get("sampleCount")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let recommendation = profile
+                        .get("recommendation")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let suggested_delay = recommendation
+                        .get("suggestedSubmitDelayMs")
+                        .and_then(Value::as_u64);
+                    let suggested_jitter = recommendation
+                        .get("suggestedJitterMs")
+                        .and_then(Value::as_u64);
+                    let confidence = recommendation
+                        .get("confidence")
+                        .and_then(Value::as_str)
+                        .unwrap_or("low");
+                    let success_rate = recommendation
+                        .get("successRate")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let weighted_quality_score = recommendation
+                        .get("weightedQualityScore")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let mut summary = format!(
+                        "  - {action_type}: samples={sample_count} | confidence={confidence} | success={:.0}% | quality={:.1}",
+                        success_rate * 100.0,
+                        weighted_quality_score
+                    );
+                    if let Some(delay) = suggested_delay {
+                        summary.push_str(&format!(" | suggest delay={}ms", delay));
+                    }
+                    if let Some(jitter) = suggested_jitter {
+                        summary.push_str(&format!(" | suggest jitter={}ms", jitter));
+                    }
+                    lines.push(summary);
+                }
+            }
+        }
+    }
     if let Some(benchmark) = report.get("benchmark").and_then(Value::as_object) {
         lines.push("Benchmark:".to_string());
         if let Some(timings) = benchmark.get("timings").and_then(Value::as_object) {
@@ -303,6 +565,13 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
 }
 
 pub fn read_persisted_report(file_name: &str) -> Result<(ReportSummaryEntry, String), String> {
+    let (entry, text, _payload) = read_persisted_report_bundle(file_name)?;
+    Ok((entry, text))
+}
+
+pub fn read_persisted_report_bundle(
+    file_name: &str,
+) -> Result<(ReportSummaryEntry, String, Value), String> {
     let safe_file_name = std::path::Path::new(file_name)
         .file_name()
         .and_then(|value| value.to_str())
@@ -321,5 +590,54 @@ pub fn read_persisted_report(file_name: &str) -> Result<(ReportSummaryEntry, Str
     Ok((
         build_report_summary_entry(&safe_file_name)?,
         build_report_text(&safe_file_name, &payload, &raw),
+        payload,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn summary_entry_includes_follow_job_counts() {
+        let _guard = env_lock().lock().expect("lock env");
+        let file_name = "follow-summary.json";
+        let payload = serde_json::json!({
+            "writtenAtMs": 123,
+            "action": "send",
+            "traceId": "trace-1",
+            "mint": "mint-1",
+            "report": {
+                "execution": {
+                    "provider": "helius-sender",
+                    "transportType": "helius-sender"
+                },
+                "followDaemon": {
+                    "enabled": true,
+                    "job": {
+                        "state": "running",
+                        "actions": [
+                            { "actionId": "a", "state": "confirmed" },
+                            { "actionId": "b", "state": "failed" },
+                            { "actionId": "c", "state": "running" }
+                        ]
+                    }
+                }
+            },
+            "signatures": ["sig-1"]
+        });
+        let summary = build_report_summary_entry_from_payload(file_name, &payload, 123);
+        assert!(summary.followEnabled);
+        assert_eq!(summary.followState, "running");
+        assert_eq!(summary.followActionCount, 3);
+        assert_eq!(summary.followConfirmedCount, 1);
+        assert_eq!(summary.followRunningCount, 1);
+        assert_eq!(summary.followProblemCount, 1);
+    }
 }

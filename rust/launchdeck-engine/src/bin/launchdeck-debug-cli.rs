@@ -79,16 +79,10 @@ fn configured_rpc_url(override_url: Option<&str>) -> String {
             return trimmed.to_string();
         }
     }
-    if let Ok(explicit) = env::var("HELIUS_RPC_URL") {
+    if let Ok(explicit) = env::var("SOLANA_RPC_URL") {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
-        }
-    }
-    if let Ok(api_key) = env::var("HELIUS_API_KEY") {
-        let trimmed = api_key.trim();
-        if !trimmed.is_empty() {
-            return format!("https://mainnet.helius-rpc.com/?api-key={trimmed}");
         }
     }
     DEFAULT_RPC_URL.to_string()

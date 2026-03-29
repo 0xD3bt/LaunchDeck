@@ -63,3 +63,13 @@ pub fn runtime_state_path() -> PathBuf {
     }
     repo_root().join(".local").join("engine-runtime.json")
 }
+
+pub fn follow_daemon_state_path() -> PathBuf {
+    if let Ok(explicit) = env::var("LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    local_root_dir().join("follow-daemon-state.json")
+}
