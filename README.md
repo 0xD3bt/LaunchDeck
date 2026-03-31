@@ -155,6 +155,8 @@ Typical first-run workflow:
 
 Detailed operator walkthrough: `docs/USAGE.md`
 
+VPS deployment walkthrough: `docs/VPS_SETUP.md`
+
 ## Execution Providers
 
 LaunchDeck exposes three current provider choices:
@@ -228,11 +230,9 @@ Primary operator docs:
 - `docs/REPORTING.md`
 - `docs/TROUBLESHOOTING.md`
 - `docs/ARCHITECTURE.md`
+- `docs/VPS_SETUP.md`
 
 Supporting or internal documents:
 
-- `docs/Article.md`
-- `docs/Article_TWITTER.md`
-- `docs/PRODUCTION_AUDIT.md`
 - `docs/EXECUTION_PROVIDER_PLAN.md`
 - `docs/FRONTEND_REGRESSION_CHECKLIST.md`
