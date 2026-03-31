@@ -16,6 +16,7 @@ Running LaunchDeck on a VPS is usually the better default for:
 - lower latency to your RPC, sender, and bundle endpoints
 - better separation from your everyday browsing machine
 - easier repeatable deployments with SSH keys and startup scripts
+- the ability to keep execution on the VPS while still operating the UI from your normal desktop over SSH
 
 By default, LaunchDeck binds the UI to `127.0.0.1` on the server. That means the recommended access pattern is an SSH tunnel from your local machine to the VPS.
 
@@ -193,6 +194,8 @@ http://127.0.0.1:8789
 ```
 
 This keeps the UI private instead of exposing it directly to the public internet.
+
+After that, you can just use LaunchDeck from your normal desktop browser while the runtime stays on the VPS. The SSH tunnel only carries the local UI connection, so you can still use the app normally, including things like popout windows and the regular operator workflow.
 
 ## 9. Updating The Server Later
 
