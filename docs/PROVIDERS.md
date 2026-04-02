@@ -111,7 +111,6 @@ Practical note:
 
 When all of these are true:
 
-- provider routing resolves to `helius-sender`
 - `SOLANA_WS_URL` points at a Helius websocket endpoint
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 - your Helius tier actually supports `transactionSubscribe`
@@ -119,6 +118,13 @@ When all of these are true:
 the follow daemon upgrades slot, signature, and market watchers to use Helius `transactionSubscribe` instead of standard websocket subscriptions.
 
 If any of those conditions are not met, LaunchDeck falls back to the standard websocket watcher path automatically.
+
+Watcher routing note:
+
+- send provider and watch endpoint are not the same thing
+- provider selection decides how launch and trade transactions are sent
+- `SOLANA_WS_URL` decides which websocket watch path the daemon uses
+- that means a launch can send with `standard-rpc` or `jito-bundle` and still use Helius enhanced realtime watchers if the websocket watch endpoint is Helius
 
 ## Standard RPC
 

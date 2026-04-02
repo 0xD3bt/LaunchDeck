@@ -8,6 +8,12 @@ use thiserror::Error;
 const TOKEN_NAME_MAX_LENGTH: usize = 32;
 const TOKEN_SYMBOL_MAX_LENGTH: usize = 10;
 const MAX_FEE_SPLIT_RECIPIENTS: usize = 10;
+const DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT: u64 = 340_000;
+const DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT: u64 = 180_000;
+const DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT: u64 = 175_000;
+const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 120_000;
+const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 145_000;
+const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 90_000;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -693,7 +699,7 @@ fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
 
-fn configured_track_send_block_height_default() -> bool {
+fn configured_track_send_block_height_env_enabled() -> bool {
     matches!(
         env::var("LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT")
             .unwrap_or_default()
@@ -701,6 +707,66 @@ fn configured_track_send_block_height_default() -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "1" | "true" | "yes" | "on"
+    )
+}
+
+fn benchmark_mode_allows_track_send_block_height_default(mode: &str) -> bool {
+    matches!(mode.trim().to_ascii_lowercase().as_str(), "" | "full")
+}
+
+fn configured_track_send_block_height_default() -> bool {
+    benchmark_mode_allows_track_send_block_height_default(
+        &env::var("LAUNCHDECK_BENCHMARK_MODE").unwrap_or_default(),
+    ) && configured_track_send_block_height_env_enabled()
+}
+
+fn configured_compute_unit_limit_env(name: &str, fallback: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+pub fn configured_default_launch_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT",
+        DEFAULT_LAUNCH_COMPUTE_UNIT_LIMIT,
+    )
+}
+
+pub fn configured_default_agent_setup_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT",
+        DEFAULT_AGENT_SETUP_COMPUTE_UNIT_LIMIT,
+    )
+}
+
+pub fn configured_default_follow_up_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT",
+        DEFAULT_FOLLOW_UP_COMPUTE_UNIT_LIMIT,
+    )
+}
+
+pub fn configured_default_sniper_buy_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT",
+        DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT,
+    )
+}
+
+pub fn configured_default_dev_auto_sell_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT",
+        DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT,
+    )
+}
+
+pub fn configured_default_launch_usd1_topup_compute_unit_limit() -> u64 {
+    configured_compute_unit_limit_env(
+        "LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT",
+        DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT,
     )
 }
 
@@ -2140,5 +2206,21 @@ mod tests {
         assert_eq!(trigger.threshold, "100000");
         assert_eq!(trigger.scanTimeoutSeconds, 15);
         assert_eq!(trigger.timeoutAction, "stop");
+    }
+
+    #[test]
+    fn track_send_block_height_default_only_runs_in_full_mode() {
+        assert!(!benchmark_mode_allows_track_send_block_height_default("off"));
+        assert!(!benchmark_mode_allows_track_send_block_height_default("light"));
+        assert!(!benchmark_mode_allows_track_send_block_height_default("basic"));
+        assert!(!benchmark_mode_allows_track_send_block_height_default("unexpected"));
+        assert!(benchmark_mode_allows_track_send_block_height_default("full"));
+        assert!(benchmark_mode_allows_track_send_block_height_default(""));
+    }
+
+    #[test]
+    fn explicit_track_send_block_height_false_overrides_full_mode_default() {
+        let resolved = parse_bool(&Some(json!(false)), true);
+        assert!(!resolved);
     }
 }

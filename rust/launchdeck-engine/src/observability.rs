@@ -8,7 +8,12 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::{fs_utils::atomic_write, paths, transport::TransportPlan};
+use crate::{
+    fs_utils::atomic_write,
+    paths,
+    reports_browser::record_persisted_report_payload,
+    transport::TransportPlan,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TraceContext {
@@ -86,7 +91,9 @@ pub fn update_persisted_follow_daemon_snapshot(path: &str, snapshot: &Value) -> 
     atomic_write(
         std::path::Path::new(path),
         &serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
-    )
+    )?;
+    refresh_reports_cache_for_path(std::path::Path::new(path), &payload);
+    Ok(())
 }
 
 fn write_launch_report_file(
@@ -124,7 +131,9 @@ fn write_launch_report_file(
     atomic_write(
         path,
         &serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?,
-    )
+    )?;
+    refresh_reports_cache_for_path(path, &payload);
+    Ok(())
 }
 
 fn current_time_ms() -> u128 {
@@ -134,9 +143,16 @@ fn current_time_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn refresh_reports_cache_for_path(path: &std::path::Path, payload: &Value) {
+    if let Some(file_name) = path.file_name().and_then(|value| value.to_str()) {
+        record_persisted_report_payload(file_name, payload);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reports_browser::{clear_report_summary_cache, list_persisted_reports};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -166,6 +182,7 @@ mod tests {
             separateTipTransaction: false,
             skipPreflight: true,
             maxRetries: 0,
+            standardRpcSubmitEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -216,6 +233,7 @@ mod tests {
             separateTipTransaction: false,
             skipPreflight: true,
             maxRetries: 0,
+            standardRpcSubmitEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -254,6 +272,7 @@ mod tests {
         let _guard = env_lock().lock().expect("lock env");
         let temp_dir =
             std::env::temp_dir().join(format!("launchdeck-follow-log-update-{}", Uuid::new_v4()));
+        clear_report_summary_cache();
         unsafe {
             std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
         }
@@ -272,6 +291,7 @@ mod tests {
             separateTipTransaction: false,
             skipPreflight: true,
             maxRetries: 0,
+            standardRpcSubmitEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -298,6 +318,66 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("read updated log");
         assert!(raw.contains("\"followDaemon\""));
         assert!(raw.contains("\"traceId\": \"trace-follow\""));
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
+        }
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn persist_launch_report_refreshes_reports_cache() {
+        let _guard = env_lock().lock().expect("lock env");
+        let temp_dir =
+            std::env::temp_dir().join(format!("launchdeck-send-log-cache-{}", Uuid::new_v4()));
+        clear_report_summary_cache();
+        unsafe {
+            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
+        }
+        let cached_before = list_persisted_reports("newest");
+        assert!(cached_before.is_empty());
+        let plan = TransportPlan {
+            requestedProvider: "helius-sender".to_string(),
+            resolvedProvider: "helius-sender".to_string(),
+            requestedEndpointProfile: "global".to_string(),
+            resolvedEndpointProfile: "global".to_string(),
+            executionClass: "single".to_string(),
+            transportType: "helius-sender".to_string(),
+            ordering: "single".to_string(),
+            verified: true,
+            supportsBundle: false,
+            requiresInlineTip: true,
+            requiresPriorityFee: true,
+            separateTipTransaction: false,
+            skipPreflight: true,
+            maxRetries: 0,
+            standardRpcSubmitEndpoints: vec![],
+            heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
+            heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
+            watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
+            watchEndpoints: vec!["wss://mainnet.helius-rpc.com/?api-key=test".to_string()],
+            jitoBundleEndpoints: vec![],
+            warnings: vec![],
+        };
+        let report = json!({
+            "mint": "mint-cache-test",
+            "execution": {
+                "sent": [
+                    { "signature": "sig-cache" }
+                ]
+            }
+        });
+
+        let path =
+            persist_launch_report("trace-cache", "send", &plan, &report).expect("persist send log");
+        let file_name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("file name");
+        let cached_after = list_persisted_reports("newest");
+        assert!(cached_after.iter().any(|entry| {
+            entry.fileName == file_name && entry.mint == "mint-cache-test"
+        }));
+
         unsafe {
             std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
         }

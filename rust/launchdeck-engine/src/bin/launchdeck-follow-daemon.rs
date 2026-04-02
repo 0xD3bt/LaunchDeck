@@ -25,7 +25,8 @@ use launchdeck_engine::{
         FollowDaemonStore,
         FollowJobRecord, FollowJobResponse, FollowJobState, FollowReadyRequest,
         FollowReadyResponse, FollowReserveRequest, FollowStopAllRequest, FollowWatcherHealth,
-        follow_job_response, follow_ready_response, should_use_post_setup_creator_vault_for_sell,
+        follow_job_response, follow_ready_response, should_use_post_setup_creator_vault_for_buy,
+        should_use_post_setup_creator_vault_for_sell,
     },
     observability::update_persisted_follow_daemon_snapshot,
     paths,
@@ -51,7 +52,7 @@ use launchdeck_engine::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env,
     net::SocketAddr,
     sync::Arc,
@@ -71,15 +72,15 @@ struct AppState {
     auth_token: Option<String>,
     rpc_url: String,
     store: FollowDaemonStore,
-    max_active_jobs: usize,
-    max_concurrent_compiles: usize,
-    max_concurrent_sends: usize,
+    max_active_jobs: Option<usize>,
+    max_concurrent_compiles: Option<usize>,
+    max_concurrent_sends: Option<usize>,
     capacity_wait_ms: u64,
     active_jobs: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     wallet_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     report_write_lock: Arc<Mutex<()>>,
-    compile_slots: Arc<Semaphore>,
-    send_slots: Arc<Semaphore>,
+    compile_slots: Option<Arc<Semaphore>>,
+    send_slots: Option<Arc<Semaphore>>,
     watch_hubs: Arc<Mutex<HashMap<String, Arc<JobWatchHub>>>>,
     prepared_follow_buys: Arc<Mutex<HashMap<String, PreparedFollowBuyStatic>>>,
     hot_follow_buy_runtime: Arc<Mutex<HashMap<String, CachedFollowBuyRuntime>>>,
@@ -88,7 +89,7 @@ struct AppState {
     follow_report_flush_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     watch_endpoint_health: Arc<Mutex<HashMap<String, CachedWatchEndpointHealth>>>,
     wallet_precheck_cache: Arc<Mutex<HashMap<String, CachedWalletPrecheck>>>,
-    shared_block_height: Arc<SharedBlockHeightHub>,
+    offset_worker: Arc<OffsetWorkerHub>,
 }
 
 #[derive(Clone)]
@@ -128,15 +129,24 @@ struct JobWatchHub {
     started: Mutex<JobWatchStarted>,
 }
 
-struct SharedBlockHeightHub {
-    tx: watch::Sender<Option<Result<u64, String>>>,
-    consumers: Mutex<HashSet<String>>,
+struct OffsetWorkerHub {
+    consumers: Mutex<HashMap<String, OffsetConsumer>>,
     running: Mutex<bool>,
+    last_observed_block_height: Mutex<Option<u64>>,
+    last_observed_at_ms: Mutex<Option<u128>>,
+}
+
+struct OffsetConsumer {
+    trace_id: String,
+    action_id: String,
+    base_confirmed_block_height: u64,
+    confirmation_detected_at_ms: u128,
+    target_block_offset: u64,
+    completion_tx: watch::Sender<Option<Result<(), String>>>,
 }
 
 #[derive(Default)]
 struct JobWatchStarted {
-    slot: bool,
     signature: bool,
     market: bool,
 }
@@ -166,6 +176,9 @@ const FOLLOW_READY_WATCH_REFRESH_MS: u64 = 5_000;
 const FOLLOW_READY_WATCH_TTL_MS: u128 = 10_000;
 const FOLLOW_READY_PRECHECK_TTL_MS: u128 = 5_000;
 const FOLLOW_READY_PRECHECK_REFRESH_MS: u64 = 3_000;
+const DEFAULT_FOLLOW_OFFSET_POLL_INTERVAL_MS: u64 = 400;
+const OFFSET_SAME_BLOCK_REPOLL_DELAY_MS: u64 = 25;
+const OFFSET_SAME_BLOCK_REPOLL_LIMIT: usize = 3;
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -189,12 +202,26 @@ fn configured_follow_daemon_base_url() -> String {
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", configured_follow_daemon_port()))
 }
 
-fn configured_limit(var_name: &str, fallback: usize) -> usize {
-    env::var(var_name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback)
+fn parse_optional_limit_value(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    trimmed.parse::<usize>().ok().filter(|value| *value > 0)
+}
+
+fn configured_limit(var_name: &str) -> Option<usize> {
+    let Ok(value) = env::var(var_name) else {
+        return None;
+    };
+    let trimmed = value.trim();
+    let parsed = parse_optional_limit_value(trimmed);
+    if parsed.is_none() && !trimmed.is_empty() && trimmed != "0" {
+        eprintln!(
+            "Warning: {var_name}={trimmed:?} is invalid. Use blank or 0 for uncapped, or a positive integer for a cap. Treating it as uncapped."
+        );
+    }
+    parsed
 }
 
 fn configured_capacity_wait_ms() -> u64 {
@@ -205,12 +232,23 @@ fn configured_capacity_wait_ms() -> u64 {
         .unwrap_or(5_000)
 }
 
-fn configured_follow_block_height_refresh_ms() -> u64 {
-    env::var("LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS")
+fn configured_follow_offset_poll_interval_ms() -> u64 {
+    env::var("LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|value| value.clamp(50, 1_000))
-        .unwrap_or(200)
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FOLLOW_OFFSET_POLL_INTERVAL_MS)
+}
+
+fn configured_enable_approximate_follow_offset_timer() -> bool {
+    matches!(
+        env::var("LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn configured_auth_token() -> Option<String> {
@@ -241,8 +279,14 @@ async fn build_health(state: &Arc<AppState>) -> FollowDaemonHealth {
     health.maxActiveJobs = state.max_active_jobs;
     health.maxConcurrentCompiles = state.max_concurrent_compiles;
     health.maxConcurrentSends = state.max_concurrent_sends;
-    health.availableCompileSlots = state.compile_slots.available_permits();
-    health.availableSendSlots = state.send_slots.available_permits();
+    health.availableCompileSlots = state
+        .compile_slots
+        .as_ref()
+        .map(|semaphore| semaphore.available_permits());
+    health.availableSendSlots = state
+        .send_slots
+        .as_ref()
+        .map(|semaphore| semaphore.available_permits());
     if health.activeJobs == 0 {
         health.slotWatcherMode = None;
         health.signatureWatcherMode = None;
@@ -398,6 +442,17 @@ fn follow_buy_cache_key(trace_id: &str, action_id: &str) -> String {
     format!("{trace_id}:{action_id}")
 }
 
+fn hot_follow_buy_runtime_cache_key(trace_id: &str, prefer_post_setup_creator_vault: bool) -> String {
+    format!(
+        "{trace_id}:{}",
+        if prefer_post_setup_creator_vault {
+            "post-setup"
+        } else {
+            "launch-creator"
+        }
+    )
+}
+
 async fn cache_prepared_follow_buy(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -422,11 +477,12 @@ async fn get_prepared_follow_buy(
 async fn cache_hot_follow_buy_runtime(
     state: &Arc<AppState>,
     trace_id: &str,
+    prefer_post_setup_creator_vault: bool,
     prepared: PreparedFollowBuyRuntime,
 ) {
     let mut cache = state.hot_follow_buy_runtime.lock().await;
     cache.insert(
-        trace_id.to_string(),
+        hot_follow_buy_runtime_cache_key(trace_id, prefer_post_setup_creator_vault),
         CachedFollowBuyRuntime {
             prepared,
             refreshed_at_ms: now_ms(),
@@ -437,9 +493,14 @@ async fn cache_hot_follow_buy_runtime(
 async fn get_hot_follow_buy_runtime(
     state: &Arc<AppState>,
     trace_id: &str,
+    prefer_post_setup_creator_vault: bool,
 ) -> Option<CachedFollowBuyRuntime> {
     let cache = state.hot_follow_buy_runtime.lock().await;
-    cache.get(trace_id).cloned()
+    cache.get(&hot_follow_buy_runtime_cache_key(
+        trace_id,
+        prefer_post_setup_creator_vault,
+    ))
+    .cloned()
 }
 
 async fn clear_follow_buy_caches(state: &Arc<AppState>, trace_id: &str) {
@@ -449,7 +510,7 @@ async fn clear_follow_buy_caches(state: &Arc<AppState>, trace_id: &str) {
     }
     {
         let mut runtime = state.hot_follow_buy_runtime.lock().await;
-        runtime.remove(trace_id);
+        runtime.retain(|key, _| !key.starts_with(&format!("{trace_id}:")));
     }
     let handle = {
         let mut tasks = state.hot_follow_buy_tasks.lock().await;
@@ -467,7 +528,7 @@ async fn clear_follow_buy_cache_entries_only(state: &Arc<AppState>, trace_id: &s
     }
     {
         let mut runtime = state.hot_follow_buy_runtime.lock().await;
-        runtime.remove(trace_id);
+        runtime.retain(|key, _| !key.starts_with(&format!("{trace_id}:")));
     }
 }
 
@@ -502,10 +563,23 @@ async fn spawn_hot_follow_buy_refresh_if_needed(state: Arc<AppState>, trace_id: 
                 sleep(Duration::from_millis(HOT_FOLLOW_BUY_REFRESH_MS)).await;
                 continue;
             };
-            if let Ok(prepared) =
-                prepare_follow_buy_runtime(&task_state.rpc_url, mint, launch_creator).await
-            {
-                cache_hot_follow_buy_runtime(&task_state, &task_trace_id, prepared).await;
+            for prefer_post_setup_creator_vault in [false, true] {
+                if let Ok(prepared) = prepare_follow_buy_runtime(
+                    &task_state.rpc_url,
+                    mint,
+                    launch_creator,
+                    prefer_post_setup_creator_vault,
+                )
+                .await
+                {
+                    cache_hot_follow_buy_runtime(
+                        &task_state,
+                        &task_trace_id,
+                        prefer_post_setup_creator_vault,
+                        prepared,
+                    )
+                    .await;
+                }
             }
             sleep(Duration::from_millis(HOT_FOLLOW_BUY_REFRESH_MS)).await;
         }
@@ -535,20 +609,33 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
     if job.launchpad != "pump" {
         return;
     }
-    if let Ok(prepared_runtime) =
-        prepare_follow_buy_runtime(&state.rpc_url, mint, launch_creator).await
-    {
-        cache_hot_follow_buy_runtime(&state, &job.traceId, prepared_runtime).await;
+    for prefer_post_setup_creator_vault in [false, true] {
+        if let Ok(prepared_runtime) = prepare_follow_buy_runtime(
+            &state.rpc_url,
+            mint,
+            launch_creator,
+            prefer_post_setup_creator_vault,
+        )
+        .await
+        {
+            cache_hot_follow_buy_runtime(
+                &state,
+                &job.traceId,
+                prefer_post_setup_creator_vault,
+                prepared_runtime,
+            )
+            .await;
+        }
     }
     let trace_id = job.traceId.clone();
     let rpc_url = state.rpc_url.clone();
     let execution = job.execution.clone();
-    let jito_tip_account = job.jitoTipAccount.clone();
+    let buy_tip_account = job.buyTipAccount.clone();
     let tasks = buy_actions.into_iter().map(|action| {
         let trace_id = trace_id.clone();
         let rpc_url = rpc_url.clone();
         let execution = execution.clone();
-        let jito_tip_account = jito_tip_account.clone();
+        let buy_tip_account = buy_tip_account.clone();
         let mint = mint.to_string();
         let launch_creator = launch_creator.to_string();
         async move {
@@ -562,7 +649,7 @@ async fn prepare_follow_job_buy_caches(state: Arc<AppState>, job: &FollowJobReco
             let prepared = prepare_follow_buy_static(
                 &rpc_url,
                 &execution,
-                &jito_tip_account,
+                &buy_tip_account,
                 &wallet_secret,
                 &mint,
                 &launch_creator,
@@ -598,7 +685,7 @@ async fn resolve_prepared_follow_buy(
     let prepared = prepare_follow_buy_static(
         &state.rpc_url,
         &job.execution,
-        &job.jitoTipAccount,
+        &job.buyTipAccount,
         wallet_secret,
         mint,
         launch_creator,
@@ -613,8 +700,10 @@ async fn resolve_hot_follow_buy_runtime_for_job(
     state: &Arc<AppState>,
     job: &FollowJobRecord,
     launch_creator: &str,
+    prefer_post_setup_creator_vault: bool,
 ) -> Result<PreparedFollowBuyRuntime, String> {
-    if let Some(cached) = get_hot_follow_buy_runtime(state, &job.traceId).await
+    if let Some(cached) =
+        get_hot_follow_buy_runtime(state, &job.traceId, prefer_post_setup_creator_vault).await
         && now_ms().saturating_sub(cached.refreshed_at_ms) <= HOT_FOLLOW_BUY_MAX_AGE_MS
     {
         return Ok(cached.prepared);
@@ -623,8 +712,20 @@ async fn resolve_hot_follow_buy_runtime_for_job(
         .mint
         .as_deref()
         .ok_or_else(|| "Follow job missing mint.".to_string())?;
-    let prepared = prepare_follow_buy_runtime(&state.rpc_url, mint, launch_creator).await?;
-    cache_hot_follow_buy_runtime(state, &job.traceId, prepared.clone()).await;
+    let prepared = prepare_follow_buy_runtime(
+        &state.rpc_url,
+        mint,
+        launch_creator,
+        prefer_post_setup_creator_vault,
+    )
+    .await?;
+    cache_hot_follow_buy_runtime(
+        state,
+        &job.traceId,
+        prefer_post_setup_creator_vault,
+        prepared.clone(),
+    )
+    .await;
     Ok(prepared)
 }
 
@@ -832,18 +933,24 @@ async fn run_launch_gate_prechecks(
 }
 
 fn has_capacity_for_new_job(health: &FollowDaemonHealth) -> bool {
-    health.activeJobs < health.maxActiveJobs
+    health
+        .maxActiveJobs
+        .is_none_or(|max_active_jobs| health.activeJobs < max_active_jobs)
 }
 
 async fn acquire_capacity_slot(
-    semaphore: Arc<Semaphore>,
+    semaphore: Option<Arc<Semaphore>>,
     wait_ms: u64,
     label: &str,
-) -> Result<OwnedSemaphorePermit, String> {
+) -> Result<Option<OwnedSemaphorePermit>, String> {
+    let Some(semaphore) = semaphore else {
+        return Ok(None);
+    };
     timeout(Duration::from_millis(wait_ms), semaphore.acquire_owned())
         .await
         .map_err(|_| format!("Timed out waiting for follow daemon {label} capacity."))?
         .map_err(|_| format!("Follow daemon {label} capacity is unavailable."))
+        .map(Some)
 }
 
 async fn daemon_health(State(state): State<Arc<AppState>>) -> Json<FollowDaemonHealth> {
@@ -1658,11 +1765,8 @@ async fn get_job_watch_hub(state: &Arc<AppState>, trace_id: &str) -> Arc<JobWatc
 }
 
 async fn remove_job_watch_hub(state: &Arc<AppState>, trace_id: &str) {
-    {
-        let mut hubs = state.watch_hubs.lock().await;
-        hubs.remove(trace_id);
-    }
-    release_shared_block_height_consumer(state, trace_id).await;
+    let mut hubs = state.watch_hubs.lock().await;
+    hubs.remove(trace_id);
 }
 
 async fn spawn_job_if_needed(state: Arc<AppState>, trace_id: String) {
@@ -1870,27 +1974,62 @@ async fn execute_action_with_retry(
             else {
                 return Err(error);
             };
+            if should_rebuild_presigned_pump_buy_creator_vault_mismatch(
+                &latest_job,
+                &latest_action,
+                &error,
+            ) {
+                let retry_delay_ms = action_retry_backoff_ms(latest_action.attemptCount);
+                let _ = state
+                    .store
+                    .update_action(&trace_id, &action.actionId, |record| {
+                        reset_action_for_presigned_rebuild(
+                            record,
+                            format!(
+                                "Pump buy hit creator_vault mismatch; rebuilding with refreshed creator-vault state in {}ms: {}",
+                                retry_delay_ms, error
+                            ),
+                        );
+                    })
+                    .await;
+                sync_follow_job_report(&state, &trace_id).await;
+                sleep(Duration::from_millis(retry_delay_ms)).await;
+                continue;
+            }
             if should_retry_pump_sell_creator_vault_mismatch(&latest_job, &latest_action, &error) {
                 let retry_delay_ms = action_retry_backoff_ms(latest_action.attemptCount);
                 let _ = state
                     .store
                     .update_action(&trace_id, &action.actionId, |record| {
-                        record.state = FollowActionState::Armed;
-                        record.preSignedTransactions.clear();
-                        record.submitStartedAtMs = None;
-                        record.submittedAtMs = None;
-                        record.confirmedAtMs = None;
-                        record.sendObservedBlockHeight = None;
-                        record.confirmedObservedBlockHeight = None;
-                        record.blocksToConfirm = None;
-                        record.signature = None;
-                        record.explorerUrl = None;
-                        record.endpoint = None;
-                        record.bundleId = None;
-                        record.lastError = Some(format!(
-                            "Pump sell hit creator_vault mismatch; rebuilding with refreshed vault path in {}ms: {}",
-                            retry_delay_ms, error
-                        ));
+                        reset_action_for_presigned_rebuild(
+                            record,
+                            format!(
+                                "Pump sell hit creator_vault mismatch; rebuilding with refreshed creator-vault state in {}ms: {}",
+                                retry_delay_ms, error
+                            ),
+                        );
+                    })
+                    .await;
+                sync_follow_job_report(&state, &trace_id).await;
+                sleep(Duration::from_millis(retry_delay_ms)).await;
+                continue;
+            }
+            if should_rebuild_presigned_pump_sell_onchain_slippage(
+                &latest_job,
+                &latest_action,
+                &error,
+            ) {
+                let retry_delay_ms = action_retry_backoff_ms(latest_action.attemptCount);
+                let _ = state
+                    .store
+                    .update_action(&trace_id, &action.actionId, |record| {
+                        reset_action_for_presigned_rebuild(
+                            record,
+                            format!(
+                                "Pump pre-signed sell hit on-chain slippage; rebuilding with refreshed sell quote in {}ms: {}",
+                                retry_delay_ms, error
+                            ),
+                        );
                     })
                     .await;
                 sync_follow_job_report(&state, &trace_id).await;
@@ -2026,6 +2165,10 @@ async fn record_action_expired(
     sync_follow_job_report(state, &job.traceId).await;
 }
 
+fn is_pump_creator_vault_retry_error(error: &str) -> bool {
+    is_creator_vault_seed_mismatch(error) || is_pump_custom_2006_seed_mismatch(error)
+}
+
 fn should_retry_action(job: &FollowJobRecord, action: &FollowActionRecord, error: &str) -> bool {
     if action.attemptCount > job.followLaunch.constraints.retryBudget {
         return false;
@@ -2063,7 +2206,58 @@ fn should_retry_pump_sell_creator_vault_mismatch(
     ) {
         return false;
     }
-    is_creator_vault_seed_mismatch(error) || is_pump_custom_2006_seed_mismatch(error)
+    is_pump_creator_vault_retry_error(error)
+}
+
+fn should_rebuild_presigned_pump_buy_creator_vault_mismatch(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    error: &str,
+) -> bool {
+    if action.attemptCount > job.followLaunch.constraints.retryBudget {
+        return false;
+    }
+    if job.launchpad != "pump" {
+        return false;
+    }
+    if !matches!(action.kind, FollowActionKind::SniperBuy) {
+        return false;
+    }
+    if action.preSignedTransactions.is_empty() {
+        return false;
+    }
+    is_pump_creator_vault_retry_error(error)
+}
+
+fn is_pump_custom_6003_slippage(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("instructionerror")
+        && (normalized.contains("\"custom\":6003")
+            || normalized.contains("custom:6003")
+            || normalized.contains("custom: 6003"))
+}
+
+fn should_rebuild_presigned_pump_sell_onchain_slippage(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    error: &str,
+) -> bool {
+    if action.attemptCount > job.followLaunch.constraints.retryBudget {
+        return false;
+    }
+    if job.launchpad != "pump" {
+        return false;
+    }
+    if !matches!(
+        action.kind,
+        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell
+    ) {
+        return false;
+    }
+    if action.preSignedTransactions.is_empty() {
+        return false;
+    }
+    is_pump_custom_6003_slippage(error)
 }
 
 fn is_retryable_action_error(error: &str) -> bool {
@@ -2116,6 +2310,43 @@ fn should_rebuild_expired_presigned_action(action: &FollowActionRecord, error: &
         && is_expired_action_error(error)
 }
 
+fn action_waiting_for_presigned_rebuild(action: &FollowActionRecord) -> bool {
+    if action.preSignedTransactions.is_empty()
+        && matches!(
+            action.state,
+            FollowActionState::Queued
+                | FollowActionState::Armed
+                | FollowActionState::Eligible
+                | FollowActionState::Running
+        )
+    {
+        let normalized = action
+            .lastError
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return normalized.contains("rebuilding with refreshed creator-vault state")
+            || normalized.contains("rebuilding with refreshed sell quote");
+    }
+    false
+}
+
+fn reset_action_for_presigned_rebuild(record: &mut FollowActionRecord, message: String) {
+    record.state = FollowActionState::Armed;
+    record.preSignedTransactions.clear();
+    record.submitStartedAtMs = None;
+    record.submittedAtMs = None;
+    record.confirmedAtMs = None;
+    record.sendObservedBlockHeight = None;
+    record.confirmedObservedBlockHeight = None;
+    record.blocksToConfirm = None;
+    record.signature = None;
+    record.explorerUrl = None;
+    record.endpoint = None;
+    record.bundleId = None;
+    record.lastError = Some(message);
+}
+
 fn should_block_deferred_setup_for_action(action: &FollowActionRecord, now_ms: u128) -> bool {
     if action.marketCap.is_some() {
         return false;
@@ -2127,6 +2358,9 @@ fn should_block_deferred_setup_for_action(action: &FollowActionRecord, now_ms: u
             | FollowActionState::Eligible
             | FollowActionState::Running
     ) {
+        return false;
+    }
+    if action_waiting_for_presigned_rebuild(action) {
         return false;
     }
     if action.requireConfirmation {
@@ -2206,6 +2440,10 @@ async fn execute_action(
         .as_deref()
         .ok_or_else(|| "Follow job missing launch creator.".to_string())?;
     let compile_started = Instant::now();
+    let prefer_post_setup_creator_vault_for_buy = should_use_post_setup_creator_vault_for_buy(
+        job.preferPostSetupCreatorVaultForSell,
+        action,
+    );
     let prefer_post_setup_creator_vault_for_sell = should_use_post_setup_creator_vault_for_sell(
         job.preferPostSetupCreatorVaultForSell,
         action,
@@ -2251,7 +2489,7 @@ async fn execute_action(
                             &state.rpc_url,
                             &job.execution,
                             job.tokenMayhemMode,
-                            &job.jitoTipAccount,
+                            &job.buyTipAccount,
                             &wallet_secret,
                             mint,
                             launch_creator,
@@ -2265,7 +2503,7 @@ async fn execute_action(
                             &job.quoteAsset,
                             &job.execution,
                             job.tokenMayhemMode,
-                            &job.jitoTipAccount,
+                            &job.buyTipAccount,
                             &wallet_secret,
                             mint,
                             launch_creator,
@@ -2281,7 +2519,7 @@ async fn execute_action(
                         &state.rpc_url,
                         &job.execution,
                         job.tokenMayhemMode,
-                        &job.jitoTipAccount,
+                        &job.buyTipAccount,
                         &wallet_secret,
                         mint,
                         launch_creator,
@@ -2300,7 +2538,13 @@ async fn execute_action(
                 )
                 .await?;
                 let runtime =
-                    resolve_hot_follow_buy_runtime_for_job(&state, job, launch_creator).await?;
+                    resolve_hot_follow_buy_runtime_for_job(
+                        &state,
+                        job,
+                        launch_creator,
+                        prefer_post_setup_creator_vault_for_buy,
+                    )
+                    .await?;
                 Some(
                     finalize_follow_buy_transaction(
                         &state.rpc_url,
@@ -2320,7 +2564,7 @@ async fn execute_action(
                     &state.rpc_url,
                     &job.quoteAsset,
                     &job.execution,
-                    &job.jitoTipAccount,
+                    &job.sellTipAccount,
                     &wallet_secret,
                     mint,
                     sell_percent.unwrap_or_default(),
@@ -2335,7 +2579,7 @@ async fn execute_action(
                     &state.rpc_url,
                     &job.execution,
                     job.tokenMayhemMode,
-                    &job.jitoTipAccount,
+                    &job.sellTipAccount,
                     &wallet_secret,
                     mint,
                     launch_creator,
@@ -2348,7 +2592,7 @@ async fn execute_action(
                     &state.rpc_url,
                     &job.execution,
                     job.tokenMayhemMode,
-                    &job.jitoTipAccount,
+                    &job.sellTipAccount,
                     &wallet_secret,
                     mint,
                     launch_creator,
@@ -2403,7 +2647,7 @@ async fn execute_action(
                     &state.rpc_url,
                     &job.execution,
                     job.tokenMayhemMode,
-                    &job.jitoTipAccount,
+                    &job.sellTipAccount,
                     &wallet_secret,
                     mint,
                     launch_creator,
@@ -2667,14 +2911,14 @@ async fn wait_for_action_eligibility(
                 )
                 .await?;
             }
-            if let Some(offset) = action.targetBlockOffset {
+            if action.targetBlockOffset.unwrap_or_default() > 0 {
                 let wait_started = Instant::now();
                 wait_for_slot_offset(
                     state.clone(),
                     job,
                     &action.actionId,
                     confirmed_launch_block_height,
-                    u64::from(offset),
+                    u64::from(action.targetBlockOffset.unwrap()),
                 )
                 .await?;
                 watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
@@ -2683,7 +2927,7 @@ async fn wait_for_action_eligibility(
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
             let has_time = action.scheduledForMs.is_some();
             let has_market = action.marketCap.is_some();
-            let has_slot = action.targetBlockOffset.is_some();
+            let has_slot = action.targetBlockOffset.unwrap_or_default() > 0;
             if has_slot && has_market {
                 let wait_started = Instant::now();
                 tokio::select! {
@@ -2854,39 +3098,48 @@ async fn ensure_signature_watcher(
     hub.signature_tx.subscribe()
 }
 
-async fn ensure_slot_watcher(
-    state: Arc<AppState>,
-    job: &FollowJobRecord,
-) -> watch::Receiver<Option<Result<u64, String>>> {
-    let hub = get_job_watch_hub(&state, &job.traceId).await;
-    let mut started = hub.started.lock().await;
-    if !started.slot {
-        started.slot = true;
-        set_watcher_health(
-            &state,
-            WatcherKind::Slot,
-            FollowWatcherHealth::Healthy,
-            Some("shared-block-height".to_string()),
-            Some(state.rpc_url.clone()),
-            None,
-        )
-        .await;
-    }
-    drop(started);
-    ensure_shared_block_height_worker(state, &job.traceId).await
+fn offset_consumer_key(trace_id: &str, action_id: &str) -> String {
+    format!("{trace_id}:{action_id}")
 }
 
-async fn ensure_shared_block_height_worker(
+async fn current_shared_block_height(state: Arc<AppState>, _trace_id: &str) -> Result<u64, String> {
+    fetch_current_block_height_fresh(&state.rpc_url, "confirmed").await
+}
+
+async fn register_offset_consumer(
     state: Arc<AppState>,
-    trace_id: &str,
-) -> watch::Receiver<Option<Result<u64, String>>> {
+    job: &FollowJobRecord,
+    action_id: &str,
+    base_confirmed_block_height: u64,
+    target_block_offset: u64,
+    confirmation_detected_at_ms: u128,
+) -> watch::Receiver<Option<Result<(), String>>> {
+    let key = offset_consumer_key(&job.traceId, action_id);
+    let (completion_tx, rx) = watch::channel(None);
+    let consumer = OffsetConsumer {
+        trace_id: job.traceId.clone(),
+        action_id: action_id.to_string(),
+        base_confirmed_block_height,
+        confirmation_detected_at_ms,
+        target_block_offset,
+        completion_tx,
+    };
+    {
+        let current_height = *state.offset_worker.last_observed_block_height.lock().await;
+        if current_height.is_some_and(|height| {
+            height >= base_confirmed_block_height.saturating_add(target_block_offset)
+        }) {
+            let _ = consumer.completion_tx.send(Some(Ok(())));
+            return rx;
+        }
+    }
     let mut should_start = false;
     {
-        let mut consumers = state.shared_block_height.consumers.lock().await;
-        consumers.insert(trace_id.to_string());
+        let mut consumers = state.offset_worker.consumers.lock().await;
+        consumers.insert(key, consumer);
     }
     {
-        let mut running = state.shared_block_height.running.lock().await;
+        let mut running = state.offset_worker.running.lock().await;
         if !*running {
             *running = true;
             should_start = true;
@@ -2895,87 +3148,223 @@ async fn ensure_shared_block_height_worker(
     if should_start {
         let task_state = state.clone();
         tokio::spawn(async move {
-            run_shared_block_height_worker(task_state).await;
+            run_offset_worker(task_state).await;
         });
     }
-    state.shared_block_height.tx.subscribe()
+    let approximate_mode = configured_enable_approximate_follow_offset_timer();
+    set_watcher_health(
+        &state,
+        WatcherKind::Slot,
+        FollowWatcherHealth::Healthy,
+        Some(if approximate_mode {
+            "approx-local-timer".to_string()
+        } else {
+            "real-blockheight".to_string()
+        }),
+        if approximate_mode {
+            None
+        } else {
+            Some(state.rpc_url.clone())
+        },
+        None,
+    )
+    .await;
+    rx
 }
 
-async fn release_shared_block_height_consumer(state: &Arc<AppState>, trace_id: &str) {
-    let mut consumers = state.shared_block_height.consumers.lock().await;
-    consumers.remove(trace_id);
+async fn unregister_offset_consumer(state: &Arc<AppState>, trace_id: &str, action_id: &str) {
+    let key = offset_consumer_key(trace_id, action_id);
+    let mut consumers = state.offset_worker.consumers.lock().await;
+    consumers.remove(&key);
 }
 
-async fn current_shared_block_height(state: Arc<AppState>, trace_id: &str) -> Result<u64, String> {
-    let mut rx = ensure_shared_block_height_worker(state.clone(), trace_id).await;
-    if let Some(result) = rx.borrow().clone() {
-        return result;
+async fn current_offset_consumers(state: &Arc<AppState>) -> Vec<(String, u64)> {
+    let consumers = state.offset_worker.consumers.lock().await;
+    consumers
+        .values()
+        .map(|consumer| {
+            (
+                offset_consumer_key(&consumer.trace_id, &consumer.action_id),
+                consumer
+                    .base_confirmed_block_height
+                    .saturating_add(consumer.target_block_offset),
+            )
+        })
+        .collect()
+}
+
+async fn compute_offset_poll_delay_ms(state: &Arc<AppState>, interval_ms: u64) -> u64 {
+    let now = now_ms();
+    let last_observed_at_ms = *state.offset_worker.last_observed_at_ms.lock().await;
+    if let Some(last_observed_at_ms) = last_observed_at_ms {
+        let elapsed_ms = now.saturating_sub(last_observed_at_ms) as u64;
+        let conservative_lost_ms = elapsed_ms.saturating_mul(3) / 4;
+        return interval_ms
+            .saturating_sub(conservative_lost_ms.min(interval_ms.saturating_sub(100)))
+            .max(100);
     }
-    let wait_ms = configured_follow_block_height_refresh_ms().saturating_add(50);
-    if timeout(Duration::from_millis(wait_ms), rx.changed())
-        .await
-        .is_ok()
+    let earliest_confirmation_detected_at_ms = {
+        let consumers = state.offset_worker.consumers.lock().await;
+        consumers
+            .values()
+            .map(|consumer| consumer.confirmation_detected_at_ms)
+            .min()
+    };
+    let Some(earliest_confirmation_detected_at_ms) = earliest_confirmation_detected_at_ms else {
+        return interval_ms;
+    };
+    let elapsed_ms = now.saturating_sub(earliest_confirmation_detected_at_ms) as u64;
+    let conservative_lost_ms = (elapsed_ms / 2).min(interval_ms.saturating_sub(100));
+    interval_ms.saturating_sub(conservative_lost_ms).max(100)
+}
+
+async fn complete_offset_consumers_for_approximate_tick(
+    state: &Arc<AppState>,
+    interval_ms: u64,
+    correction_ms: u64,
+) {
+    let now = now_ms();
+    let completed = {
+        let consumers = state.offset_worker.consumers.lock().await;
+        consumers
+            .iter()
+            .filter_map(|(key, consumer)| {
+                let elapsed_ms = now.saturating_sub(consumer.confirmation_detected_at_ms) as u64;
+                let adjusted_elapsed_ms = elapsed_ms.saturating_add(correction_ms);
+                let estimated_blocks_elapsed = adjusted_elapsed_ms / interval_ms;
+                (estimated_blocks_elapsed >= consumer.target_block_offset).then(|| {
+                    (key.clone(), consumer.completion_tx.clone())
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if completed.is_empty() {
+        return;
+    }
     {
-        if let Some(result) = rx.borrow().clone() {
-            return result;
+        let mut consumers = state.offset_worker.consumers.lock().await;
+        for (key, _) in &completed {
+            consumers.remove(key);
         }
     }
-    fetch_current_block_height_fresh(&state.rpc_url, "confirmed").await
+    for (_, tx) in completed {
+        let _ = tx.send(Some(Ok(())));
+    }
 }
 
-async fn run_shared_block_height_worker(state: Arc<AppState>) {
-    let refresh_ms = configured_follow_block_height_refresh_ms();
+async fn complete_offset_consumers_for_height(state: &Arc<AppState>, block_height: u64) {
+    let completed = {
+        let consumers = state.offset_worker.consumers.lock().await;
+        consumers
+            .iter()
+            .filter_map(|(key, consumer)| {
+                let target_height = consumer
+                    .base_confirmed_block_height
+                    .saturating_add(consumer.target_block_offset);
+                (block_height >= target_height).then(|| (key.clone(), consumer.completion_tx.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    if completed.is_empty() {
+        return;
+    }
+    {
+        let mut consumers = state.offset_worker.consumers.lock().await;
+        for (key, _) in &completed {
+            consumers.remove(key);
+        }
+    }
+    for (_, tx) in completed {
+        let _ = tx.send(Some(Ok(())));
+    }
+}
+
+async fn run_offset_worker(state: Arc<AppState>) {
+    let interval_ms = configured_follow_offset_poll_interval_ms();
+    let approximate_mode = configured_enable_approximate_follow_offset_timer();
+    let mut delay_ms = compute_offset_poll_delay_ms(&state, interval_ms).await;
+    let mut next_tick_correction_ms = interval_ms.saturating_sub(delay_ms);
     loop {
-        let has_consumers = {
-            let consumers = state.shared_block_height.consumers.lock().await;
-            !consumers.is_empty()
-        };
-        if !has_consumers {
+        if current_offset_consumers(&state).await.is_empty() {
             {
-                let mut running = state.shared_block_height.running.lock().await;
+                let mut running = state.offset_worker.running.lock().await;
                 *running = false;
             }
-            let still_has_consumers = {
-                let consumers = state.shared_block_height.consumers.lock().await;
-                !consumers.is_empty()
-            };
-            if still_has_consumers {
-                let mut running = state.shared_block_height.running.lock().await;
-                if !*running {
-                    *running = true;
+            if current_offset_consumers(&state).await.is_empty() {
+                return;
+            }
+            let mut running = state.offset_worker.running.lock().await;
+            if !*running {
+                *running = true;
+            }
+        }
+        sleep(Duration::from_millis(delay_ms)).await;
+        if approximate_mode {
+            set_watcher_health(
+                &state,
+                WatcherKind::Slot,
+                FollowWatcherHealth::Healthy,
+                Some("approx-local-timer".to_string()),
+                None,
+                None,
+            )
+            .await;
+            complete_offset_consumers_for_approximate_tick(
+                &state,
+                interval_ms,
+                next_tick_correction_ms,
+            )
+                .await;
+            next_tick_correction_ms = 0;
+            delay_ms = interval_ms;
+            continue;
+        }
+        let mut repolls_remaining = OFFSET_SAME_BLOCK_REPOLL_LIMIT;
+        loop {
+            let result = fetch_current_block_height_fresh(&state.rpc_url, "confirmed").await;
+            match result {
+                Ok(block_height) => {
+                    let previous_block_height =
+                        { *state.offset_worker.last_observed_block_height.lock().await };
+                    {
+                        let mut last_height = state.offset_worker.last_observed_block_height.lock().await;
+                        *last_height = Some(block_height);
+                    }
+                    {
+                        let mut last_observed_at = state.offset_worker.last_observed_at_ms.lock().await;
+                        *last_observed_at = Some(now_ms());
+                    }
+                    set_watcher_health(
+                        &state,
+                        WatcherKind::Slot,
+                        FollowWatcherHealth::Healthy,
+                        Some("real-blockheight".to_string()),
+                        Some(state.rpc_url.clone()),
+                        None,
+                    )
+                    .await;
+                    complete_offset_consumers_for_height(&state, block_height).await;
+                    if previous_block_height == Some(block_height) && repolls_remaining > 0 {
+                        repolls_remaining = repolls_remaining.saturating_sub(1);
+                        sleep(Duration::from_millis(OFFSET_SAME_BLOCK_REPOLL_DELAY_MS)).await;
+                        continue;
+                    }
                 }
-                continue;
+                Err(error) => {
+                    set_watcher_health(
+                        &state,
+                        WatcherKind::Slot,
+                        FollowWatcherHealth::Degraded,
+                        Some("real-blockheight".to_string()),
+                        Some(state.rpc_url.clone()),
+                        Some(error),
+                    )
+                    .await;
+                }
             }
-            let _ = state.shared_block_height.tx.send(None);
-            return;
+            break;
         }
-        let result = fetch_current_block_height_fresh(&state.rpc_url, "confirmed").await;
-        match &result {
-            Ok(_) => {
-                set_watcher_health(
-                    &state,
-                    WatcherKind::Slot,
-                    FollowWatcherHealth::Healthy,
-                    Some("shared-block-height".to_string()),
-                    Some(state.rpc_url.clone()),
-                    None,
-                )
-                .await;
-            }
-            Err(error) => {
-                set_watcher_health(
-                    &state,
-                    WatcherKind::Slot,
-                    FollowWatcherHealth::Degraded,
-                    Some("shared-block-height".to_string()),
-                    Some(state.rpc_url.clone()),
-                    Some(error.clone()),
-                )
-                .await;
-            }
-        }
-        let _ = state.shared_block_height.tx.send(Some(result));
-        sleep(Duration::from_millis(refresh_ms)).await;
+        delay_ms = interval_ms;
     }
 }
 
@@ -3031,13 +3420,7 @@ async fn capture_action_watcher_metadata(
     };
     let fallback_reason = health.lastError.clone().filter(|value| !value.trim().is_empty());
     let mode = match kind {
-        WatcherKind::Slot => {
-            if fallback_reason.is_some() {
-                health.slotWatcherMode.clone().or_else(|| inferred_mode.clone())
-            } else {
-                inferred_mode.clone().or_else(|| health.slotWatcherMode.clone())
-            }
-        }
+        WatcherKind::Slot => health.slotWatcherMode.clone().or_else(|| inferred_mode.clone()),
         WatcherKind::Signature => {
             if fallback_reason.is_some() {
                 health
@@ -3750,31 +4133,52 @@ async fn wait_for_slot_offset(
     confirmed_launch_block_height: Option<u64>,
     target_offset: u64,
 ) -> Result<(), String> {
-    let mut rx = ensure_slot_watcher(state.clone(), job).await;
+    if target_offset == 0 {
+        capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Signature).await;
+        return Ok(());
+    }
     let base_block_height = confirmed_launch_block_height
         .or(job.confirmedObservedBlockHeight)
         .ok_or_else(|| {
             "Launch confirmation block height was unavailable for On Confirmed Block trigger."
                 .to_string()
         })?;
+    let confirmation_detected_at_ms = now_ms();
+    let mut rx = register_offset_consumer(
+        state.clone(),
+        job,
+        action_id,
+        base_block_height,
+        target_offset,
+        confirmation_detected_at_ms,
+    )
+    .await;
     loop {
-        ensure_action_not_cancelled(&state, &job.traceId, action_id).await?;
-        let current_block_height = rx.borrow().clone();
-        if let Some(result) = current_block_height {
+        if let Err(error) = ensure_action_not_cancelled(&state, &job.traceId, action_id).await {
+            unregister_offset_consumer(&state, &job.traceId, action_id).await;
+            return Err(error);
+        }
+        let current = rx.borrow().clone();
+        if let Some(result) = current {
+            unregister_offset_consumer(&state, &job.traceId, action_id).await;
             match result {
-                Ok(block_height) => {
-                    if block_height >= base_block_height.saturating_add(target_offset) {
-                        capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Slot)
-                            .await;
-                        return Ok(());
-                    }
+                Ok(()) => {
+                    capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Slot)
+                        .await;
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             }
         }
-        rx.changed()
-            .await
-            .map_err(|_| "Shared slot watcher stopped unexpectedly.".to_string())?;
+        tokio::select! {
+            result = rx.changed() => {
+                if let Err(_) = result {
+                    unregister_offset_consumer(&state, &job.traceId, action_id).await;
+                    return Err("Shared offset worker stopped unexpectedly.".to_string());
+                }
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 
@@ -3951,9 +4355,9 @@ async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
 async fn main() {
     let _ = dotenvy::dotenv();
     let base_url = configured_follow_daemon_base_url();
-    let max_active_jobs = configured_limit("LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS", 64);
-    let max_concurrent_compiles = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES", 8);
-    let max_concurrent_sends = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS", 8);
+    let max_active_jobs = configured_limit("LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS");
+    let max_concurrent_compiles = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES");
+    let max_concurrent_sends = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS");
     let capacity_wait_ms = configured_capacity_wait_ms();
     let state = Arc::new(AppState {
         auth_token: configured_auth_token(),
@@ -3966,8 +4370,8 @@ async fn main() {
         active_jobs: Arc::new(Mutex::new(HashMap::new())),
         wallet_locks: Arc::new(Mutex::new(HashMap::new())),
         report_write_lock: Arc::new(Mutex::new(())),
-        compile_slots: Arc::new(Semaphore::new(max_concurrent_compiles)),
-        send_slots: Arc::new(Semaphore::new(max_concurrent_sends)),
+        compile_slots: max_concurrent_compiles.map(|limit| Arc::new(Semaphore::new(limit))),
+        send_slots: max_concurrent_sends.map(|limit| Arc::new(Semaphore::new(limit))),
         watch_hubs: Arc::new(Mutex::new(HashMap::new())),
         prepared_follow_buys: Arc::new(Mutex::new(HashMap::new())),
         hot_follow_buy_runtime: Arc::new(Mutex::new(HashMap::new())),
@@ -3976,13 +4380,11 @@ async fn main() {
         follow_report_flush_tasks: Arc::new(Mutex::new(HashMap::new())),
         watch_endpoint_health: Arc::new(Mutex::new(HashMap::new())),
         wallet_precheck_cache: Arc::new(Mutex::new(HashMap::new())),
-        shared_block_height: Arc::new({
-            let (tx, _) = watch::channel(None);
-            SharedBlockHeightHub {
-                tx,
-                consumers: Mutex::new(HashSet::new()),
-                running: Mutex::new(false),
-            }
+        offset_worker: Arc::new(OffsetWorkerHub {
+            consumers: Mutex::new(HashMap::new()),
+            running: Mutex::new(false),
+            last_observed_block_height: Mutex::new(None),
+            last_observed_at_ms: Mutex::new(None),
         }),
     });
     if let Some(endpoint) = configured_startup_watch_endpoint() {
@@ -4051,7 +4453,9 @@ mod tests {
         NormalizedFollowLaunchMarketCapTrigger, NormalizedFollowLaunchSell,
         NormalizedFollowLaunchSnipe,
     };
+    use launchdeck_engine::rpc::CompiledTransaction;
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn sample_execution() -> NormalizedExecution {
         serde_json::from_value(json!({
@@ -4106,6 +4510,8 @@ mod tests {
             execution: sample_execution(),
             tokenMayhemMode: false,
             jitoTipAccount: "tip".to_string(),
+            buyTipAccount: "buy-tip".to_string(),
+            sellTipAccount: "sell-tip".to_string(),
             preferPostSetupCreatorVaultForSell: false,
             mint: None,
             launchCreator: None,
@@ -4188,7 +4594,7 @@ mod tests {
         };
         let plan = follow_action_transport_plan(&job, &action);
         assert_eq!(plan.resolvedProvider, "standard-rpc");
-        assert_eq!(plan.transportType, "standard-rpc-sequential");
+        assert_eq!(plan.transportType, "standard-rpc-fanout");
     }
 
     #[test]
@@ -4342,6 +4748,179 @@ mod tests {
     }
 
     #[test]
+    fn presigned_pump_buy_creator_vault_retry_detects_onchain_custom_2006() {
+        let mut job = sample_job();
+        job.followLaunch.constraints.retryBudget = 1;
+        let action = FollowActionRecord {
+            actionId: "buy".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            state: FollowActionState::Sent,
+            buyAmountSol: Some("0.1".to_string()),
+            sellPercent: None,
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![CompiledTransaction {
+                label: "buy".to_string(),
+                format: "v0".to_string(),
+                blockhash: "hash".to_string(),
+                lastValidBlockHeight: 1,
+                serializedBase64: "base64".to_string(),
+                signature: None,
+                lookupTablesUsed: vec![],
+                computeUnitLimit: None,
+                computeUnitPriceMicroLamports: None,
+                inlineTipLamports: None,
+                inlineTipAccount: None,
+            }],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(should_rebuild_presigned_pump_buy_creator_vault_mismatch(
+            &job,
+            &action,
+            r#"on-chain failure | Transaction abc failed on-chain: {"InstructionError":[3,{"Custom":2006}]}"#,
+        ));
+    }
+
+    #[test]
+    fn presigned_pump_sell_slippage_retry_detects_onchain_custom_6003() {
+        let mut job = sample_job();
+        job.followLaunch.constraints.retryBudget = 1;
+        let action = FollowActionRecord {
+            actionId: "sell".to_string(),
+            kind: FollowActionKind::DevAutoSell,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            state: FollowActionState::Sent,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![CompiledTransaction {
+                label: "sell".to_string(),
+                format: "v0".to_string(),
+                blockhash: "hash".to_string(),
+                lastValidBlockHeight: 1,
+                serializedBase64: "base64".to_string(),
+                signature: None,
+                lookupTablesUsed: vec![],
+                computeUnitLimit: None,
+                computeUnitPriceMicroLamports: None,
+                inlineTipLamports: None,
+                inlineTipAccount: None,
+            }],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(should_rebuild_presigned_pump_sell_onchain_slippage(
+            &job,
+            &action,
+            r#"on-chain failure | Transaction abc failed on-chain: {"InstructionError":[2,{"Custom":6003}]}"#,
+        ));
+    }
+
+    #[test]
+    fn creator_vault_rebuild_retry_does_not_block_deferred_setup() {
+        let action = FollowActionRecord {
+            actionId: "buy".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            state: FollowActionState::Armed,
+            buyAmountSol: Some("0.1".to_string()),
+            sellPercent: None,
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 1,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: Some(
+                "Pump buy hit creator_vault mismatch; rebuilding with refreshed creator-vault state in 300ms: seed mismatch".to_string(),
+            ),
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(!should_block_deferred_setup_for_action(&action, 0));
+    }
+
+    #[test]
     fn confirmation_zero_sell_keeps_deployer_creator_vault_path() {
         let action = FollowActionRecord {
             actionId: "sell".to_string(),
@@ -4458,7 +5037,7 @@ mod tests {
         }
         assert_eq!(
             selected_realtime_watcher_mode(
-                "helius-sender",
+                "standard-rpc",
                 "us",
                 Some("wss://mainnet.helius-rpc.com/?api-key=test"),
             ),
@@ -4467,5 +5046,54 @@ mod tests {
         unsafe {
             env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
         }
+    }
+
+    #[test]
+    fn follow_job_capacity_is_unbounded_when_limit_is_missing() {
+        let health = FollowDaemonHealth {
+            running: true,
+            statePath: PathBuf::from("/tmp/follow-state.json"),
+            version: "test".to_string(),
+            pid: None,
+            startedAtMs: None,
+            controlTransport: "local-http".to_string(),
+            controlUrl: None,
+            updatedAtMs: 0,
+            queueDepth: 0,
+            activeJobs: 10_000,
+            maxActiveJobs: None,
+            maxConcurrentCompiles: None,
+            maxConcurrentSends: None,
+            availableCompileSlots: None,
+            availableSendSlots: None,
+            slotWatcher: FollowWatcherHealth::Healthy,
+            slotWatcherMode: None,
+            signatureWatcher: FollowWatcherHealth::Healthy,
+            signatureWatcherMode: None,
+            marketWatcher: FollowWatcherHealth::Healthy,
+            marketWatcherMode: None,
+            lastError: None,
+            watchEndpoint: None,
+        };
+        assert!(has_capacity_for_new_job(&health));
+    }
+
+    #[test]
+    fn configured_limit_blank_means_uncapped() {
+        assert_eq!(configured_limit("__LAUNCHDECK_TEST_UNSET_LIMIT__"), None);
+    }
+
+    #[test]
+    fn parse_optional_limit_value_supports_uncapped_and_capped_values() {
+        assert_eq!(parse_optional_limit_value(""), None);
+        assert_eq!(parse_optional_limit_value("0"), None);
+        assert_eq!(parse_optional_limit_value(" 0 "), None);
+        assert_eq!(parse_optional_limit_value("15"), Some(15));
+    }
+
+    #[test]
+    fn parse_optional_limit_value_rejects_invalid_values() {
+        assert_eq!(parse_optional_limit_value("abc"), None);
+        assert_eq!(parse_optional_limit_value("-1"), None);
     }
 }

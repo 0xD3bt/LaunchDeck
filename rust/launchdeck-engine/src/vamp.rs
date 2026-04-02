@@ -4,7 +4,7 @@ use crate::{
     bags_native::{BagsImportContext, BagsImportRecipient, detect_bags_import_context},
     bonk_native::{BonkImportContext, detect_bonk_import_context},
     image_library::{SerializedImageRecord, save_image_bytes},
-    rpc::{fetch_account_data, fetch_account_exists},
+    rpc::{fetch_account_data, fetch_multiple_account_data},
 };
 use reqwest::Client;
 use serde::Serialize;
@@ -611,11 +611,45 @@ async fn parse_pump_sharing_config_recipients(
     let _admin = read_pubkey(data, &mut offset)?;
     let _admin_revoked = read_bool(data, &mut offset)?;
     let count = read_u32(data, &mut offset)? as usize;
-    let mut recipients = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count);
+    let mut account_addresses = Vec::with_capacity(count);
     for _ in 0..count {
         let address = read_pubkey(data, &mut offset)?;
         let share_bps = i64::from(read_u16(data, &mut offset)?);
-        recipients.push(resolve_pump_shareholder_recipient(rpc_url, address, share_bps).await);
+        account_addresses.push(address.to_string());
+        entries.push((address, share_bps));
+    }
+    let account_data = fetch_multiple_account_data(rpc_url, &account_addresses, "confirmed").await?;
+    let mut recipients = Vec::with_capacity(count);
+    for ((address, share_bps), maybe_account_data) in entries.into_iter().zip(account_data.into_iter())
+    {
+        if let Some(account_data) = maybe_account_data
+            && let Ok((user_id, platform)) = parse_pump_social_fee_pda(&account_data)
+            && platform == PLATFORM_GITHUB
+        {
+            let github_username = resolve_github_username_from_id(&user_id)
+                .await
+                .unwrap_or_default();
+            recipients.push(ImportedRouteRecipient {
+                r#type: "github".to_string(),
+                address: String::new(),
+                githubUsername: github_username.clone(),
+                githubUserId: user_id,
+                shareBps: share_bps,
+                sourceProvider: "github".to_string(),
+                sourceUsername: github_username,
+            });
+            continue;
+        }
+        recipients.push(ImportedRouteRecipient {
+            r#type: "wallet".to_string(),
+            address: address.to_string(),
+            githubUsername: String::new(),
+            githubUserId: String::new(),
+            shareBps: share_bps,
+            sourceProvider: String::new(),
+            sourceUsername: String::new(),
+        });
     }
     Ok(recipients)
 }
@@ -626,23 +660,23 @@ async fn detect_pump_import_context(
     pump_payload: Option<&Value>,
 ) -> Result<Option<ImportedTokenData>, String> {
     let bonding_curve_address = pump_bonding_curve_pda(mint)?.to_string();
-    let bonding_curve_data = fetch_account_data(rpc_url, &bonding_curve_address, "confirmed").await;
-    if let Ok(data) = bonding_curve_data {
+    let agent_payments_address = pump_token_agent_payments_pda(mint)?.to_string();
+    let fee_sharing_address = pump_fee_sharing_config_pda(mint)?.to_string();
+    let batch_accounts = fetch_multiple_account_data(
+        rpc_url,
+        &[
+            bonding_curve_address,
+            agent_payments_address,
+            fee_sharing_address.clone(),
+        ],
+        "confirmed",
+    )
+    .await?;
+    if let Some(data) = batch_accounts.first().cloned().flatten() {
         let (creator, cashback_enabled) = parse_pump_creator_and_cashback(&data)?;
-        let agent_enabled = fetch_account_exists(
-            rpc_url,
-            &pump_token_agent_payments_pda(mint)?.to_string(),
-            "confirmed",
-        )
-        .await
-        .unwrap_or(false);
-        let fee_sharing_enabled = fetch_account_exists(
-            rpc_url,
-            &pump_fee_sharing_config_pda(mint)?.to_string(),
-            "confirmed",
-        )
-        .await
-        .unwrap_or(false);
+        let agent_enabled = batch_accounts.get(1).is_some_and(|value| value.is_some());
+        let fee_sharing_data = batch_accounts.get(2).cloned().flatten();
+        let fee_sharing_enabled = fee_sharing_data.is_some();
         let mut imported = ImportedTokenData {
             launchpad: "pump".to_string(),
             mode: if agent_enabled {
@@ -673,13 +707,7 @@ async fn detect_pump_import_context(
             ..ImportedTokenData::default()
         };
         if fee_sharing_enabled && !agent_enabled {
-            if let Ok(config_data) = fetch_account_data(
-                rpc_url,
-                &pump_fee_sharing_config_pda(mint)?.to_string(),
-                "confirmed",
-            )
-            .await
-            {
+            if let Some(config_data) = fee_sharing_data {
                 if let Ok(recipients) =
                     parse_pump_sharing_config_recipients(rpc_url, &config_data).await
                 {

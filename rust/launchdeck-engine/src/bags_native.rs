@@ -1,7 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -16,7 +16,14 @@ use tokio::{
 };
 
 use crate::{
-    config::{NormalizedConfig, NormalizedExecution, validate_launchpad_support},
+    config::{
+        NormalizedConfig, NormalizedExecution, configured_default_dev_auto_sell_compute_unit_limit,
+        configured_default_launch_compute_unit_limit,
+        configured_default_sniper_buy_compute_unit_limit, validate_launchpad_support,
+    },
+    helper_worker::{
+        HelperWorkerClient, HelperWorkerConfig, HelperWorkerError, helper_worker_enabled,
+    },
     pump_native::{LaunchQuote, NativeCompileTimings},
     report::{InstructionSummary, LaunchReport, TransactionSummary, build_report, render_report},
     rpc::CompiledTransaction,
@@ -24,12 +31,12 @@ use crate::{
 };
 
 const PACKET_LIMIT_BYTES: usize = 1232;
-const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const DEFAULT_HELPER_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_HELPER_MAX_CONCURRENCY: usize = 4;
 const DEFAULT_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS: u64 = 1_000_000;
 const DEFAULT_BAGS_SETUP_JITO_TIP_MIN_LAMPORTS: u64 = 1_000;
-const DEFAULT_BAGS_SETUP_JITO_TIP_PERCENTILE: &str = "p75";
+const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
 
 fn helper_timeout_ms() -> u64 {
     std::env::var("LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS")
@@ -230,7 +237,27 @@ fn helper_script_path() -> Result<PathBuf, String> {
     Ok(project_root()?.join("scripts/bags-launchpad.js"))
 }
 
-fn parse_helper_output<R: for<'de> Deserialize<'de>>(
+fn bags_worker_enabled() -> bool {
+    helper_worker_enabled("LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER")
+}
+
+fn worker_client() -> Result<Arc<HelperWorkerClient>, String> {
+    static CLIENT: OnceLock<Result<Arc<HelperWorkerClient>, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let project_root = project_root()?;
+            let script_path = helper_script_path()?;
+            Ok(Arc::new(HelperWorkerClient::new(HelperWorkerConfig {
+                helper_name: "Bags",
+                project_root,
+                script_path,
+                timeout_ms: helper_timeout_ms(),
+            })))
+        })
+        .clone()
+}
+
+fn parse_helper_output<R: DeserializeOwned>(
     output_stdout: &[u8],
     helper_name: &str,
 ) -> Result<R, String> {
@@ -275,7 +302,7 @@ fn parse_helper_output<R: for<'de> Deserialize<'de>>(
     ))
 }
 
-async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(request: &T) -> Result<R, String> {
+async fn run_helper_once<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
     let _permit = helper_semaphore()
         .acquire_owned()
         .await
@@ -350,6 +377,19 @@ async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(request: &T) -> 
     parse_helper_output(&output_stdout, "Bags")
 }
 
+async fn run_helper<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
+    if bags_worker_enabled() {
+        match worker_client()?.request::<T, R>(request).await {
+            Ok(response) => return Ok(response),
+            Err(HelperWorkerError::Request(error)) => return Err(error),
+            Err(HelperWorkerError::Transport(error)) => {
+                eprintln!("Bags worker transport failed, falling back to one-shot helper: {error}");
+            }
+        }
+    }
+    run_helper_once(request).await
+}
+
 fn helper_tx_config(
     compute_unit_limit: Option<u64>,
     compute_unit_price_micro_lamports: u64,
@@ -357,7 +397,7 @@ fn helper_tx_config(
     tip_account: &str,
 ) -> HelperTxConfig<'_> {
     HelperTxConfig {
-        computeUnitLimit: compute_unit_limit.unwrap_or(FIXED_COMPUTE_UNIT_LIMIT),
+        computeUnitLimit: compute_unit_limit.unwrap_or_else(configured_default_launch_compute_unit_limit),
         computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
         tipLamports: tip_lamports,
         tipAccount: tip_account,
@@ -381,12 +421,12 @@ fn bags_setup_jito_tip_min_lamports() -> u64 {
 }
 
 fn bags_setup_jito_tip_percentile() -> String {
-    let value = std::env::var("LAUNCHDECK_BAGS_SETUP_JITO_TIP_PERCENTILE")
-        .unwrap_or_else(|_| DEFAULT_BAGS_SETUP_JITO_TIP_PERCENTILE.to_string());
+    let value = std::env::var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE")
+        .unwrap_or_else(|_| DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string());
     let trimmed = value.trim().to_lowercase();
     match trimmed.as_str() {
         "p25" | "p50" | "p75" | "p95" | "p99" => trimmed,
-        _ => DEFAULT_BAGS_SETUP_JITO_TIP_PERCENTILE.to_string(),
+        _ => DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE.to_string(),
     }
 }
 
@@ -414,13 +454,13 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
     if lamports == 0 {
         Ok(0)
     } else {
-        Ok((lamports.saturating_mul(1_000_000)) / FIXED_COMPUTE_UNIT_LIMIT)
+        Ok((lamports.saturating_mul(1_000_000)) / PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT)
     }
 }
 
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
     let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
-    Ok(percent / 100)
+    Ok(percent.min(10_000))
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
@@ -454,7 +494,7 @@ fn append_bags_fee_estimate_notes(report: &mut LaunchReport, estimate: &BagsFeeE
                 estimate.setupJitoTipSource.trim()
             },
             if estimate.setupJitoTipPercentile.trim().is_empty() {
-                DEFAULT_BAGS_SETUP_JITO_TIP_PERCENTILE
+                DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE
             } else {
                 estimate.setupJitoTipPercentile.trim()
             },
@@ -595,7 +635,11 @@ pub async fn try_compile_native_bags(
         "ownerSecret": decode_secret_base64(wallet_secret),
         "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            config.tx.computeUnitLimit.and_then(|value| u64::try_from(value).ok()),
+            config
+                .tx
+                .computeUnitLimit
+                .and_then(|value| u64::try_from(value).ok())
+                .or_else(|| Some(configured_default_launch_compute_unit_limit())),
             u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
                 .unwrap_or_default(),
             fee_estimate.setupJitoTipLamports,
@@ -705,7 +749,11 @@ pub async fn prepare_native_bags_send(
         "ownerSecret": decode_secret_base64(wallet_secret),
         "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            config.tx.computeUnitLimit.and_then(|value| u64::try_from(value).ok()),
+            config
+                .tx
+                .computeUnitLimit
+                .and_then(|value| u64::try_from(value).ok())
+                .or_else(|| Some(configured_default_launch_compute_unit_limit())),
             u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
                 .unwrap_or_default(),
             fee_estimate.setupJitoTipLamports,
@@ -841,7 +889,11 @@ pub async fn compile_launch_transaction(
         "commitment": config.execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
         "txConfig": helper_tx_config(
-            config.tx.computeUnitLimit.and_then(|value| u64::try_from(value).ok()),
+            config
+                .tx
+                .computeUnitLimit
+                .and_then(|value| u64::try_from(value).ok())
+                .or_else(|| Some(configured_default_launch_compute_unit_limit())),
             u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
                 .unwrap_or_default(),
             tip_lamports,
@@ -886,7 +938,7 @@ pub async fn compile_follow_buy_transaction(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_sniper_buy_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?,
             jito_tip_account,
@@ -942,7 +994,7 @@ pub async fn compile_follow_sell_transaction(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.sellSlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_dev_auto_sell_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
             parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?,
             jito_tip_account,
@@ -990,4 +1042,43 @@ pub async fn poll_bags_market_cap_lamports(
         .parse::<u64>()
         .map_err(|error| format!("Invalid Bags market cap response: {error}"))?;
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn bags_setup_tip_percentile_follows_shared_auto_fee_setting() {
+        let _guard = env_lock().lock().expect("lock env");
+        unsafe {
+            std::env::set_var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE", "p95");
+        }
+        assert_eq!(bags_setup_jito_tip_percentile(), "p95");
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE");
+        }
+    }
+
+    #[test]
+    fn bags_setup_tip_percentile_defaults_to_shared_p99() {
+        let _guard = env_lock().lock().expect("lock env");
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE");
+        }
+        assert_eq!(bags_setup_jito_tip_percentile(), "p99");
+    }
+
+    #[test]
+    fn slippage_percent_maps_to_expected_bps() {
+        assert_eq!(slippage_bps_from_percent("20").expect("20%"), 2_000);
+        assert_eq!(slippage_bps_from_percent("0.5").expect("0.5%"), 50);
+        assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
+    }
 }

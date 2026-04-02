@@ -283,6 +283,13 @@ fn report_summary_cache() -> &'static Mutex<Option<ReportSummaryCache>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
+pub(crate) fn clear_report_summary_cache() {
+    if let Ok(mut guard) = report_summary_cache().lock() {
+        *guard = None;
+    }
+}
+
 fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> String {
     let report = payload.get("report").cloned().unwrap_or(Value::Null);
     if let Ok(parsed) = serde_json::from_value::<LaunchReport>(report.clone()) {
@@ -632,5 +639,46 @@ mod tests {
         assert_eq!(summary.followConfirmedCount, 1);
         assert_eq!(summary.followRunningCount, 1);
         assert_eq!(summary.followProblemCount, 1);
+    }
+
+    #[test]
+    fn record_persisted_report_payload_updates_cached_lists() {
+        let _guard = env_lock().lock().expect("lock env");
+        clear_report_summary_cache();
+
+        let initial_payload = serde_json::json!({
+            "writtenAtMs": 100,
+            "action": "send",
+            "traceId": "trace-1",
+            "mint": "mint-1",
+            "report": {
+                "execution": {
+                    "provider": "helius-sender",
+                    "transportType": "helius-sender"
+                }
+            },
+            "signatures": ["sig-1"]
+        });
+        record_persisted_report_payload("cached-report.json", &initial_payload);
+
+        let updated_payload = serde_json::json!({
+            "writtenAtMs": 200,
+            "action": "send",
+            "traceId": "trace-1",
+            "mint": "mint-2",
+            "report": {
+                "execution": {
+                    "provider": "standard-rpc",
+                    "transportType": "standard-rpc"
+                }
+            },
+            "signatures": ["sig-2"]
+        });
+        record_persisted_report_payload("cached-report.json", &updated_payload);
+
+        let newest = list_persisted_reports("newest");
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].mint, "mint-2");
+        assert_eq!(newest[0].provider, "standard-rpc");
     }
 }

@@ -444,6 +444,65 @@ pub async fn fetch_account_data(
     BASE64.decode(data).map_err(|error| error.to_string())
 }
 
+pub async fn fetch_multiple_account_data(
+    rpc_url: &str,
+    accounts: &[String],
+    commitment: &str,
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    if accounts.is_empty() {
+        return Ok(vec![]);
+    }
+    let result = rpc_request(
+        rpc_url,
+        "getMultipleAccounts",
+        json!([
+            accounts,
+            {
+                "encoding": "base64",
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    let values = result
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "RPC getMultipleAccounts did not return a value array.".to_string())?;
+    if values.len() != accounts.len() {
+        return Err(format!(
+            "RPC getMultipleAccounts returned {} entries for {} requested accounts.",
+            values.len(),
+            accounts.len()
+        ));
+    }
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let data = value
+                .get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "RPC getMultipleAccounts returned invalid base64 data for {}.",
+                        accounts[index]
+                    )
+                })?;
+            use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+            BASE64
+                .decode(data)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
 pub async fn fetch_account_exists(
     rpc_url: &str,
     account: &str,
@@ -457,11 +516,57 @@ pub async fn fetch_account_exists(
             {
                 "encoding": "base64",
                 "commitment": commitment,
+                "dataSlice": {
+                    "offset": 0,
+                    "length": 0
+                }
             }
         ]),
     )
     .await?;
     Ok(result.get("value").is_some_and(|value| !value.is_null()))
+}
+
+pub async fn fetch_multiple_account_exists(
+    rpc_url: &str,
+    accounts: &[String],
+    commitment: &str,
+) -> Result<Vec<bool>, String> {
+    if accounts.is_empty() {
+        return Ok(vec![]);
+    }
+    let result = rpc_request(
+        rpc_url,
+        "getMultipleAccounts",
+        json!([
+            accounts,
+            {
+                "encoding": "base64",
+                "commitment": commitment,
+                "dataSlice": {
+                    "offset": 0,
+                    "length": 0
+                }
+            }
+        ]),
+    )
+    .await?;
+    let values = result
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "RPC getMultipleAccounts did not return a value array.".to_string())?;
+    if values.len() != accounts.len() {
+        return Err(format!(
+            "RPC getMultipleAccounts returned {} entries for {} requested accounts.",
+            values.len(),
+            accounts.len()
+        ));
+    }
+    Ok(values
+        .into_iter()
+        .map(|value| !value.is_null())
+        .collect::<Vec<_>>())
 }
 
 pub async fn fetch_current_block_height(rpc_url: &str, commitment: &str) -> Result<u64, String> {
@@ -797,6 +902,230 @@ async fn wait_for_confirmation_websocket(
         })?
 }
 
+async fn wait_for_confirmations_polling_batch(
+    rpc_url: &str,
+    signatures: &[(usize, String)],
+    commitment: &str,
+    max_attempts: u32,
+    poll_interval_ms: u64,
+) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
+    let mut pending = signatures.to_vec();
+    let mut completed = Vec::with_capacity(signatures.len());
+    let mut first_observed_status: HashMap<usize, String> = HashMap::new();
+    let mut first_observed_slot: HashMap<usize, u64> = HashMap::new();
+    let mut first_observed_at_ms: HashMap<usize, u128> = HashMap::new();
+
+    for attempt in 0..max_attempts {
+        if pending.is_empty() {
+            return Ok(completed);
+        }
+        let search_transaction_history = attempt + 1 >= std::cmp::max(2, max_attempts / 2);
+        let signature_batch = pending
+            .iter()
+            .map(|(_, signature)| Value::String(signature.clone()))
+            .collect::<Vec<_>>();
+        let result = rpc_request(
+            rpc_url,
+            "getSignatureStatuses",
+            json!([
+                signature_batch,
+                { "searchTransactionHistory": search_transaction_history }
+            ]),
+        )
+        .await?;
+        let values = result
+            .get("value")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut next_pending = Vec::new();
+
+        for (position, (index, signature)) in pending.into_iter().enumerate() {
+            let status = values.get(position).cloned().unwrap_or(Value::Null);
+            if status.is_null() {
+                next_pending.push((index, signature));
+                continue;
+            }
+            let actual_commitment = status
+                .get("confirmationStatus")
+                .and_then(Value::as_str)
+                .unwrap_or("processed");
+            first_observed_status
+                .entry(index)
+                .or_insert_with(|| actual_commitment.to_string());
+            if let Some(slot) = status.get("slot").and_then(Value::as_u64) {
+                first_observed_slot.entry(index).or_insert(slot);
+            }
+            first_observed_at_ms
+                .entry(index)
+                .or_insert_with(current_time_ms);
+            if status.get("err").is_some() && !status.get("err").unwrap_or(&Value::Null).is_null() {
+                return Err(format!(
+                    "Transaction {} failed on-chain: {}",
+                    signature,
+                    status.get("err").cloned().unwrap_or(Value::Null)
+                ));
+            }
+            if commitment_satisfied(actual_commitment, commitment) {
+                completed.push((
+                    index,
+                    ConfirmationDetails {
+                        status,
+                        confirmed_observed_block_height: None,
+                        confirmed_slot: first_observed_slot.get(&index).copied(),
+                        confirmation_source: "rpc-polling-batch",
+                        first_observed_status: first_observed_status.get(&index).cloned(),
+                        first_observed_slot: first_observed_slot.get(&index).copied(),
+                        first_observed_at_ms: first_observed_at_ms.get(&index).copied(),
+                        confirmed_at_ms: Some(current_time_ms()),
+                    },
+                ));
+            } else {
+                next_pending.push((index, signature));
+            }
+        }
+
+        pending = next_pending;
+        if pending.is_empty() {
+            return Ok(completed);
+        }
+        sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+
+    Err(format!(
+        "Timed out waiting for transactions {} to reach {}.",
+        pending
+            .iter()
+            .map(|(_, signature)| signature.clone())
+            .collect::<Vec<_>>()
+            .join(", "),
+        commitment
+    ))
+}
+
+async fn subscribe_signature_batch(
+    ws: &mut WsStream,
+    signatures: &[(usize, String)],
+    commitment: &str,
+) -> Result<HashMap<u64, usize>, String> {
+    let mut subscription_map = HashMap::new();
+    for (request_offset, (index, signature)) in signatures.iter().enumerate() {
+        let request_id = request_offset as u64 + 1;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "signatureSubscribe",
+                "params": [
+                    signature,
+                    {
+                        "commitment": commitment
+                    }
+                ],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        loop {
+            let payload = next_json_message(ws).await?;
+            if payload.get("id").and_then(Value::as_u64) == Some(request_id) {
+                if payload.get("error").is_some() {
+                    return Err(format!("Subscription failed: {payload}"));
+                }
+                let subscription_id = payload
+                    .get("result")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("Subscription ack missing id: {payload}"))?;
+                subscription_map.insert(subscription_id, *index);
+                break;
+            }
+        }
+    }
+    Ok(subscription_map)
+}
+
+async fn wait_for_confirmations_websocket_batch(
+    endpoint: &str,
+    rpc_url: &str,
+    signatures: &[(usize, String)],
+    commitment: &str,
+    track_confirmed_block_height: bool,
+) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
+    let session = async {
+        let mut ws = open_subscription_socket(endpoint).await?;
+        let subscription_map = subscribe_signature_batch(&mut ws, signatures, commitment).await?;
+        let mut pending = signatures
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<HashSet<_>>();
+        let mut confirmations = Vec::with_capacity(signatures.len());
+        while !pending.is_empty() {
+            let message = next_json_message(&mut ws).await?;
+            let Some(params) = message.get("params") else {
+                continue;
+            };
+            let Some(subscription_id) = params.get("subscription").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(index) = subscription_map.get(&subscription_id).copied() else {
+                continue;
+            };
+            if !pending.remove(&index) {
+                continue;
+            }
+            let context_slot = params
+                .get("result")
+                .and_then(|result| result.get("context"))
+                .and_then(|context| context.get("slot"))
+                .and_then(Value::as_u64);
+            let value = params
+                .get("result")
+                .and_then(|result| result.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let err = value.get("err").cloned().unwrap_or(Value::Null);
+            if !err.is_null() {
+                return Err(format!("Launch signature notification reported error: {err}"));
+            }
+            let confirmed_observed_block_height = if track_confirmed_block_height {
+                fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let observed_at_ms = current_time_ms();
+            confirmations.push((
+                index,
+                ConfirmationDetails {
+                    status: json!({
+                        "confirmationStatus": commitment,
+                        "slot": context_slot,
+                    }),
+                    confirmed_observed_block_height,
+                    confirmed_slot: context_slot,
+                    confirmation_source: "websocket",
+                    first_observed_status: Some(commitment.to_string()),
+                    first_observed_slot: context_slot,
+                    first_observed_at_ms: Some(observed_at_ms),
+                    confirmed_at_ms: Some(observed_at_ms),
+                },
+            ));
+        }
+        Ok(confirmations)
+    };
+    timeout(Duration::from_secs(35), session)
+        .await
+        .map_err(|_| {
+            format!(
+                "Timed out waiting for websocket confirmation for {} transaction(s).",
+                signatures.len()
+            )
+        })?
+}
+
 fn transport_watch_endpoint(transport_plan: &TransportPlan) -> Option<&str> {
     transport_plan
         .watchEndpoint
@@ -814,69 +1143,59 @@ pub async fn confirm_transactions_with_websocket_fallback(
     poll_interval_ms: u64,
 ) -> Result<(Vec<String>, u128), String> {
     let confirm_started = std::time::Instant::now();
-    let jobs = submitted
+    let signatures = submitted
         .iter()
         .enumerate()
         .map(|(index, result)| {
-            let label = result.label.clone();
-            let signature = result.signature.clone().ok_or_else(|| {
-                format!(
-                    "Submitted transaction {} is missing a signature.",
-                    result.label
-                )
-            });
-            async move {
-                let signature = signature?;
-                let mut warnings = Vec::new();
-                let confirmation = if let Some(endpoint) = watch_endpoint {
-                    match wait_for_confirmation_websocket(
-                        endpoint,
-                        rpc_url,
-                        &signature,
-                        commitment,
-                        false,
+            result
+                .signature
+                .clone()
+                .map(|signature| (index, signature))
+                .ok_or_else(|| {
+                    format!(
+                        "Submitted transaction {} is missing a signature.",
+                        result.label
                     )
-                    .await
-                    {
-                        Ok(confirmation) => confirmation,
-                        Err(error) => {
-                            warnings.push(format!(
-                                "Websocket confirmation failed for {}: {}. Falling back to RPC polling.",
-                                label, error
-                            ));
-                            wait_for_confirmation_polling(
-                                rpc_url,
-                                &signature,
-                                commitment,
-                                poll_max_attempts,
-                                poll_interval_ms,
-                                false,
-                            )
-                            .await?
-                        }
-                    }
-                } else {
-                    wait_for_confirmation_polling(
-                        rpc_url,
-                        &signature,
-                        commitment,
-                        poll_max_attempts,
-                        poll_interval_ms,
-                        false,
-                    )
-                    .await?
-                };
-                Ok::<(usize, ConfirmationDetails, Vec<String>), String>((index, confirmation, warnings))
-            }
+                })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let mut warnings = Vec::new();
-    let mut confirmations = Vec::with_capacity(submitted.len());
-    for result in join_all(jobs).await {
-        let (index, confirmation, entry_warnings) = result?;
-        warnings.extend(entry_warnings);
-        confirmations.push((index, confirmation));
-    }
+    let confirmations = if let Some(endpoint) = watch_endpoint {
+        match wait_for_confirmations_websocket_batch(
+            endpoint,
+            rpc_url,
+            &signatures,
+            commitment,
+            false,
+        )
+        .await
+        {
+            Ok(confirmations) => confirmations,
+            Err(error) => {
+                warnings.push(format!(
+                    "Websocket batch confirmation failed: {}. Falling back to batched RPC polling.",
+                    error
+                ));
+                wait_for_confirmations_polling_batch(
+                    rpc_url,
+                    &signatures,
+                    commitment,
+                    poll_max_attempts,
+                    poll_interval_ms,
+                )
+                .await?
+            }
+        }
+    } else {
+        wait_for_confirmations_polling_batch(
+            rpc_url,
+            &signatures,
+            commitment,
+            poll_max_attempts,
+            poll_interval_ms,
+        )
+        .await?
+    };
     let confirmed_observed_block_height = if track_send_block_height {
         fetch_sampled_block_height_snapshot(rpc_url, commitment)
             .await
@@ -1056,6 +1375,193 @@ pub async fn submit_transactions_parallel(
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
     Ok((results, vec![], submit_started.elapsed().as_millis()))
+}
+
+fn standard_rpc_submit_endpoints(primary_rpc_url: &str, extra_endpoints: &[String]) -> Vec<String> {
+    let mut endpoints = vec![primary_rpc_url.to_string()];
+    for endpoint in extra_endpoints {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() || endpoints.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        endpoints.push(trimmed.to_string());
+    }
+    endpoints
+}
+
+async fn submit_single_transaction_standard_rpc_fanout(
+    endpoints: &[String],
+    transaction: &CompiledTransaction,
+    commitment: &str,
+    skip_preflight: bool,
+    max_retries: u32,
+) -> Result<(SentResult, Vec<String>), String> {
+    if endpoints.is_empty() {
+        return Err(format!(
+            "Standard RPC submission failed for transaction {} because no endpoints were configured.",
+            transaction.label
+        ));
+    }
+    let mut endpoint_results = endpoints
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let serialized = transaction.serializedBase64.clone();
+            let commitment = commitment.to_string();
+            async move {
+                (
+                    endpoint.clone(),
+                    rpc_request(
+                        &endpoint,
+                        "sendTransaction",
+                        json!([
+                            serialized,
+                            {
+                                "encoding": "base64",
+                                "skipPreflight": skip_preflight,
+                                "preflightCommitment": commitment,
+                                "maxRetries": max_retries,
+                            }
+                        ]),
+                    )
+                    .await,
+                )
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut first_successful_endpoint = None;
+    let mut successful_endpoints = Vec::new();
+    let mut returned_signatures = Vec::new();
+    let mut errors = Vec::new();
+    while let Some((endpoint, result)) = endpoint_results.next().await {
+        match result {
+            Ok(value) => {
+                if first_successful_endpoint.is_none() {
+                    first_successful_endpoint = Some(endpoint.clone());
+                }
+                if let Some(signature) = value.as_str() {
+                    returned_signatures.push(signature.to_string());
+                }
+                successful_endpoints.push(endpoint);
+            }
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if successful_endpoints.is_empty() {
+        return Err(format!(
+            "Standard RPC fanout failed for transaction {} on all attempted endpoints: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !errors.is_empty() {
+        warnings.push(format!(
+            "Standard RPC fanout had partial failures for {}: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let signature = transaction
+        .signature
+        .clone()
+        .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+        .or_else(|| returned_signatures.first().cloned())
+        .ok_or_else(|| {
+            format!(
+                "Standard RPC fanout did not return a signature for {}.",
+                transaction.label
+            )
+        })?;
+    Ok((
+        SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: Some(signature.clone()),
+            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "standard-rpc-fanout".to_string(),
+            endpoint: first_successful_endpoint,
+            attemptedEndpoints: endpoints.to_vec(),
+            skipPreflight: skip_preflight,
+            maxRetries: max_retries,
+            confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: Some(current_time_ms()),
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
+        },
+        warnings,
+    ))
+}
+
+pub async fn submit_transactions_standard_rpc_fanout(
+    primary_rpc_url: &str,
+    extra_endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    max_retries: u32,
+    track_send_block_height: bool,
+    parallelize_transactions: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    let endpoints = standard_rpc_submit_endpoints(primary_rpc_url, extra_endpoints);
+    let submit_started = std::time::Instant::now();
+    let mut warnings = Vec::new();
+    let mut results = if parallelize_transactions {
+        let entries = join_all(transactions.iter().map(|transaction| {
+            submit_single_transaction_standard_rpc_fanout(
+                &endpoints,
+                transaction,
+                commitment,
+                skip_preflight,
+                max_retries,
+            )
+        }))
+        .await;
+        let mut sent = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (result, entry_warnings) = entry?;
+            sent.push(result);
+            warnings.extend(entry_warnings);
+        }
+        sent
+    } else {
+        let mut sent = Vec::with_capacity(transactions.len());
+        for transaction in transactions {
+            let (result, entry_warnings) = submit_single_transaction_standard_rpc_fanout(
+                &endpoints,
+                transaction,
+                commitment,
+                skip_preflight,
+                max_retries,
+            )
+            .await?;
+            sent.push(result);
+            warnings.extend(entry_warnings);
+        }
+        sent
+    };
+    if track_send_block_height {
+        let send_observed_block_height =
+            fetch_sampled_block_height_snapshot(primary_rpc_url, commitment)
+                .await
+                .ok();
+        for result in &mut results {
+            result.sendObservedBlockHeight = send_observed_block_height;
+        }
+    }
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
 }
 
 pub async fn confirm_transactions_sequential(
@@ -1727,6 +2233,12 @@ async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Val
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
 }
 
+pub async fn prewarm_jito_bundle_endpoint(endpoint: &JitoBundleEndpoint) -> Result<(), String> {
+    jito_request(&endpoint.status, "getTipAccounts", json!([]))
+        .await
+        .map(|_| ())
+}
+
 pub async fn send_transactions_bundle(
     rpc_url: &str,
     endpoints: &[JitoBundleEndpoint],
@@ -1810,14 +2322,37 @@ pub async fn send_transactions_for_transport(
             ))
         }
         _ => {
-            send_transactions_sequential(
+            let (mut results, warnings, submit_ms) = submit_transactions_standard_rpc_fanout(
                 rpc_url,
+                &transport_plan.standardRpcSubmitEndpoints,
                 transactions,
                 commitment,
-                skip_preflight,
+                transport_plan.skipPreflight || skip_preflight,
+                transport_plan.maxRetries,
                 track_send_block_height,
+                false,
             )
-            .await
+            .await?;
+            let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                &mut results,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await?;
+            let mut combined_warnings = warnings;
+            combined_warnings.extend(confirm_warnings);
+            Ok((
+                results,
+                combined_warnings,
+                SendTimingBreakdown {
+                    submit_ms,
+                    confirm_ms,
+                },
+            ))
         }
     }
 }
@@ -1852,12 +2387,15 @@ pub async fn submit_transactions_for_transport(
             .await
         }
         _ => {
-            submit_transactions_sequential(
+            submit_transactions_standard_rpc_fanout(
                 rpc_url,
+                &transport_plan.standardRpcSubmitEndpoints,
                 transactions,
                 commitment,
-                skip_preflight,
+                transport_plan.skipPreflight || skip_preflight,
+                transport_plan.maxRetries,
                 track_send_block_height,
+                false,
             )
             .await
         }
@@ -1894,12 +2432,15 @@ pub async fn submit_independent_transactions_for_transport(
             .await
         }
         _ => {
-            submit_transactions_parallel(
+            submit_transactions_standard_rpc_fanout(
                 rpc_url,
+                &transport_plan.standardRpcSubmitEndpoints,
                 transactions,
                 commitment,
-                skip_preflight,
+                transport_plan.skipPreflight || skip_preflight,
+                transport_plan.maxRetries,
                 track_send_block_height,
+                true,
             )
             .await
         }

@@ -3,6 +3,7 @@ mod bonk_native;
 mod config;
 mod follow;
 mod fs_utils;
+mod helper_worker;
 mod image_library;
 mod launchpad_dispatch;
 mod launchpads;
@@ -30,6 +31,7 @@ use crate::{
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
         FollowJobResponse, FollowReserveRequest, FollowStopAllRequest, build_action_records,
+        should_use_post_setup_creator_vault_for_buy,
         should_use_post_setup_creator_vault_for_sell,
     },
     fs_utils::atomic_write,
@@ -62,9 +64,9 @@ use crate::{
         confirm_transactions_with_websocket_fallback, configured_warm_rpc_url,
         fetch_current_block_height,
         send_transactions_bundle,
-        simulate_transactions, spawn_blockhash_refresh_task, prewarm_rpc_endpoint,
-        submit_independent_transactions_for_transport, submit_transactions_for_transport,
-        submit_transactions_sequential,
+        simulate_transactions, spawn_blockhash_refresh_task, prewarm_jito_bundle_endpoint,
+        prewarm_rpc_endpoint, submit_independent_transactions_for_transport,
+        submit_transactions_for_transport, submit_transactions_sequential,
     },
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
@@ -74,7 +76,8 @@ use crate::{
     transport::{
         build_transport_plan, configured_helius_sender_endpoint,
         configured_helius_sender_endpoints_for_profile, configured_jito_bundle_endpoints,
-        configured_provider_region, configured_shared_region, default_endpoint_profile,
+        configured_provider_region, configured_shared_region,
+        configured_standard_rpc_submit_endpoints, default_endpoint_profile,
         default_endpoint_profile_for_provider, estimate_transaction_count,
         helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
     },
@@ -111,6 +114,47 @@ use std::{
 struct AppState {
     auth_token: Option<String>,
     runtime: Arc<RuntimeRegistry>,
+    warm: Arc<Mutex<WarmControlState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WarmControlState {
+    last_activity_at_ms: u128,
+    last_resume_at_ms: Option<u128>,
+    last_suspend_at_ms: Option<u128>,
+    last_warm_attempt_at_ms: Option<u128>,
+    last_warm_success_at_ms: Option<u128>,
+    current_reason: String,
+    last_error: Option<String>,
+    selected_providers: Vec<String>,
+    browser_active: bool,
+    continuous_active: bool,
+    in_flight_requests: usize,
+    warm_pass_in_flight: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct WarmActivityRequest {
+    #[serde(default)]
+    #[serde(rename = "creationProvider")]
+    creation_provider: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "buyProvider")]
+    buy_provider: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "sellProvider")]
+    sell_provider: Option<String>,
+}
+
+struct WarmInFlightGuard {
+    warm: Arc<Mutex<WarmControlState>>,
+}
+
+impl Drop for WarmInFlightGuard {
+    fn drop(&mut self) {
+        let mut warm = self.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        warm.in_flight_requests = warm.in_flight_requests.saturating_sub(1);
+    }
 }
 
 #[derive(Serialize)]
@@ -356,14 +400,311 @@ fn configured_rpc_url() -> String {
 }
 
 fn configured_startup_warm_enabled() -> bool {
-    !matches!(
-        std::env::var("LAUNCHDECK_DISABLE_STARTUP_WARM")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
+    if let Ok(value) = std::env::var("LAUNCHDECK_ENABLE_STARTUP_WARM") {
+        return parse_env_bool_flag(&value, true);
+    }
+    !parse_env_bool_flag(
+        &std::env::var("LAUNCHDECK_DISABLE_STARTUP_WARM").unwrap_or_default(),
+        false,
     )
+}
+
+fn parse_env_bool_flag(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => default,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn configured_continuous_warm_enabled() -> bool {
+    parse_env_bool_flag(
+        &std::env::var("LAUNCHDECK_ENABLE_CONTINUOUS_WARM").unwrap_or_default(),
+        true,
+    )
+}
+
+fn configured_idle_warm_suspend_enabled() -> bool {
+    parse_env_bool_flag(
+        &std::env::var("LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND").unwrap_or_default(),
+        true,
+    )
+}
+
+fn configured_continuous_warm_interval_ms() -> u64 {
+    std::env::var("LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 1_000)
+        .unwrap_or(10_000)
+}
+
+fn configured_idle_warm_timeout_ms() -> u64 {
+    std::env::var("LAUNCHDECK_IDLE_WARM_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 1_000)
+        .unwrap_or(30_000)
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
+    let normalized = candidate.trim().to_ascii_lowercase();
+    if normalized.is_empty() || values.iter().any(|value| value == &normalized) {
+        return;
+    }
+    values.push(normalized);
+}
+
+fn normalize_warm_provider(provider: &str) -> Option<String> {
+    let normalized = provider.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "helius-sender" | "standard-rpc" | "jito-bundle" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn configured_active_warm_providers() -> Vec<String> {
+    let config = read_persistent_config();
+    let active_preset_id = config
+        .get("defaults")
+        .and_then(|value| value.get("activePresetId"))
+        .and_then(Value::as_str)
+        .unwrap_or("preset1");
+    let preset = config
+        .get("presets")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(active_preset_id))
+                .or_else(|| items.first())
+        });
+    let mut providers = Vec::new();
+    for key in ["creationSettings", "buySettings", "sellSettings"] {
+        if let Some(provider) = preset
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.get("provider"))
+            .and_then(Value::as_str)
+            .and_then(normalize_warm_provider)
+        {
+            push_unique_string(&mut providers, &provider);
+        }
+    }
+    if providers.is_empty() {
+        providers.push("helius-sender".to_string());
+    }
+    providers
+}
+
+fn merged_warm_providers(selected: &[String]) -> Vec<String> {
+    let mut providers = configured_active_warm_providers();
+    for provider in selected {
+        push_unique_string(&mut providers, provider);
+    }
+    providers
+}
+
+fn activity_providers(payload: &WarmActivityRequest) -> Vec<String> {
+    let mut providers = Vec::new();
+    for value in [
+        payload.creation_provider.as_deref(),
+        payload.buy_provider.as_deref(),
+        payload.sell_provider.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(provider) = normalize_warm_provider(value) {
+            push_unique_string(&mut providers, &provider);
+        }
+    }
+    providers
+}
+
+fn mark_operator_activity(state: &Arc<AppState>, providers: Vec<String>) -> bool {
+    let now = current_time_ms();
+    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_trigger_immediate_rewarm = !warm_gate_state(&warm, now, 0).0;
+    warm.last_activity_at_ms = now;
+    warm.browser_active = true;
+    if should_trigger_immediate_rewarm {
+        warm.last_resume_at_ms = Some(now);
+        warm.last_suspend_at_ms = None;
+        warm.continuous_active = true;
+    }
+    warm.current_reason = "active-operator-activity".to_string();
+    if !providers.is_empty() {
+        warm.selected_providers = providers;
+    }
+    should_trigger_immediate_rewarm
+}
+
+fn mark_in_flight_engine_request(state: &Arc<AppState>) -> WarmInFlightGuard {
+    let now = current_time_ms();
+    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    warm.in_flight_requests = warm.in_flight_requests.saturating_add(1);
+    warm.last_activity_at_ms = now;
+    warm.browser_active = true;
+    WarmInFlightGuard {
+        warm: state.warm.clone(),
+    }
+}
+
+fn warm_gate_state(
+    warm: &WarmControlState,
+    now_ms: u128,
+    follow_active_jobs: u64,
+) -> (bool, bool, String) {
+    if !configured_continuous_warm_enabled() {
+        return (false, false, "disabled-by-env".to_string());
+    }
+    if warm.in_flight_requests > 0 {
+        return (true, true, "active-in-flight-request".to_string());
+    }
+    if follow_active_jobs > 0 {
+        return (true, true, "active-follow-jobs".to_string());
+    }
+    if !configured_idle_warm_suspend_enabled() {
+        return (true, warm.last_activity_at_ms > 0, "active-continuous-warm".to_string());
+    }
+    if warm.last_activity_at_ms == 0 {
+        return (false, false, "idle-awaiting-browser-activity".to_string());
+    }
+    let idle_timeout_ms = u128::from(configured_idle_warm_timeout_ms());
+    let idle_for_ms = now_ms.saturating_sub(warm.last_activity_at_ms);
+    if idle_for_ms <= idle_timeout_ms {
+        return (true, true, "active-operator-activity".to_string());
+    }
+    (false, false, "suspended-idle".to_string())
+}
+
+fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
+    let now_ms = current_time_ms();
+    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (active, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
+    let selected_providers = merged_warm_providers(&warm.selected_providers);
+    json!({
+        "startupEnabled": configured_startup_warm_enabled(),
+        "continuousEnabled": configured_continuous_warm_enabled(),
+        "idleSuspendEnabled": configured_idle_warm_suspend_enabled(),
+        "intervalMs": configured_continuous_warm_interval_ms(),
+        "idleTimeoutMs": configured_idle_warm_timeout_ms(),
+        "active": active,
+        "suspended": configured_continuous_warm_enabled() && !active,
+        "browserActive": browser_active,
+        "reason": reason,
+        "selectedProviders": selected_providers,
+        "inFlightRequests": warm.in_flight_requests,
+        "followActiveJobs": follow_active_jobs,
+        "lastActivityAtMs": if warm.last_activity_at_ms > 0 { Some(warm.last_activity_at_ms as u64) } else { None },
+        "idleForMs": if warm.last_activity_at_ms > 0 { Some(now_ms.saturating_sub(warm.last_activity_at_ms) as u64) } else { None },
+        "lastResumeAtMs": warm.last_resume_at_ms.map(|value| value as u64),
+        "lastSuspendAtMs": warm.last_suspend_at_ms.map(|value| value as u64),
+        "lastWarmAttemptAtMs": warm.last_warm_attempt_at_ms.map(|value| value as u64),
+        "lastWarmSuccessAtMs": warm.last_warm_success_at_ms.map(|value| value as u64),
+        "lastError": warm.last_error.clone(),
+    })
+}
+
+async fn follow_active_jobs_count() -> u64 {
+    let payload = follow_daemon_status_payload().await;
+    payload
+        .get("health")
+        .and_then(|value| value.get("activeJobs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
+    let follow_active_jobs = follow_active_jobs_count().await;
+    let providers = {
+        let now_ms = current_time_ms();
+        let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let providers = merged_warm_providers(&warm.selected_providers);
+        let (should_warm, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
+        if should_warm != warm.continuous_active {
+            if should_warm {
+                warm.last_resume_at_ms = Some(now_ms);
+            } else {
+                warm.last_suspend_at_ms = Some(now_ms);
+            }
+        }
+        warm.browser_active = browser_active;
+        warm.continuous_active = should_warm;
+        warm.current_reason = reason;
+        if !should_warm {
+            return;
+        }
+        if warm.warm_pass_in_flight {
+            return;
+        }
+        warm.warm_pass_in_flight = true;
+        warm.last_warm_attempt_at_ms = Some(now_ms);
+        providers
+    };
+
+    let main_rpc_url = configured_rpc_url();
+    let warm_rpc_url = configured_warm_rpc_url(&main_rpc_url);
+    let mut success_count = 0usize;
+    let mut errors = Vec::new();
+
+    match prewarm_rpc_endpoint(&warm_rpc_url).await {
+        Ok(()) => success_count += 1,
+        Err(error) => errors.push(format!("warm-rpc: {error}")),
+    }
+    match fetch_fee_market_snapshot(&main_rpc_url).await {
+        Ok(_) => success_count += 1,
+        Err(error) => errors.push(format!("fee-market: {error}")),
+    }
+    if providers.iter().any(|provider| provider == "standard-rpc") {
+        let mut endpoints = configured_standard_rpc_submit_endpoints();
+        endpoints.push(main_rpc_url.clone());
+        for endpoint in endpoints {
+            match prewarm_rpc_endpoint(&endpoint).await {
+                Ok(()) => success_count += 1,
+                Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
+            }
+        }
+    }
+    if providers.iter().any(|provider| provider == "helius-sender") {
+        for endpoint in configured_helius_sender_endpoints_for_profile(
+            &default_endpoint_profile_for_provider("helius-sender"),
+        ) {
+            match prewarm_rpc_endpoint(&endpoint).await {
+                Ok(()) => success_count += 1,
+                Err(error) => errors.push(format!("helius-sender {}: {}", endpoint, error)),
+            }
+        }
+    }
+    if providers.iter().any(|provider| provider == "jito-bundle") {
+        for endpoint in configured_jito_bundle_endpoints() {
+            match prewarm_jito_bundle_endpoint(&endpoint).await {
+                Ok(()) => success_count += 1,
+                Err(error) => errors.push(format!("jito-bundle {}: {}", endpoint.name, error)),
+            }
+        }
+    }
+
+    let now_ms = current_time_ms();
+    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    warm.warm_pass_in_flight = false;
+    if success_count > 0 {
+        warm.last_warm_success_at_ms = Some(now_ms);
+        warm.last_error = None;
+    } else if !errors.is_empty() {
+        warm.last_error = Some(errors.join(" | "));
+    }
+}
+
+fn spawn_continuous_warm_task(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            execute_continuous_warm_pass(&state).await;
+            tokio::time::sleep(Duration::from_millis(configured_continuous_warm_interval_ms()))
+                .await;
+        }
+    });
 }
 
 fn configured_base_url() -> String {
@@ -582,7 +923,17 @@ fn append_execution_note(report: &mut Value, note: &str) {
     execution["notes"] = Value::Array(existing_notes);
 }
 
+fn set_execution_value(report: &mut Value, key: &str, value: Value) {
+    let Some(execution) = report.get_mut("execution") else {
+        return;
+    };
+    execution[key] = value;
+}
+
 fn set_report_timing(report: &mut Value, key: &str, value_ms: u128) {
+    if report_benchmark_mode(report) == BenchmarkMode::Off {
+        return;
+    }
     if let Some(execution) = report.get_mut("execution") {
         if execution.get("timings").is_none()
             || execution.get("timings").is_some_and(Value::is_null)
@@ -640,6 +991,13 @@ fn parse_follow_job_timings(report: &Value) -> Option<FollowJobTimings> {
 
 fn refresh_report_benchmark(report: &mut Value) {
     let mode = report_benchmark_mode(report);
+    if mode == BenchmarkMode::Off {
+        if let Some(execution) = report.get_mut("execution") {
+            execution["timings"] = Value::Null;
+        }
+        report["benchmark"] = Value::Null;
+        return;
+    }
     let timings = sanitize_execution_timings_for_mode(&parse_report_execution_timings(report), mode);
     if let Some(execution) = report.get_mut("execution") {
         execution["timings"] = serde_json::to_value(&timings).unwrap_or_else(|_| json!({}));
@@ -671,11 +1029,7 @@ fn refresh_report_benchmark(report: &mut Value) {
             })
         })
         .collect::<Vec<_>>();
-    let timing_groups = if mode == BenchmarkMode::Off {
-        Vec::new()
-    } else {
-        build_benchmark_timing_groups(&timings, parse_follow_job_timings(report).as_ref())
-    };
+    let timing_groups = build_benchmark_timing_groups(&timings, parse_follow_job_timings(report).as_ref());
     report["benchmark"] = json!({
         "mode": mode.as_str(),
         "timings": timings,
@@ -753,6 +1107,13 @@ fn has_same_time_snipes(follow_launch: &NormalizedFollowLaunch) -> bool {
         .snipes
         .iter()
         .any(|snipe| snipe.enabled && snipe.submitWithLaunch)
+}
+
+fn should_reserve_follow_job(
+    follow_launch: &NormalizedFollowLaunch,
+    deferred_setup_transactions: &[CompiledTransaction],
+) -> bool {
+    follow_launch.enabled || !deferred_setup_transactions.is_empty()
 }
 
 fn same_time_wallet_label(wallet_env_key: &str) -> String {
@@ -838,10 +1199,89 @@ const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
 const FEE_MARKET_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const FEE_MARKET_MAX_AGE: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 struct FeeMarketSnapshot {
     helius_priority_lamports: Option<u64>,
+    helius_launch_priority_lamports: Option<u64>,
+    helius_trade_priority_lamports: Option<u64>,
     jito_tip_p99_lamports: Option<u64>,
+}
+
+impl FeeMarketSnapshot {
+    fn launch_priority_lamports(&self) -> Option<u64> {
+        self.helius_launch_priority_lamports
+            .or(self.helius_priority_lamports)
+    }
+
+    fn trade_priority_lamports(&self) -> Option<u64> {
+        self.helius_trade_priority_lamports
+            .or(self.helius_priority_lamports)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoFeeActionReport {
+    enabled: bool,
+    provider: String,
+    prioritySource: String,
+    priorityEstimateLamports: Option<u64>,
+    resolvedPriorityLamports: Option<u64>,
+    tipSource: String,
+    tipEstimateLamports: Option<u64>,
+    resolvedTipLamports: Option<u64>,
+    capLamports: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoFeeReport {
+    snapshot: FeeMarketSnapshot,
+    creation: AutoFeeActionReport,
+    buy: AutoFeeActionReport,
+    sell: AutoFeeActionReport,
+}
+
+#[derive(Debug, Clone)]
+struct AutoFeeResolutionSummary {
+    notes: Vec<String>,
+    report: AutoFeeReport,
+}
+
+fn action_priority_estimate(snapshot: &FeeMarketSnapshot, action: &str) -> (Option<u64>, String) {
+    match action {
+        "creation" => {
+            if let Some(value) = snapshot.helius_launch_priority_lamports {
+                (Some(value), "launch-template".to_string())
+            } else if let Some(value) = snapshot.helius_priority_lamports {
+                (Some(value), "generic".to_string())
+            } else {
+                (None, "missing".to_string())
+            }
+        }
+        "buy" | "sell" => {
+            if let Some(value) = snapshot.helius_trade_priority_lamports {
+                (Some(value), "trade-template".to_string())
+            } else if let Some(value) = snapshot.helius_priority_lamports {
+                (Some(value), "generic".to_string())
+            } else {
+                (None, "missing".to_string())
+            }
+        }
+        _ => {
+            if let Some(value) = snapshot.helius_priority_lamports {
+                (Some(value), "generic".to_string())
+            } else {
+                (None, "missing".to_string())
+            }
+        }
+    }
+}
+
+fn action_tip_estimate(snapshot: &FeeMarketSnapshot) -> (Option<u64>, String) {
+    if let Some(value) = snapshot.jito_tip_p99_lamports {
+        (Some(value), "jito-p99".to_string())
+    } else {
+        (None, "missing".to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -978,11 +1418,30 @@ fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u
     }
 }
 
-async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let client = shared_fee_market_http_client();
-    let helius_options = if helius_priority_level == "recommended" {
+const FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS: [&str; 8] = [
+    "ComputeBudget111111111111111111111111111111",
+    "11111111111111111111111111111111",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+];
+
+const FEE_TEMPLATE_TRADE_ACCOUNT_KEYS: [&str; 8] = [
+    "ComputeBudget111111111111111111111111111111",
+    "11111111111111111111111111111111",
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "So11111111111111111111111111111111111111112",
+];
+
+fn helius_fee_estimate_options(helius_priority_level: &str) -> Value {
+    if helius_priority_level == "recommended" {
         json!({
             "recommended": true
         })
@@ -990,61 +1449,122 @@ async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapsh
         json!({
             "includeAllPriorityFeeLevels": true
         })
-    };
-    let helius_request = client
+    }
+}
+
+fn parse_helius_priority_estimate_result(result: &Value, helius_priority_level: &str) -> Option<u64> {
+    normalize_estimate_to_lamports(
+        match helius_priority_level {
+            "recommended" => result
+                .get("priorityFeeEstimate")
+                .or_else(|| result.get("recommended")),
+            selected_level => result
+                .get("priorityFeeLevels")
+                .and_then(|levels| levels.get(selected_level)),
+        }
+        .or_else(|| {
+            result
+                .get("priorityFeeLevels")
+                .and_then(|levels| levels.get("veryHigh"))
+        })
+        .or_else(|| {
+            result
+                .get("priorityFeeEstimate")
+                .or_else(|| result.get("recommended"))
+        })
+        .or_else(|| {
+            result
+                .get("priorityFeeLevels")
+                .and_then(|levels| levels.get("high"))
+        }),
+    )
+}
+
+async fn fetch_helius_priority_estimate(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    helius_priority_level: &str,
+    request_id: &str,
+    account_keys: Option<&[&str]>,
+) -> Result<Option<u64>, String> {
+    let mut params = json!({
+        "options": helius_fee_estimate_options(helius_priority_level)
+    });
+    if let Some(account_keys) = account_keys {
+        params["accountKeys"] = Value::Array(
+            account_keys
+                .iter()
+                .map(|value| Value::String((*value).to_string()))
+                .collect(),
+        );
+    }
+    let payload = client
         .post(rpc_url)
         .json(&json!({
             "jsonrpc": "2.0",
-            "id": "launchdeck-helius-priority-estimate",
+            "id": request_id,
             "method": "getPriorityFeeEstimate",
-            "params": [{
-                "options": helius_options
-            }]
+            "params": [params]
         }))
-        .send();
+        .send()
+        .await
+        .map_err(|error| format!("Helius priority estimate request failed: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Failed to decode Helius fee estimate: {error}"))?;
+    if let Some(error) = payload.get("error") {
+        return Err(format!("Helius priority estimate failed: {error}"));
+    }
+    let result = payload.get("result").unwrap_or(&payload);
+    Ok(parse_helius_priority_estimate_result(
+        result,
+        helius_priority_level,
+    ))
+}
+
+async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    let client = shared_fee_market_http_client();
+    let helius_generic_request = fetch_helius_priority_estimate(
+        &client,
+        rpc_url,
+        &helius_priority_level,
+        "launchdeck-helius-priority-estimate-generic",
+        None,
+    );
+    let helius_launch_request = fetch_helius_priority_estimate(
+        &client,
+        rpc_url,
+        &helius_priority_level,
+        "launchdeck-helius-priority-estimate-launch-template",
+        Some(&FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS),
+    );
+    let helius_trade_request = fetch_helius_priority_estimate(
+        &client,
+        rpc_url,
+        &helius_priority_level,
+        "launchdeck-helius-priority-estimate-trade-template",
+        Some(&FEE_TEMPLATE_TRADE_ACCOUNT_KEYS),
+    );
     let jito_request = client
         .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
         .send();
-    let (helius_response, jito_response) = tokio::join!(helius_request, jito_request);
+    let (
+        helius_generic_response,
+        helius_launch_response,
+        helius_trade_response,
+        jito_response,
+    ) = tokio::join!(
+        helius_generic_request,
+        helius_launch_request,
+        helius_trade_request,
+        jito_request
+    );
 
-    let helius_priority_lamports = match helius_response {
-        Ok(response) => {
-            let payload = response
-                .json::<Value>()
-                .await
-                .map_err(|error| format!("Failed to decode Helius fee estimate: {error}"))?;
-            if let Some(error) = payload.get("error") {
-                return Err(format!("Helius priority estimate failed: {error}"));
-            }
-            let result = payload.get("result").unwrap_or(&payload);
-            normalize_estimate_to_lamports(
-                match helius_priority_level.as_str() {
-                    "recommended" => result
-                        .get("priorityFeeEstimate")
-                        .or_else(|| result.get("recommended")),
-                    selected_level => result
-                        .get("priorityFeeLevels")
-                        .and_then(|levels| levels.get(selected_level)),
-                }
-                    .or_else(|| {
-                        result
-                            .get("priorityFeeLevels")
-                            .and_then(|levels| levels.get("veryHigh"))
-                    })
-                    .or_else(|| {
-                        result
-                            .get("priorityFeeEstimate")
-                            .or_else(|| result.get("recommended"))
-                    })
-                    .or_else(|| {
-                        result
-                            .get("priorityFeeLevels")
-                            .and_then(|levels| levels.get("high"))
-                    }),
-            )
-        }
-        Err(error) => return Err(format!("Helius priority estimate request failed: {error}")),
-    };
+    let helius_priority_lamports = helius_generic_response?;
+    let helius_launch_priority_lamports = helius_launch_response.unwrap_or(None);
+    let helius_trade_priority_lamports = helius_trade_response.unwrap_or(None);
 
     let jito_tip_p99_lamports = match jito_response {
         Ok(response) => {
@@ -1091,6 +1611,8 @@ async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapsh
 
     let snapshot = FeeMarketSnapshot {
         helius_priority_lamports,
+        helius_launch_priority_lamports,
+        helius_trade_priority_lamports,
         jito_tip_p99_lamports,
     };
     cache_fee_market_snapshot(
@@ -1126,15 +1648,57 @@ async fn resolve_auto_execution_fees(
     rpc_url: &str,
     normalized: &mut NormalizedConfig,
     transport_plan: &crate::transport::TransportPlan,
-) -> Result<Vec<String>, String> {
+) -> Result<AutoFeeResolutionSummary, String> {
     let needs_auto = normalized.execution.autoGas
         || normalized.execution.buyAutoGas
         || normalized.execution.sellAutoGas;
-    if !needs_auto {
-        return Ok(vec![]);
-    }
     let market = fetch_fee_market_snapshot(rpc_url).await?;
     let mut notes = Vec::new();
+    let mut creation_report = AutoFeeActionReport {
+        enabled: normalized.execution.autoGas,
+        provider: normalized.execution.provider.clone(),
+        prioritySource: "off".to_string(),
+        priorityEstimateLamports: None,
+        resolvedPriorityLamports: None,
+        tipSource: "off".to_string(),
+        tipEstimateLamports: None,
+        resolvedTipLamports: None,
+        capLamports: None,
+    };
+    let mut buy_report = AutoFeeActionReport {
+        enabled: normalized.execution.buyAutoGas,
+        provider: normalized.execution.buyProvider.clone(),
+        prioritySource: "off".to_string(),
+        priorityEstimateLamports: None,
+        resolvedPriorityLamports: None,
+        tipSource: "off".to_string(),
+        tipEstimateLamports: None,
+        resolvedTipLamports: None,
+        capLamports: None,
+    };
+    let mut sell_report = AutoFeeActionReport {
+        enabled: normalized.execution.sellAutoGas,
+        provider: normalized.execution.sellProvider.clone(),
+        prioritySource: "off".to_string(),
+        priorityEstimateLamports: None,
+        resolvedPriorityLamports: None,
+        tipSource: "off".to_string(),
+        tipEstimateLamports: None,
+        resolvedTipLamports: None,
+        capLamports: None,
+    };
+
+    if !needs_auto {
+        return Ok(AutoFeeResolutionSummary {
+            notes,
+            report: AutoFeeReport {
+                snapshot: market,
+                creation: creation_report,
+                buy: buy_report,
+                sell: sell_report,
+            },
+        });
+    }
 
     if normalized.execution.autoGas {
         let cap_lamports = parse_auto_fee_cap_lamports(
@@ -1145,6 +1709,7 @@ async fn resolve_auto_execution_fees(
             },
         );
         let provider = normalized.execution.provider.as_str();
+        creation_report.capLamports = cap_lamports;
         let uses_priority = match provider {
             "standard-rpc" => true,
             "helius-sender" => true,
@@ -1155,7 +1720,10 @@ async fn resolve_auto_execution_fees(
             || (provider == "jito-bundle");
 
         if uses_priority {
-            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+            let (estimated, source) = action_priority_estimate(&market, "creation");
+            creation_report.prioritySource = source;
+            creation_report.priorityEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Creation auto fee is enabled but no Helius priority estimate was returned."
                     .to_string()
             })?;
@@ -1163,13 +1731,17 @@ async fn resolve_auto_execution_fees(
             normalized.execution.priorityFeeSol = format_lamports_to_sol_decimal(resolved);
             normalized.tx.computeUnitPriceMicroLamports =
                 Some(lamports_to_priority_fee_micro_lamports(resolved) as i64);
+            creation_report.resolvedPriorityLamports = Some(resolved);
         } else {
             normalized.execution.priorityFeeSol.clear();
             normalized.tx.computeUnitPriceMicroLamports = Some(0);
         }
 
         if uses_tip {
-            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+            let (estimated, source) = action_tip_estimate(&market);
+            creation_report.tipSource = source;
+            creation_report.tipEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
@@ -1185,6 +1757,7 @@ async fn resolve_auto_execution_fees(
             normalized.execution.tipSol = format_lamports_to_sol_decimal(resolved);
             normalized.tx.jitoTipLamports = resolved as i64;
             normalized.tx.jitoTipAccount = pick_tip_account_for_provider(provider);
+            creation_report.resolvedTipLamports = Some(resolved);
         } else {
             normalized.execution.tipSol.clear();
             normalized.tx.jitoTipLamports = 0;
@@ -1218,21 +1791,29 @@ async fn resolve_auto_execution_fees(
             },
         );
         let provider = normalized.execution.buyProvider.as_str();
+        buy_report.capLamports = cap_lamports;
         let uses_priority = provider != "jito-bundle" || true;
         let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
 
         if uses_priority {
-            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+            let (estimated, source) = action_priority_estimate(&market, "buy");
+            buy_report.prioritySource = source;
+            buy_report.priorityEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
             })?;
             let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
             normalized.execution.buyPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            buy_report.resolvedPriorityLamports = Some(resolved);
         } else {
             normalized.execution.buyPriorityFeeSol.clear();
         }
 
         if uses_tip {
-            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+            let (estimated, source) = action_tip_estimate(&market);
+            buy_report.tipSource = source;
+            buy_report.tipEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
@@ -1246,6 +1827,7 @@ async fn resolve_auto_execution_fees(
                 resolved = 200_000;
             }
             normalized.execution.buyTipSol = format_lamports_to_sol_decimal(resolved);
+            buy_report.resolvedTipLamports = Some(resolved);
         } else {
             normalized.execution.buyTipSol.clear();
         }
@@ -1277,22 +1859,30 @@ async fn resolve_auto_execution_fees(
             },
         );
         let provider = normalized.execution.sellProvider.as_str();
+        sell_report.capLamports = cap_lamports;
         let uses_priority = provider != "jito-bundle" || true;
         let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
 
         if uses_priority {
-            let estimated = market.helius_priority_lamports.ok_or_else(|| {
+            let (estimated, source) = action_priority_estimate(&market, "sell");
+            sell_report.prioritySource = source;
+            sell_report.priorityEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Sell auto fee is enabled but no Helius priority estimate was returned."
                     .to_string()
             })?;
             let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
             normalized.execution.sellPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            sell_report.resolvedPriorityLamports = Some(resolved);
         } else {
             normalized.execution.sellPriorityFeeSol.clear();
         }
 
         if uses_tip {
-            let estimated = market.jito_tip_p99_lamports.ok_or_else(|| {
+            let (estimated, source) = action_tip_estimate(&market);
+            sell_report.tipSource = source;
+            sell_report.tipEstimateLamports = estimated;
+            let estimated = estimated.ok_or_else(|| {
                 "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
@@ -1306,6 +1896,7 @@ async fn resolve_auto_execution_fees(
                 resolved = 200_000;
             }
             normalized.execution.sellTipSol = format_lamports_to_sol_decimal(resolved);
+            sell_report.resolvedTipLamports = Some(resolved);
         } else {
             normalized.execution.sellTipSol.clear();
         }
@@ -1328,7 +1919,15 @@ async fn resolve_auto_execution_fees(
         ));
     }
 
-    Ok(notes)
+    Ok(AutoFeeResolutionSummary {
+        notes,
+        report: AutoFeeReport {
+            snapshot: market,
+            creation: creation_report,
+            buy: buy_report,
+            sell: sell_report,
+        },
+    })
 }
 
 fn apply_same_time_creation_fee_guard(
@@ -1441,6 +2040,8 @@ async fn compile_presigned_follow_actions(
     allow_ata_creation: bool,
 ) -> Result<Vec<crate::follow::FollowActionRecord>, String> {
     let mut actions = build_action_records(&normalized.followLaunch);
+    let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
+    let sell_tip_account = pick_tip_account_for_provider(&normalized.execution.sellProvider);
     let mut predicted_dev_buy_tokens: Option<Option<u64>> = None;
     let mut predicted_bonk_dev_buy_tokens: Option<Option<u64>> = None;
     let bonk_pool_id = if normalized.launchpad == "bonk" {
@@ -1460,6 +2061,14 @@ async fn compile_presigned_follow_actions(
                 let Some(buy_amount_sol) = action.buyAmountSol.as_deref() else {
                     continue;
                 };
+                if normalized.launchpad == "pump"
+                    && should_use_post_setup_creator_vault_for_buy(
+                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                        action,
+                    )
+                {
+                    continue;
+                }
                 let mut tx = compile_atomic_follow_buy_for_launchpad(
                     &normalized.launchpad,
                     &normalized.mode,
@@ -1467,7 +2076,7 @@ async fn compile_presigned_follow_actions(
                     rpc_url,
                     &normalized.execution,
                     normalized.token.mayhemMode,
-                    &normalized.tx.jitoTipAccount,
+                    &buy_tip_account,
                     &wallet_secret,
                     mint,
                     launch_creator,
@@ -1500,7 +2109,7 @@ async fn compile_presigned_follow_actions(
                     rpc_url,
                     &normalized.execution,
                     normalized.token.mayhemMode,
-                    &normalized.tx.jitoTipAccount,
+                    &sell_tip_account,
                     &wallet_secret,
                     mint,
                     launch_creator,
@@ -1540,7 +2149,7 @@ async fn compile_presigned_follow_actions(
                     rpc_url,
                     &normalized.quoteAsset,
                     &normalized.execution,
-                    &normalized.tx.jitoTipAccount,
+                    &sell_tip_account,
                     &wallet_secret,
                     mint,
                     sell_percent,
@@ -1715,6 +2324,11 @@ async fn build_wallet_status_payload(
 async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
     let (runtime_workers, follow_daemon) =
         tokio::join!(list_workers(&state.runtime), follow_daemon_status_payload(),);
+    let follow_active_jobs = follow_daemon
+        .get("health")
+        .and_then(|value| value.get("activeJobs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     json!({
         "ok": true,
         "service": "launchdeck-engine",
@@ -1727,6 +2341,7 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
             "statePath": state.runtime.storage_path,
             "workerCount": runtime_workers.len(),
         },
+        "warm": warm_state_payload(state, follow_active_jobs),
         "runtimeWorkers": runtime_workers,
     })
 }
@@ -1941,7 +2556,7 @@ async fn execute_engine_action_payload(
     let transport_plan_build_ms = transport_plan_started.elapsed().as_millis();
     let rpc_url = configured_rpc_url();
     let auto_fee_started = Instant::now();
-    let auto_fee_notes = resolve_auto_execution_fees(
+    let auto_fee_resolution = resolve_auto_execution_fees(
         &rpc_url,
         &mut normalized,
         &transport_plan,
@@ -2006,8 +2621,15 @@ async fn execute_engine_action_payload(
             "prepareRequestPayloadMs",
             prepare_request_payload_ms,
         );
-        for note in &auto_fee_notes {
+        for note in &auto_fee_resolution.notes {
             append_execution_note(&mut report_value, note);
+        }
+        if benchmark_mode == BenchmarkMode::Full {
+            set_execution_value(
+                &mut report_value,
+                "autoFee",
+                serde_json::to_value(&auto_fee_resolution.report).unwrap_or_else(|_| json!({})),
+            );
         }
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report_value, "formToRawConfigMs", value);
@@ -2201,8 +2823,15 @@ async fn execute_engine_action_payload(
     if let Some(warning) = same_time_fee_guard_warning.as_deref() {
         append_execution_warning(&mut report_value, warning);
     }
-    for note in &auto_fee_notes {
+    for note in &auto_fee_resolution.notes {
         append_execution_note(&mut report_value, note);
+    }
+    if benchmark_mode == BenchmarkMode::Full {
+        set_execution_value(
+            &mut report_value,
+            "autoFee",
+            serde_json::to_value(&auto_fee_resolution.report).unwrap_or_else(|_| json!({})),
+        );
     }
     set_report_timing(
         &mut report_value,
@@ -2458,7 +3087,9 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
-        let follow_daemon_client = if deferred_follow_launch.enabled {
+        let should_reserve_deferred_follow_job =
+            should_reserve_follow_job(&deferred_follow_launch, &deferred_setup_transactions);
+        let follow_daemon_client = if should_reserve_deferred_follow_job {
             Some(FollowDaemonClient::new(&configured_follow_daemon_base_url()))
         } else {
             None
@@ -2519,6 +3150,8 @@ async fn execute_engine_action_payload(
             let execution = normalized.execution.clone();
             let token_mayhem_mode = normalized.token.mayhemMode;
             let jito_tip_account = normalized.tx.jitoTipAccount.clone();
+            let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
+            let sell_tip_account = pick_tip_account_for_provider(&normalized.execution.sellProvider);
             let prefer_post_setup_creator_vault_for_sell =
                 matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked");
             let prebuilt_actions = prebuilt_follow_actions.clone().unwrap_or_default();
@@ -2536,6 +3169,8 @@ async fn execute_engine_action_payload(
                         execution,
                         tokenMayhemMode: token_mayhem_mode,
                         jitoTipAccount: jito_tip_account,
+                        buyTipAccount: buy_tip_account,
+                        sellTipAccount: sell_tip_account,
                         preferPostSetupCreatorVaultForSell: prefer_post_setup_creator_vault_for_sell,
                         prebuiltActions: prebuilt_actions,
                         deferredSetupTransactions: deferred_setup_transactions,
@@ -2579,7 +3214,7 @@ async fn execute_engine_action_payload(
                             &rpc_url,
                             &setup_batch,
                             &normalized.execution.commitment,
-                            normalized.execution.skipPreflight,
+                            transport_plan.skipPreflight,
                             normalized.execution.trackSendBlockHeight,
                         )
                         .await
@@ -3021,7 +3656,7 @@ async fn execute_engine_action_payload(
         }
         attach_follow_daemon_report(
             &mut report,
-            if deferred_follow_launch.enabled {
+            if should_reserve_deferred_follow_job {
                 Some(follow_daemon_transport.as_str())
             } else {
                 None
@@ -3133,7 +3768,7 @@ async fn execute_engine_action_payload(
                 }
             }
         }
-        if let Some(_client) = follow_daemon_client.as_ref() {
+        if should_reserve_deferred_follow_job {
             attach_follow_daemon_report(
                 &mut report,
                 Some(follow_daemon_transport.as_str()),
@@ -4034,6 +4669,8 @@ async fn api_startup_warm() -> Json<Value> {
                 Ok(snapshot) => json!({
                     "ok": true,
                     "heliusPriorityLamports": snapshot.helius_priority_lamports,
+                    "heliusLaunchPriorityLamports": snapshot.helius_launch_priority_lamports,
+                    "heliusTradePriorityLamports": snapshot.helius_trade_priority_lamports,
                     "jitoTipP99Lamports": snapshot.jito_tip_p99_lamports,
                 }),
                 Err(error) => json!({
@@ -4086,6 +4723,25 @@ async fn api_runtime_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let started_at_ms = current_time_ms();
     Json(attach_timing(
         build_runtime_status_payload(&state).await,
+        started_at_ms,
+    ))
+}
+
+async fn api_warm_activity(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<WarmActivityRequest>,
+) -> Json<Value> {
+    let started_at_ms = current_time_ms();
+    let should_rewarm_now = mark_operator_activity(&state, activity_providers(&payload));
+    if should_rewarm_now {
+        execute_continuous_warm_pass(&state).await;
+    }
+    let follow_active_jobs = follow_active_jobs_count().await;
+    Json(attach_timing(
+        json!({
+            "ok": true,
+            "warm": warm_state_payload(&state, follow_active_jobs),
+        }),
         started_at_ms,
     ))
 }
@@ -4233,6 +4889,7 @@ async fn api_run(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RunRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _warm_guard = mark_in_flight_engine_request(&state);
     let client_pre_request_ms = payload.client_pre_request_ms.map(u128::from);
     let action = payload.action.unwrap_or_else(|| "build".to_string());
     if !["build", "simulate", "send"].contains(&action.trim().to_lowercase().as_str()) {
@@ -4878,6 +5535,17 @@ async fn runtime_fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn test_state(warm: WarmControlState) -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_token: None,
+            runtime: Arc::new(RuntimeRegistry::new(
+                "/tmp/launchdeck-test-runtime.json".into(),
+            )),
+            warm: Arc::new(Mutex::new(warm)),
+        })
+    }
 
     #[tokio::test]
     async fn health_reports_rust_native_only_mode() {
@@ -4885,6 +5553,123 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.service, "launchdeck-engine");
         assert_eq!(response.mode, "rust-native-only");
+    }
+
+    #[test]
+    fn reserves_follow_job_for_deferred_setup_without_follow_actions() {
+        let follow_launch = NormalizedFollowLaunch {
+            enabled: false,
+            source: "legacy-postLaunch".to_string(),
+            schemaVersion: 1,
+            snipes: vec![],
+            devAutoSell: None,
+            constraints: crate::config::NormalizedFollowLaunchConstraints {
+                pumpOnly: true,
+                retryBudget: 1,
+                requireDaemonReadiness: true,
+                blockOnRequiredPrechecks: true,
+            },
+        };
+        let deferred_setup_transactions = vec![CompiledTransaction {
+            label: "follow-up".to_string(),
+            format: "v0".to_string(),
+            blockhash: "blockhash".to_string(),
+            lastValidBlockHeight: 123,
+            serializedBase64: "AQ==".to_string(),
+            signature: Some("sig".to_string()),
+            lookupTablesUsed: vec![],
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: None,
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+        }];
+
+        assert!(should_reserve_follow_job(
+            &follow_launch,
+            &deferred_setup_transactions
+        ));
+    }
+
+    #[test]
+    fn operator_activity_requests_immediate_rewarm_when_idle() {
+        let idle_ms = u128::from(configured_idle_warm_timeout_ms()) + 5_000;
+        let now_ms = current_time_ms();
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(idle_ms),
+            current_reason: "suspended-idle".to_string(),
+            ..WarmControlState::default()
+        });
+
+        let immediate = mark_operator_activity(&state, vec!["standard-rpc".to_string()]);
+        let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(immediate);
+        assert_eq!(warm.current_reason, "active-operator-activity");
+        assert_eq!(warm.selected_providers, vec!["standard-rpc".to_string()]);
+    }
+
+    #[test]
+    fn warm_state_payload_uses_fresh_reason_not_cached_reason() {
+        let idle_ms = u128::from(configured_idle_warm_timeout_ms()) + 5_000;
+        let now_ms = current_time_ms();
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(idle_ms),
+            current_reason: "stale-old-reason".to_string(),
+            ..WarmControlState::default()
+        });
+
+        let payload = warm_state_payload(&state, 0);
+        assert_eq!(
+            payload.get("reason").and_then(Value::as_str),
+            Some("suspended-idle")
+        );
+    }
+
+    #[test]
+    fn fee_market_snapshot_prefers_launch_specific_estimate_for_creation() {
+        let snapshot = FeeMarketSnapshot {
+            helius_priority_lamports: Some(10),
+            helius_launch_priority_lamports: Some(25),
+            helius_trade_priority_lamports: Some(40),
+            jito_tip_p99_lamports: Some(5),
+        };
+        assert_eq!(snapshot.launch_priority_lamports(), Some(25));
+        assert_eq!(snapshot.trade_priority_lamports(), Some(40));
+    }
+
+    #[test]
+    fn fee_market_snapshot_falls_back_to_generic_estimate_when_template_missing() {
+        let snapshot = FeeMarketSnapshot {
+            helius_priority_lamports: Some(10),
+            helius_launch_priority_lamports: None,
+            helius_trade_priority_lamports: None,
+            jito_tip_p99_lamports: Some(5),
+        };
+        assert_eq!(snapshot.launch_priority_lamports(), Some(10));
+        assert_eq!(snapshot.trade_priority_lamports(), Some(10));
+    }
+
+    #[test]
+    fn helius_priority_estimate_parser_uses_selected_level_then_fallbacks() {
+        let payload = json!({
+            "priorityFeeLevels": {
+                "high": 1234,
+                "veryHigh": 5678
+            },
+            "priorityFeeEstimate": 4321
+        });
+        assert_eq!(
+            parse_helius_priority_estimate_result(&payload, "veryhigh"),
+            Some(5678)
+        );
+        assert_eq!(
+            parse_helius_priority_estimate_result(&payload, "unsafeMax"),
+            Some(5678)
+        );
+        assert_eq!(
+            parse_helius_priority_estimate_result(&payload, "recommended"),
+            Some(4321)
+        );
     }
 }
 
@@ -4896,10 +5681,16 @@ async fn main() {
     let state = Arc::new(AppState {
         auth_token: configured_auth_token(),
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
+        warm: Arc::new(Mutex::new(WarmControlState {
+            selected_providers: configured_active_warm_providers(),
+            current_reason: "idle-awaiting-browser-activity".to_string(),
+            ..WarmControlState::default()
+        })),
     });
     spawn_fee_market_snapshot_refresh_task(rpc_url.clone());
     spawn_blockhash_refresh_task(rpc_url.clone(), "processed");
     spawn_blockhash_refresh_task(rpc_url.clone(), "confirmed");
+    spawn_continuous_warm_task(state.clone());
     spawn_blockhash_refresh_task(rpc_url, "finalized");
     let restored_workers = restore_workers(&state.runtime).await;
     let app = Router::new()
@@ -4919,6 +5710,7 @@ async fn main() {
         .route("/api/pump-global/warm", post(api_pump_global_warm))
         .route("/api/wallet-status", get(api_wallet_status))
         .route("/api/runtime-status", get(api_runtime_status))
+        .route("/api/warm/activity", post(api_warm_activity))
         .route("/api/follow/jobs", get(api_follow_jobs))
         .route("/api/follow/cancel", post(api_follow_cancel))
         .route("/api/follow/stop-all", post(api_follow_stop_all))

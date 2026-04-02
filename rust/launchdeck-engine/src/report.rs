@@ -281,7 +281,7 @@ pub struct BenchmarkSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchmarkMode {
     Off,
-    Basic,
+    Light,
     Full,
 }
 
@@ -289,7 +289,7 @@ impl BenchmarkMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Basic => "basic",
+            Self::Light => "light",
             Self::Full => "full",
         }
     }
@@ -297,9 +297,10 @@ impl BenchmarkMode {
     pub fn from_value(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
+            "light" | "basic" => Self::Light,
             "full" => Self::Full,
             "" => Self::Full,
-            _ => Self::Basic,
+            _ => Self::Light,
         }
     }
 }
@@ -962,7 +963,7 @@ pub fn sanitize_execution_timings_for_mode(
     sanitized.benchmarkMode = Some(mode.as_str().to_string());
     match mode {
         BenchmarkMode::Full => sanitized,
-        BenchmarkMode::Basic => {
+        BenchmarkMode::Light => {
             sanitized.apiRoundTripOverheadMs = None;
             sanitized.transportPlanBuildMs = None;
             sanitized.autoFeeResolveMs = None;
@@ -988,16 +989,7 @@ pub fn sanitize_execution_timings_for_mode(
             sanitized.reportingOverheadMs = None;
             sanitized
         }
-        BenchmarkMode::Off => ExecutionTimings {
-            benchmarkMode: Some(mode.as_str().to_string()),
-            totalElapsedMs: timings.totalElapsedMs,
-            backendTotalElapsedMs: timings.backendTotalElapsedMs,
-            executionTotalMs: timings.executionTotalMs,
-            observedWallClockMs: timings.observedWallClockMs,
-            clientPreRequestMs: timings.clientPreRequestMs,
-            persistInitialSnapshotMs: timings.persistInitialSnapshotMs,
-            ..ExecutionTimings::default()
-        },
+        BenchmarkMode::Off => ExecutionTimings::default(),
     }
 }
 
@@ -2147,11 +2139,12 @@ mod tests {
             ..ExecutionTimings::default()
         };
         let sanitized = sanitize_execution_timings_for_mode(&timings, BenchmarkMode::Off);
-        assert_eq!(sanitized.totalElapsedMs, Some(500));
-        assert_eq!(sanitized.backendTotalElapsedMs, Some(420));
-        assert_eq!(sanitized.executionTotalMs, Some(400));
-        assert_eq!(sanitized.clientPreRequestMs, Some(80));
-        assert_eq!(sanitized.persistInitialSnapshotMs, Some(12));
+        assert_eq!(sanitized.benchmarkMode, None);
+        assert_eq!(sanitized.totalElapsedMs, None);
+        assert_eq!(sanitized.backendTotalElapsedMs, None);
+        assert_eq!(sanitized.executionTotalMs, None);
+        assert_eq!(sanitized.clientPreRequestMs, None);
+        assert_eq!(sanitized.persistInitialSnapshotMs, None);
         assert_eq!(sanitized.compileTransactionsMs, None);
         assert_eq!(sanitized.sendTransportSubmitMs, None);
     }

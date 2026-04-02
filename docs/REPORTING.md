@@ -31,6 +31,18 @@ Use `Transactions` when you want to inspect raw execution output for a run.
 
 Use `Launches` when you want the higher-level launch history and reuse flow.
 
+Current report detail highlights in the UI include:
+
+- `Winning Endpoint` for the endpoint that actually landed a multi-endpoint send first
+- `Attempted Endpoints` for the full fanout list when the transport tried more than one endpoint
+- `Auto-Fee Sources` for the live fee inputs that contributed to the resolved auto-fee result
+
+Operator meaning:
+
+- `Winning Endpoint` is the endpoint that appears to have landed or returned first on a multi-endpoint path
+- `Attempted Endpoints` shows the full send fanout list, not just the winner
+- watcher mode fields in follow data tell you whether LaunchDeck used `helius-transaction-subscribe`, `standard-ws`, or another watcher mode for that action family
+
 ## What Reports Capture
 
 LaunchDeck reports are meant to answer two different questions:
@@ -44,10 +56,12 @@ Typical report data includes:
 - resolved provider
 - transport type
 - endpoint or endpoint profile information
+- winning endpoint and attempted endpoint list where applicable
 - send order
 - transaction signatures
 - confirmation state
 - applied tip and compute-unit settings
+- auto-fee source summaries when auto-fee was used
 - benchmark timing data
 - optional send/confirm block-height snapshots when `execution.trackSendBlockHeight` is enabled
 
@@ -56,6 +70,7 @@ When follow behavior is enabled, reports can also include:
 - follow-job snapshot
 - follow-action outcomes
 - watcher health
+- watcher mode
 - timing profiles
 - follow telemetry samples
 
@@ -90,16 +105,22 @@ This helps distinguish:
 
 Benchmark detail levels:
 
-- `off` keeps timing detail minimal
-- `basic` records core timings plus first-snapshot timing
+- `off` disables benchmark payloads for the report
+- `light` records core timings without benchmark-only diagnostics
 - `full` records grouped timings plus reporting-overhead timing
+
+Legacy compatibility:
+
+- `basic` is still accepted and maps to `light`
+- the UI labels the current non-full mode as `Light`
 
 `LAUNCHDECK_BENCHMARK_MODE` controls this report timing detail. It does not enable block-height capture by itself.
 
 For block-height capture in reports:
 
 - use `execution.trackSendBlockHeight` per launch or preset
-- or set `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT=true` to make that the default
+- or set `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT=true` to make that the default when `LAUNCHDECK_BENCHMARK_MODE=full`
+- `off` and `light` keep block-height capture off by default, but an explicit `execution.trackSendBlockHeight` value can still enable it intentionally
 
 ## Follow Telemetry
 

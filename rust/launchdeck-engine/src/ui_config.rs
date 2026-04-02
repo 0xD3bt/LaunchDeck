@@ -15,7 +15,7 @@ const DEFAULT_TRADE_TIP_SOL: &str = "0.01";
 const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "90";
 const DEFAULT_DEV_BUY_AMOUNTS: [&str; 3] = ["0.5", "1", "2"];
 
-fn configured_track_send_block_height_default() -> bool {
+fn configured_track_send_block_height_env_enabled() -> bool {
     matches!(
         env::var("LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT")
             .unwrap_or_default()
@@ -24,6 +24,16 @@ fn configured_track_send_block_height_default() -> bool {
             .as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn benchmark_mode_allows_track_send_block_height_default(mode: &str) -> bool {
+    matches!(mode.trim().to_ascii_lowercase().as_str(), "" | "full")
+}
+
+fn configured_track_send_block_height_default() -> bool {
+    benchmark_mode_allows_track_send_block_height_default(
+        &env::var("LAUNCHDECK_BENCHMARK_MODE").unwrap_or_default(),
+    ) && configured_track_send_block_height_env_enabled()
 }
 
 fn legacy_provider_alias(provider: &str) -> String {

@@ -25,13 +25,19 @@ use tokio::{join, task::JoinSet, time::sleep};
 
 use crate::{
     config::{
-        NormalizedConfig, NormalizedExecution, NormalizedRecipient, has_launch_follow_up,
+        NormalizedConfig, NormalizedExecution, NormalizedRecipient,
+        configured_default_agent_setup_compute_unit_limit,
+        configured_default_dev_auto_sell_compute_unit_limit,
+        configured_default_follow_up_compute_unit_limit,
+        configured_default_launch_compute_unit_limit,
+        configured_default_sniper_buy_compute_unit_limit, has_launch_follow_up,
         launch_follow_up_label,
     },
     paths,
     report::{LaunchReport, build_report, render_report},
     rpc::{
         CompiledTransaction, fetch_account_data, fetch_account_exists,
+        fetch_multiple_account_exists,
         fetch_latest_blockhash_cached,
     },
     transport::TransportPlan,
@@ -46,7 +52,7 @@ const PUMP_AGENT_PAYMENTS_PROGRAM_ID: &str = "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
-const FIXED_COMPUTE_UNIT_LIMIT: u32 = 1_000_000;
+const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const TOKEN_DECIMALS: u32 = 6;
 const GLOBAL_ACCOUNT_DISCRIMINATOR_BYTES: usize = 8;
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -233,6 +239,7 @@ pub async fn try_compile_native_pump(
         );
 
     let launch_tx_config = NativeTxConfig {
+        compute_unit_limit: configured_launch_compute_unit_limit(config)?,
         compute_unit_price_micro_lamports: creation_compute_unit_price_micro_lamports,
         jito_tip_lamports: if transport_plan.requiresInlineTip || !separate_tip_transaction {
             config.tx.jitoTipLamports
@@ -302,6 +309,10 @@ pub async fn try_compile_native_pump(
         let follow_up_tx_instructions = with_tx_settings(
             follow_up_instructions,
             &NativeTxConfig {
+                compute_unit_limit: configured_follow_up_compute_unit_limit(
+                    config,
+                    follow_up_label,
+                )?,
                 compute_unit_price_micro_lamports:
                     effective_follow_up_compute_unit_price_micro_lamports(config, transport_plan),
                 jito_tip_lamports: if transport_plan.requiresInlineTip {
@@ -327,6 +338,10 @@ pub async fn try_compile_native_pump(
             None,
             follow_up_tx_instructions.clone(),
             &NativeTxConfig {
+                compute_unit_limit: configured_follow_up_compute_unit_limit(
+                    config,
+                    follow_up_label,
+                )?,
                 compute_unit_price_micro_lamports:
                     effective_follow_up_compute_unit_price_micro_lamports(config, transport_plan),
                 jito_tip_lamports: if transport_plan.requiresInlineTip {
@@ -351,6 +366,10 @@ pub async fn try_compile_native_pump(
             .extend(transaction_size_diagnostics(
                 &follow_up_tx_instructions,
                 &NativeTxConfig {
+                    compute_unit_limit: configured_follow_up_compute_unit_limit(
+                        config,
+                        follow_up_label,
+                    )?,
                     compute_unit_price_micro_lamports:
                         effective_follow_up_compute_unit_price_micro_lamports(
                             config,
@@ -389,6 +408,7 @@ pub async fn try_compile_native_pump(
             None,
             tip_tx_instructions.clone(),
             &NativeTxConfig {
+                compute_unit_limit: configured_launch_compute_unit_limit(config)?,
                 compute_unit_price_micro_lamports: 0,
                 jito_tip_lamports: config.tx.jitoTipLamports,
                 jito_tip_account: config.tx.jitoTipAccount.clone(),
@@ -401,6 +421,7 @@ pub async fn try_compile_native_pump(
         tip_metrics.warnings.extend(transaction_size_diagnostics(
             &tip_tx_instructions,
             &NativeTxConfig {
+                compute_unit_limit: configured_launch_compute_unit_limit(config)?,
                 compute_unit_price_micro_lamports: 0,
                 jito_tip_lamports: config.tx.jitoTipLamports,
                 jito_tip_account: config.tx.jitoTipAccount.clone(),
@@ -458,6 +479,7 @@ pub async fn try_compile_native_pump(
 
 #[derive(Debug, Clone)]
 struct NativeTxConfig {
+    compute_unit_limit: u32,
     compute_unit_price_micro_lamports: i64,
     jito_tip_lamports: i64,
     jito_tip_account: String,
@@ -531,6 +553,34 @@ fn effective_follow_up_compute_unit_price_micro_lamports(
         return 0;
     }
     config.tx.computeUnitPriceMicroLamports.unwrap_or(0)
+}
+
+fn u64_to_u32_limit(value: u64, label: &str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{label} is too large for a u32 compute unit limit."))
+}
+
+fn configured_launch_compute_unit_limit(config: &NormalizedConfig) -> Result<u32, String> {
+    let limit = config
+        .tx
+        .computeUnitLimit
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(configured_default_launch_compute_unit_limit);
+    u64_to_u32_limit(limit, "launch compute unit limit")
+}
+
+fn configured_follow_up_compute_unit_limit(
+    config: &NormalizedConfig,
+    follow_up_label: &str,
+) -> Result<u32, String> {
+    let limit = config
+        .tx
+        .computeUnitLimit
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| match follow_up_label {
+            "agent-setup" => configured_default_agent_setup_compute_unit_limit(),
+            _ => configured_default_follow_up_compute_unit_limit(),
+        });
+    u64_to_u32_limit(limit, "follow-up compute unit limit")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1227,13 +1277,13 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
     if lamports == 0 {
         Ok(0)
     } else {
-        Ok((lamports.saturating_mul(1_000_000)) / u64::from(FIXED_COMPUTE_UNIT_LIMIT))
+        Ok((lamports.saturating_mul(1_000_000)) / PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT)
     }
 }
 
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
     let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
-    Ok((percent / 100).min(10_000))
+    Ok(percent.min(10_000))
 }
 
 pub async fn compile_follow_buy_transaction(
@@ -1245,6 +1295,7 @@ pub async fn compile_follow_buy_transaction(
     mint: &str,
     launch_creator: &str,
     buy_amount_sol: &str,
+    prefer_post_setup_creator_vault: bool,
 ) -> Result<CompiledTransaction, String> {
     let prepared = prepare_follow_buy_static(
         rpc_url,
@@ -1256,7 +1307,13 @@ pub async fn compile_follow_buy_transaction(
         buy_amount_sol,
     )
     .await?;
-    let runtime = prepare_follow_buy_runtime(rpc_url, mint, launch_creator).await?;
+    let runtime = prepare_follow_buy_runtime(
+        rpc_url,
+        mint,
+        launch_creator,
+        prefer_post_setup_creator_vault,
+    )
+    .await?;
     finalize_follow_buy_transaction(
         rpc_url,
         execution,
@@ -1266,6 +1323,31 @@ pub async fn compile_follow_buy_transaction(
         &runtime,
     )
     .await
+}
+
+fn provider_uses_follow_tip(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "helius-sender" | "jito-bundle"
+    )
+}
+
+fn resolve_follow_tip_config(
+    provider: &str,
+    tip_sol: &str,
+    jito_tip_account: &str,
+    label: &str,
+) -> Result<(i64, String), String> {
+    if !provider_uses_follow_tip(provider) {
+        return Ok((0, String::new()));
+    }
+    let tip_lamports = parse_decimal_u64(tip_sol, 9, label)? as i64;
+    let tip_account = if tip_sol.trim().is_empty() {
+        String::new()
+    } else {
+        jito_tip_account.to_string()
+    };
+    Ok((tip_lamports, tip_account))
 }
 
 pub async fn prepare_follow_buy_static(
@@ -1282,16 +1364,22 @@ pub async fn prepare_follow_buy_static(
     let mint = parse_pubkey(mint, "mint")?;
     let launch_creator = parse_pubkey(launch_creator, "launch creator")?;
     let sol_amount = parse_decimal_u64(buy_amount_sol, 9, "followLaunch.snipes.buyAmountSol")?;
+    let (jito_tip_lamports, jito_tip_account) = resolve_follow_tip_config(
+        &execution.buyProvider,
+        &execution.buyTipSol,
+        jito_tip_account,
+        "buy tip",
+    )?;
     let tx_config = NativeTxConfig {
+        compute_unit_limit: u64_to_u32_limit(
+            configured_default_sniper_buy_compute_unit_limit(),
+            "sniper buy compute unit limit",
+        )?,
         compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
             &execution.buyPriorityFeeSol,
         )? as i64,
-        jito_tip_lamports: parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")? as i64,
-        jito_tip_account: if execution.buyTipSol.trim().is_empty() {
-            String::new()
-        } else {
-            jito_tip_account.to_string()
-        },
+        jito_tip_lamports,
+        jito_tip_account,
     };
     let tx_format = select_native_format(&execution.txFormat, false)?;
     let _ = rpc_url;
@@ -1309,11 +1397,17 @@ pub async fn prepare_follow_buy_runtime(
     rpc_url: &str,
     mint: &str,
     launch_creator: &str,
+    prefer_post_setup_creator_vault: bool,
 ) -> Result<PreparedFollowBuyRuntime, String> {
     let mint = parse_pubkey(mint, "mint")?;
     let launch_creator = parse_pubkey(launch_creator, "launch creator")?;
-    let creator_vault_authority =
-        resolve_follow_creator_vault_authority(rpc_url, &mint, &launch_creator, false).await?;
+    let creator_vault_authority = resolve_follow_creator_vault_authority(
+        rpc_url,
+        &mint,
+        &launch_creator,
+        prefer_post_setup_creator_vault,
+    )
+    .await?;
     let global = fetch_global_state_cached(rpc_url).await?;
     let curve = fetch_bonding_curve_state(rpc_url, &mint).await?;
     Ok(PreparedFollowBuyRuntime {
@@ -1398,16 +1492,22 @@ pub async fn compile_atomic_follow_buy_transaction(
             token_mayhem_mode,
         )?,
     ];
+    let (jito_tip_lamports, jito_tip_account) = resolve_follow_tip_config(
+        &execution.buyProvider,
+        &execution.buyTipSol,
+        jito_tip_account,
+        "buy tip",
+    )?;
     let tx_config = NativeTxConfig {
+        compute_unit_limit: u64_to_u32_limit(
+            configured_default_sniper_buy_compute_unit_limit(),
+            "sniper buy compute unit limit",
+        )?,
         compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
             &execution.buyPriorityFeeSol,
         )? as i64,
-        jito_tip_lamports: parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")? as i64,
-        jito_tip_account: if execution.buyTipSol.trim().is_empty() {
-            String::new()
-        } else {
-            jito_tip_account.to_string()
-        },
+        jito_tip_lamports,
+        jito_tip_account,
     };
     let tx_instructions = with_tx_settings(instructions, &tx_config, &user)?;
     let tx_format = select_native_format(&execution.txFormat, false)?;
@@ -1545,16 +1645,22 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         curve.cashback_enabled,
         token_mayhem_mode,
     )?];
+    let (jito_tip_lamports, jito_tip_account) = resolve_follow_tip_config(
+        &execution.sellProvider,
+        &execution.sellTipSol,
+        jito_tip_account,
+        "sell tip",
+    )?;
     let tx_config = NativeTxConfig {
+        compute_unit_limit: u64_to_u32_limit(
+            configured_default_dev_auto_sell_compute_unit_limit(),
+            "dev auto sell compute unit limit",
+        )?,
         compute_unit_price_micro_lamports: priority_fee_sol_to_micro_lamports(
             &execution.sellPriorityFeeSol,
         )? as i64,
-        jito_tip_lamports: parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")? as i64,
-        jito_tip_account: if execution.sellTipSol.trim().is_empty() {
-            String::new()
-        } else {
-            jito_tip_account.to_string()
-        },
+        jito_tip_lamports,
+        jito_tip_account,
     };
     let tx_instructions = with_tx_settings(instructions, &tx_config, &user)?;
     let tx_format = select_native_format(&execution.txFormat, false)?;
@@ -2069,9 +2175,9 @@ async fn build_social_fee_pda_create_instructions(
     recipients: &[NormalizedRecipient],
     payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
-    let mut tasks = JoinSet::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut ordered_user_ids = Vec::new();
+    let mut addresses = Vec::new();
     for (index, recipient) in recipients.iter().enumerate() {
         if recipient.githubUserId.is_empty() {
             continue;
@@ -2080,27 +2186,12 @@ async fn build_social_fee_pda_create_instructions(
             continue;
         }
         ordered_user_ids.push((index, recipient.githubUserId.clone()));
-        let rpc_url = rpc_url.to_string();
-        let user_id = recipient.githubUserId.clone();
-        tasks.spawn(async move {
-            let social_fee = social_fee_pda(&user_id, PLATFORM_GITHUB)?;
-            let exists =
-                fetch_account_exists(&rpc_url, &social_fee.to_string(), "confirmed").await?;
-            Ok::<(usize, String, bool), String>((index, user_id, exists))
-        });
+        addresses.push(social_fee_pda(&recipient.githubUserId, PLATFORM_GITHUB)?.to_string());
     }
-    let mut existing_by_user_id = HashMap::new();
-    while let Some(joined) = tasks.join_next().await {
-        let (index, user_id, exists) = joined.map_err(|error| error.to_string())??;
-        existing_by_user_id.insert(user_id, (index, exists));
-    }
+    let exists = fetch_multiple_account_exists(rpc_url, &addresses, "confirmed").await?;
     ordered_user_ids.sort_by_key(|(index, _)| *index);
     let mut instructions = Vec::new();
-    for (_, user_id) in ordered_user_ids {
-        let exists = existing_by_user_id
-            .get(&user_id)
-            .map(|(_, exists)| *exists)
-            .unwrap_or(false);
+    for ((_, user_id), exists) in ordered_user_ids.into_iter().zip(exists.into_iter()) {
         if !exists {
             instructions.push(build_create_social_fee_pda_instruction(
                 payer,
@@ -2263,9 +2354,9 @@ async fn build_native_follow_up_instructions(
     }
 }
 
-fn build_compute_unit_limit_instruction() -> Result<Instruction, String> {
+fn build_compute_unit_limit_instruction(compute_unit_limit: u32) -> Result<Instruction, String> {
     let mut data = vec![2];
-    data.extend_from_slice(&FIXED_COMPUTE_UNIT_LIMIT.to_le_bytes());
+    data.extend_from_slice(&compute_unit_limit.to_le_bytes());
     Ok(Instruction {
         program_id: compute_budget_program_id()?,
         accounts: vec![],
@@ -2288,7 +2379,7 @@ fn with_tx_settings(
     tx_config: &NativeTxConfig,
     payer: &Pubkey,
 ) -> Result<Vec<Instruction>, String> {
-    let mut instructions = vec![build_compute_unit_limit_instruction()?];
+    let mut instructions = vec![build_compute_unit_limit_instruction(tx_config.compute_unit_limit)?];
     if tx_config.compute_unit_price_micro_lamports > 0 {
         instructions.push(build_compute_unit_price_instruction(
             tx_config.compute_unit_price_micro_lamports as u64,
@@ -2832,7 +2923,7 @@ fn compile_transaction_candidate(
             serializedBase64: serialized_base64,
             signature,
             lookupTablesUsed: lookup_tables_used,
-            computeUnitLimit: Some(u64::from(FIXED_COMPUTE_UNIT_LIMIT)),
+            computeUnitLimit: Some(u64::from(tx_config.compute_unit_limit)),
             computeUnitPriceMicroLamports: if tx_config.compute_unit_price_micro_lamports > 0 {
                 Some(tx_config.compute_unit_price_micro_lamports as u64)
             } else {
@@ -2986,6 +3077,13 @@ mod tests {
     }
 
     #[test]
+    fn slippage_percent_maps_to_expected_bps() {
+        assert_eq!(slippage_bps_from_percent("20").expect("20%"), 2_000);
+        assert_eq!(slippage_bps_from_percent("0.5").expect("0.5%"), 50);
+        assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
+    }
+
+    #[test]
     fn jito_multi_tx_creation_drops_priority_fee() {
         let mut config = regular_config();
         config.execution.provider = "jito-bundle".to_string();
@@ -3130,7 +3228,7 @@ mod tests {
                 serializedBase64: String::new(),
                 signature: None,
                 lookupTablesUsed: vec![],
-                computeUnitLimit: Some(u64::from(FIXED_COMPUTE_UNIT_LIMIT)),
+                computeUnitLimit: Some(0),
                 computeUnitPriceMicroLamports: None,
                 inlineTipLamports: None,
                 inlineTipAccount: None,
@@ -3497,11 +3595,16 @@ mod tests {
 
     #[test]
     fn compute_budget_instruction_layout_matches_web3() {
-        let limit = build_compute_unit_limit_instruction().expect("limit instruction");
+        let compute_unit_limit = 340_000u32;
+        let limit =
+            build_compute_unit_limit_instruction(compute_unit_limit).expect("limit instruction");
         let price = build_compute_unit_price_instruction(123_456).expect("price instruction");
 
         assert_eq!(limit.program_id.to_string(), COMPUTE_BUDGET_PROGRAM_ID);
-        assert_eq!(limit.data, [2, 64, 66, 15, 0]);
+        assert_eq!(
+            limit.data,
+            [&[2u8][..], &compute_unit_limit.to_le_bytes()[..]].concat()
+        );
         assert_eq!(price.program_id.to_string(), COMPUTE_BUDGET_PROGRAM_ID);
         assert_eq!(price.data, [3, 64, 226, 1, 0, 0, 0, 0, 0]);
     }
@@ -3687,6 +3790,31 @@ mod tests {
         config.agent.buybackBps = Some(2_500);
 
         assert_eq!(native_follow_up_label(&config), None);
+    }
+
+    #[test]
+    fn standard_rpc_follow_buy_tip_is_ignored_when_blank() {
+        let (tip_lamports, tip_account) =
+            resolve_follow_tip_config("standard-rpc", "", "tip-account", "buy tip")
+                .expect("standard rpc buy tip");
+        assert_eq!(tip_lamports, 0);
+        assert!(tip_account.is_empty());
+    }
+
+    #[test]
+    fn standard_rpc_follow_sell_tip_is_ignored_even_when_present() {
+        let (tip_lamports, tip_account) =
+            resolve_follow_tip_config("standard-rpc", "0.01", "tip-account", "sell tip")
+                .expect("standard rpc sell tip");
+        assert_eq!(tip_lamports, 0);
+        assert!(tip_account.is_empty());
+    }
+
+    #[test]
+    fn jito_follow_tip_still_requires_valid_tip_value() {
+        let error = resolve_follow_tip_config("jito-bundle", "", "tip-account", "buy tip")
+            .expect_err("blank jito tip should fail");
+        assert!(error.contains("buy tip"));
     }
 
     #[test]

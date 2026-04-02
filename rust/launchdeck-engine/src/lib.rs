@@ -5,6 +5,7 @@ pub mod bonk_native;
 pub mod config;
 pub mod follow;
 pub mod fs_utils;
+pub mod helper_worker;
 pub mod image_library;
 pub mod launchpad_dispatch;
 pub mod launchpads;

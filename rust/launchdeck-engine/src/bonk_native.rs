@@ -1,7 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -16,7 +16,15 @@ use tokio::{
 };
 
 use crate::{
-    config::{NormalizedConfig, NormalizedExecution, validate_launchpad_support},
+    config::{
+        NormalizedConfig, NormalizedExecution, configured_default_dev_auto_sell_compute_unit_limit,
+        configured_default_launch_compute_unit_limit,
+        configured_default_launch_usd1_topup_compute_unit_limit,
+        configured_default_sniper_buy_compute_unit_limit, validate_launchpad_support,
+    },
+    helper_worker::{
+        HelperWorkerClient, HelperWorkerConfig, HelperWorkerError, helper_worker_enabled,
+    },
     report::{
         BonkUsd1LaunchSummary, FeeSettings, InstructionSummary, TransactionSummary, build_report,
         render_report,
@@ -28,7 +36,7 @@ use crate::{
 use crate::pump_native::{LaunchQuote, NativeCompileTimings};
 
 const PACKET_LIMIT_BYTES: usize = 1232;
-const FIXED_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const DEFAULT_HELPER_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_HELPER_MAX_CONCURRENCY: usize = 4;
 
@@ -245,6 +253,26 @@ fn helper_script_path() -> Result<PathBuf, String> {
     Ok(project_root()?.join("scripts/bonk-launchpad.js"))
 }
 
+fn bonk_worker_enabled() -> bool {
+    helper_worker_enabled("LAUNCHDECK_ENABLE_BONK_HELPER_WORKER")
+}
+
+fn worker_client() -> Result<Arc<HelperWorkerClient>, String> {
+    static CLIENT: OnceLock<Result<Arc<HelperWorkerClient>, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let project_root = project_root()?;
+            let script_path = helper_script_path()?;
+            Ok(Arc::new(HelperWorkerClient::new(HelperWorkerConfig {
+                helper_name: "Bonk",
+                project_root,
+                script_path,
+                timeout_ms: helper_timeout_ms(),
+            })))
+        })
+        .clone()
+}
+
 fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<String> {
     if metrics.quoteCalls == 0
         && metrics.routeSetupLocalHits == 0
@@ -270,7 +298,7 @@ fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<St
     ))
 }
 
-fn parse_helper_output<R: for<'de> Deserialize<'de>>(
+fn parse_helper_output<R: DeserializeOwned>(
     output_stdout: &[u8],
     helper_name: &str,
 ) -> Result<R, String> {
@@ -315,7 +343,7 @@ fn parse_helper_output<R: for<'de> Deserialize<'de>>(
     ))
 }
 
-async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(request: &T) -> Result<R, String> {
+async fn run_helper_once<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
     let _permit = helper_semaphore()
         .acquire_owned()
         .await
@@ -390,6 +418,19 @@ async fn run_helper<T: Serialize, R: for<'de> Deserialize<'de>>(request: &T) -> 
     parse_helper_output(&output_stdout, "Bonk")
 }
 
+async fn run_helper<T: Serialize, R: DeserializeOwned>(request: &T) -> Result<R, String> {
+    if bonk_worker_enabled() {
+        match worker_client()?.request::<T, R>(request).await {
+            Ok(response) => return Ok(response),
+            Err(HelperWorkerError::Request(error)) => return Err(error),
+            Err(HelperWorkerError::Transport(error)) => {
+                eprintln!("Bonk worker transport failed, falling back to one-shot helper: {error}");
+            }
+        }
+    }
+    run_helper_once(request).await
+}
+
 fn helper_tx_config(
     compute_unit_limit: Option<u64>,
     compute_unit_price_micro_lamports: u64,
@@ -397,11 +438,29 @@ fn helper_tx_config(
     tip_account: &str,
 ) -> HelperTxConfig<'_> {
     HelperTxConfig {
-        computeUnitLimit: compute_unit_limit.unwrap_or(FIXED_COMPUTE_UNIT_LIMIT),
+        computeUnitLimit: compute_unit_limit.unwrap_or_else(configured_default_launch_compute_unit_limit),
         computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
         tipLamports: tip_lamports,
         tipAccount: tip_account,
     }
+}
+
+fn provider_uses_follow_tip(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "helius-sender" | "jito-bundle"
+    )
+}
+
+fn resolve_follow_tip_lamports(
+    provider: &str,
+    tip_sol: &str,
+    label: &str,
+) -> Result<u64, String> {
+    if !provider_uses_follow_tip(provider) {
+        return Ok(0);
+    }
+    parse_decimal_u64(tip_sol, 9, label)
 }
 
 fn parse_decimal_u64(value: &str, decimals: u32, label: &str) -> Result<u64, String> {
@@ -428,13 +487,13 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
     if lamports == 0 {
         Ok(0)
     } else {
-        Ok((lamports.saturating_mul(1_000_000)) / FIXED_COMPUTE_UNIT_LIMIT)
+        Ok((lamports.saturating_mul(1_000_000)) / PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT)
     }
 }
 
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
     let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
-    Ok(percent / 100)
+    Ok(percent.min(10_000))
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
@@ -572,7 +631,7 @@ pub async fn compile_sol_to_usd1_topup_transaction(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_launch_usd1_topup_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
@@ -611,7 +670,11 @@ pub async fn try_compile_native_bonk(
         "txFormat": config.execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            config.tx.computeUnitLimit.and_then(|value| u64::try_from(value).ok()),
+            config
+                .tx
+                .computeUnitLimit
+                .and_then(|value| u64::try_from(value).ok())
+                .or_else(|| Some(configured_default_launch_compute_unit_limit())),
             u64::try_from(config.tx.computeUnitPriceMicroLamports.unwrap_or_default().max(0))
                 .unwrap_or_default(),
             tip_lamports,
@@ -701,7 +764,7 @@ pub async fn compile_follow_buy_transaction(
     buy_amount_sol: &str,
     allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
-    let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
+    let tip_lamports = resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
         "action": "compile-follow-buy",
         "rpcUrl": rpc_url,
@@ -714,7 +777,7 @@ pub async fn compile_follow_buy_transaction(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_sniper_buy_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
@@ -737,7 +800,7 @@ pub async fn compile_atomic_follow_buy_transaction(
     buy_amount_sol: &str,
     allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
-    let tip_lamports = parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?;
+    let tip_lamports = resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
         "action": "compile-follow-buy-atomic",
         "mode": launch_mode,
@@ -752,7 +815,7 @@ pub async fn compile_atomic_follow_buy_transaction(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_sniper_buy_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
@@ -803,7 +866,8 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     launch_mode_override: Option<&str>,
     launch_creator_override: Option<&str>,
 ) -> Result<Option<CompiledTransaction>, String> {
-    let tip_lamports = parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.sellProvider, &execution.sellTipSol, "sell tip")?;
     let response: HelperFollowSellResponse = run_helper(&json!({
         "action": "compile-follow-sell",
         "rpcUrl": rpc_url,
@@ -819,7 +883,7 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.sellSlippagePercent)?,
         "txConfig": helper_tx_config(
-            Some(FIXED_COMPUTE_UNIT_LIMIT),
+            Some(configured_default_dev_auto_sell_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
@@ -939,4 +1003,37 @@ pub async fn warm_bonk_state(rpc_url: &str) -> Result<Value, String> {
         payload["usd1QuoteMetrics"] = serde_json::to_value(metrics).unwrap_or(Value::Null);
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_rpc_follow_tip_is_ignored_when_blank() {
+        let tip_lamports =
+            resolve_follow_tip_lamports("standard-rpc", "", "buy tip").expect("standard rpc tip");
+        assert_eq!(tip_lamports, 0);
+    }
+
+    #[test]
+    fn standard_rpc_follow_tip_is_ignored_even_when_present() {
+        let tip_lamports = resolve_follow_tip_lamports("standard-rpc", "0.01", "sell tip")
+            .expect("standard rpc tip");
+        assert_eq!(tip_lamports, 0);
+    }
+
+    #[test]
+    fn jito_follow_tip_preserves_non_blank_tip_value() {
+        let tip_lamports =
+            resolve_follow_tip_lamports("jito-bundle", "0.01", "buy tip").expect("jito tip");
+        assert!(tip_lamports > 0);
+    }
+
+    #[test]
+    fn slippage_percent_maps_to_expected_bps() {
+        assert_eq!(slippage_bps_from_percent("20").expect("20%"), 2_000);
+        assert_eq!(slippage_bps_from_percent("0.5").expect("0.5%"), 50);
+        assert_eq!(slippage_bps_from_percent("100").expect("100%"), 10_000);
+    }
 }

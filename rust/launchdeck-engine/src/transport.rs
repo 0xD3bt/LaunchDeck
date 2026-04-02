@@ -54,6 +54,7 @@ pub struct TransportPlan {
     pub separateTipTransaction: bool,
     pub skipPreflight: bool,
     pub maxRetries: u32,
+    pub standardRpcSubmitEndpoints: Vec<String>,
     pub heliusSenderEndpoint: Option<String>,
     pub heliusSenderEndpoints: Vec<String>,
     pub watchEndpoint: Option<String>,
@@ -168,6 +169,16 @@ fn configured_helius_sender_override() -> Option<String> {
     None
 }
 
+pub fn configured_standard_rpc_submit_endpoints() -> Vec<String> {
+    env::var("LAUNCHDECK_STANDARD_RPC_SEND_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn helius_sender_endpoint_override_active() -> bool {
     configured_helius_sender_override().is_some()
 }
@@ -222,11 +233,8 @@ pub fn supports_helius_transaction_subscribe(
     endpoint_profile: &str,
     watch_endpoint: Option<&str>,
 ) -> bool {
-    let normalized_provider = normalize_provider(provider);
+    let _ = normalize_provider(provider);
     let _ = normalize_endpoint_profile(provider, endpoint_profile);
-    if normalized_provider != "helius-sender" {
-        return false;
-    }
     watch_endpoint
         .map(|endpoint| endpoint.trim().to_ascii_lowercase().contains("helius"))
         .unwrap_or(false)
@@ -251,10 +259,10 @@ pub fn execution_class(execution: &NormalizedExecution, transaction_count: usize
 pub fn transport_type(execution: &NormalizedExecution, transaction_count: usize) -> String {
     let provider = resolved_provider(execution, transaction_count);
     match provider.as_str() {
-        "standard-rpc" => "standard-rpc-sequential".to_string(),
+        "standard-rpc" => "standard-rpc-fanout".to_string(),
         "helius-sender" => "helius-sender".to_string(),
         "jito-bundle" => "jito-bundle".to_string(),
-        _ => "standard-rpc-sequential".to_string(),
+        _ => "standard-rpc-fanout".to_string(),
     }
 }
 
@@ -377,6 +385,11 @@ pub fn build_transport_plan(
     } else {
         vec![]
     };
+    let standard_rpc_submit_endpoints = if resolved == "standard-rpc" {
+        configured_standard_rpc_submit_endpoints()
+    } else {
+        vec![]
+    };
     let jito_bundle_endpoints = if transport == "jito-bundle" {
         configured_jito_bundle_endpoints_for_profile(&resolved_endpoint_profile)
     } else {
@@ -426,8 +439,14 @@ pub fn build_transport_plan(
         requiresInlineTip: transport == "helius-sender",
         requiresPriorityFee: transport == "helius-sender",
         separateTipTransaction: transport == "jito-bundle",
-        skipPreflight: transport == "helius-sender" || execution.skipPreflight,
-        maxRetries: if transport == "helius-sender" { 0 } else { 3 },
+        skipPreflight: matches!(transport.as_str(), "helius-sender" | "standard-rpc-fanout")
+            || execution.skipPreflight,
+        maxRetries: if matches!(transport.as_str(), "helius-sender" | "standard-rpc-fanout") {
+            0
+        } else {
+            3
+        },
+        standardRpcSubmitEndpoints: standard_rpc_submit_endpoints,
         heliusSenderEndpoint: if transport == "helius-sender" {
             helius_sender_endpoints.first().cloned()
         } else {
@@ -489,9 +508,11 @@ mod tests {
     fn standard_rpc_resolves_to_sequential_transport() {
         let config = sample_config("standard-rpc");
         let plan = build_transport_plan(&config.execution, 2);
-        assert_eq!(plan.transportType, "standard-rpc-sequential");
+        assert_eq!(plan.transportType, "standard-rpc-fanout");
         assert_eq!(plan.executionClass, "sequential");
         assert!(!plan.requiresInlineTip);
+        assert_eq!(plan.maxRetries, 0);
+        assert!(plan.skipPreflight);
     }
 
     #[test]
@@ -582,13 +603,13 @@ mod tests {
     }
 
     #[test]
-    fn helius_transaction_subscribe_requires_helius_sender_and_helius_ws() {
+    fn helius_transaction_subscribe_requires_helius_ws() {
         assert!(supports_helius_transaction_subscribe(
             "helius-sender",
             "global",
             Some("wss://mainnet.helius-rpc.com/?api-key=test")
         ));
-        assert!(!supports_helius_transaction_subscribe(
+        assert!(supports_helius_transaction_subscribe(
             "standard-rpc",
             "global",
             Some("wss://mainnet.helius-rpc.com/?api-key=test")

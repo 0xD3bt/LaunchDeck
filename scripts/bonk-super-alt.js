@@ -18,6 +18,33 @@ const DEFAULT_WALLET_ENV_KEY = "SOLANA_PRIVATE_KEY";
 const EXTEND_CHUNK_SIZE = 20;
 const BONK_USD1_SUPER_LOOKUP_TABLE = "GHVFasDr4sFtF2fMNBLnaRUKeSxX77DgK5SsThB3Ro7U";
 
+function envInt(name, fallback) {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function envBool(name, fallback) {
+  const raw = String(process.env[name] || "").trim().toLowerCase();
+  if (!raw) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(raw)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(raw)) {
+    return false;
+  }
+  return fallback;
+}
+
+function resolveSendOptions() {
+  return {
+    skipPreflight: envBool("BONK_SUPER_ALT_SKIP_PREFLIGHT", true),
+    maxRetries: Math.max(0, envInt("BONK_SUPER_ALT_MAX_RETRIES", 0)),
+    preflightCommitment: "confirmed",
+  };
+}
+
 function parseArgs(argv) {
   const options = {
     statePath: DEFAULT_STATE_PATH,
@@ -162,11 +189,7 @@ async function extendLookupTable(connection, wallet, tableAddress, addresses) {
   transaction.lastValidBlockHeight = lastValidBlockHeight;
   transaction.add(instruction);
   transaction.sign(wallet);
-  const signature = await connection.sendRawTransaction(transaction.serialize(), {
-    skipPreflight: false,
-    maxRetries: 3,
-    preflightCommitment: "confirmed",
-  });
+  const signature = await connection.sendRawTransaction(transaction.serialize(), resolveSendOptions());
   await connection.confirmTransaction(
     { signature, blockhash, lastValidBlockHeight },
     "confirmed",

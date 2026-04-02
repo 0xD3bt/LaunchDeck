@@ -4,6 +4,7 @@ require("dotenv").config({ quiet: true });
 
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 const bs58 = require("bs58");
 const BN = require("bn.js");
 const {
@@ -1133,10 +1134,12 @@ async function readRequest() {
   return raw ? JSON.parse(raw) : {};
 }
 
-async function main() {
-  const request = await readRequest();
+async function handleRequest(request) {
   let response;
   switch (request.action) {
+    case "ping":
+      response = { ok: true };
+      break;
     case "quote":
       response = await quoteLaunch(request);
       break;
@@ -1168,6 +1171,41 @@ async function main() {
     default:
       throw new Error(`Unsupported bags helper action: ${request.action || "(missing)"}`);
   }
+  return response;
+}
+
+async function runWorkerLoop() {
+  const reader = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+  for await (const line of reader) {
+    if (!line.trim()) {
+      continue;
+    }
+    let requestId = null;
+    try {
+      const envelope = JSON.parse(line);
+      requestId = envelope && envelope.requestId != null ? envelope.requestId : null;
+      const result = await handleRequest(envelope.request || {});
+      process.stdout.write(`${JSON.stringify({ requestId, ok: true, result })}\n`);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({
+        requestId,
+        ok: false,
+        error: error && error.message ? error.message : String(error),
+      })}\n`);
+    }
+  }
+}
+
+async function main() {
+  if (process.argv.includes("--worker")) {
+    await runWorkerLoop();
+    return;
+  }
+  const request = await readRequest();
+  const response = await handleRequest(request);
   process.stdout.write(JSON.stringify(response));
 }
 

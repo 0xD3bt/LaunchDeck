@@ -4640,7 +4640,7 @@ button {
   grid-template-columns:
     minmax(74px, 0.9fr)
     repeat(2, minmax(58px, 0.72fr))
-    minmax(156px, 0.98fr);
+    minmax(176px, 1.04fr);
 }
 
 .settings-grid-five {
@@ -4802,6 +4802,10 @@ button {
   align-content: start;
   justify-content: center;
   min-width: 0;
+}
+
+.settings-route-grid > .settings-route-meta {
+  grid-column: -2 / -1;
 }
 
 .settings-auto-fee-button {
@@ -4999,7 +5003,10 @@ label.is-disabled textarea {
 }
 
 .settings-provider-warning {
-  margin-top: 10px;
+  margin-top: 6px;
+  padding: 5px 8px;
+  font-size: 10px;
+  line-height: 1.25;
   text-align: left;
 }
 
@@ -5298,6 +5305,10 @@ label.is-disabled textarea {
   .settings-route-meta {
     grid-template-columns: minmax(84px, auto) minmax(92px, 1fr);
     align-items: stretch;
+  }
+
+  .settings-route-grid > .settings-route-meta {
+    grid-column: auto;
   }
 
   .settings-region-row {

@@ -2,6 +2,7 @@
 
 require("dotenv").config({ quiet: true });
 
+const readline = require("readline");
 const bs58 = require("bs58");
 const BN = require("bn.js");
 const {
@@ -130,6 +131,42 @@ function writeTimedCache(map, key, value) {
     storedAtMs: Date.now(),
     value,
   });
+}
+
+function connectionCacheScope(connection) {
+  return String(
+    (connection && (connection.rpcEndpoint || connection._rpcEndpoint)) || "",
+  ).trim();
+}
+
+function buildAccountReadConfig(commitment, extra = {}) {
+  const config = { ...extra };
+  if (commitment) {
+    config.commitment = commitment;
+  }
+  return Object.keys(config).length ? config : undefined;
+}
+
+async function fetchMultipleAccountsInfo(connection, pubkeys, commitment, extra = {}) {
+  const config = buildAccountReadConfig(commitment, extra);
+  return config
+    ? connection.getMultipleAccountsInfo(pubkeys, config)
+    : connection.getMultipleAccountsInfo(pubkeys);
+}
+
+async function fetchRequiredAccountPair(connection, first, second, commitment) {
+  const [firstAccount, secondAccount] = await fetchMultipleAccountsInfo(
+    connection,
+    [first.pubkey, second.pubkey],
+    commitment,
+  );
+  if (!firstAccount) {
+    throw new Error(`${first.label} account not found: ${first.pubkey.toBase58()}`);
+  }
+  if (!secondAccount) {
+    throw new Error(`${second.label} account not found: ${second.pubkey.toBase58()}`);
+  }
+  return [firstAccount, secondAccount];
 }
 
 function readUsd1RouteSetupCache(key, ttlMs) {
@@ -322,13 +359,20 @@ async function waitForWalletTokenAccountVisibility(raydium, owner, mint, ata, co
 
 async function ensureAssociatedTokenAccountExists(connection, owner, mint, request, raydium) {
   const commitment = request.commitment || "confirmed";
-  const mintInfo = await connection.getAccountInfo(mint, commitment);
+  const minimalReadConfig = buildAccountReadConfig(commitment, {
+    dataSlice: { offset: 0, length: 0 },
+  });
+  const mintInfo = minimalReadConfig
+    ? await connection.getAccountInfo(mint, minimalReadConfig)
+    : await connection.getAccountInfo(mint);
   if (!mintInfo) {
     throw new Error(`Token mint account not found: ${mint.toBase58()}`);
   }
   const tokenProgramId = mintInfo.owner;
   const ata = getAssociatedTokenAddressSync(mint, owner.publicKey, false, tokenProgramId);
-  const existingAta = await connection.getAccountInfo(ata, commitment);
+  const existingAta = minimalReadConfig
+    ? await connection.getAccountInfo(ata, minimalReadConfig)
+    : await connection.getAccountInfo(ata);
   if (existingAta) {
     const visible = await waitForWalletTokenAccountVisibility(
       raydium,
@@ -379,6 +423,8 @@ async function ensureAssociatedTokenAccountExists(connection, owner, mint, reque
   transaction.recentBlockhash = blockhash;
   transaction.sign(owner);
   const signature = await connection.sendRawTransaction(transaction.serialize(), {
+    skipPreflight: true,
+    maxRetries: 0,
     preflightCommitment: commitment,
   });
   const confirmation = await connection.confirmTransaction(
@@ -866,7 +912,8 @@ async function combineAtomicUsd1ActionTransaction(connection, owner, request, sw
 async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regular", quoteAsset = "sol") {
   const launchMode = normalizeBonkLaunchMode(mode);
   const quote = resolveQuoteAssetConfig(quoteAsset);
-  const cacheKey = `${launchMode}:${quote.asset}`;
+  const cacheScope = connectionCacheScope(connection);
+  const cacheKey = `${cacheScope}:${launchMode}:${quote.asset}`;
   const ttlMs = bonkLaunchDefaultsCacheTtlMs();
   const cached = readTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, cacheKey, ttlMs);
   const staticDefaults = cached || await (async () => {
@@ -876,7 +923,7 @@ async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regu
     const loader = (async () => {
       const { platformId } = resolveBonkPlatform(launchMode);
       const configId = getPdaLaunchpadConfigId(LAUNCHPAD_PROGRAM, quote.mint, 0, 0).publicKey;
-      const launchConfigsKey = "launch-configs";
+      const launchConfigsKey = `launch-configs:${cacheScope}`;
       const launchConfigsCached = readTimedCache(
         RAYDIUM_LAUNCH_CONFIGS_CACHE,
         launchConfigsKey,
@@ -899,17 +946,15 @@ async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regu
           RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT.set(launchConfigsKey, promise);
           return promise;
         })();
-      const [configAccount, platformAccount, launchConfigs] = await Promise.all([
-        connection.getAccountInfo(configId),
-        connection.getAccountInfo(platformId),
+      const [accountPair, launchConfigs] = await Promise.all([
+        fetchRequiredAccountPair(
+          connection,
+          { pubkey: configId, label: "Launch config" },
+          { pubkey: platformId, label: "Launch platform" },
+        ),
         launchConfigsPromise,
       ]);
-      if (!configAccount) {
-        throw new Error(`Launch config account not found: ${configId.toBase58()}`);
-      }
-      if (!platformAccount) {
-        throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
-      }
+      const [configAccount, platformAccount] = accountPair;
       const apiConfig = launchConfigs.find((entry) => entry.key.pubKey === configId.toBase58());
       if (!apiConfig) {
         throw new Error(`Raydium launch config defaults not found for ${configId.toBase58()}`);
@@ -1033,16 +1078,11 @@ async function loadLivePoolContext(raydium, connection, mint, quoteAsset) {
         const platformId = poolInfo.platformId && poolInfo.platformId.toBase58
           ? poolInfo.platformId
           : new PublicKey(String(poolInfo.platformId || ""));
-        const [configAccount, platformAccount] = await Promise.all([
-          connection.getAccountInfo(configId),
-          connection.getAccountInfo(platformId),
-        ]);
-        if (!configAccount) {
-          throw new Error(`Launch config account not found: ${configId.toBase58()}`);
-        }
-        if (!platformAccount) {
-          throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
-        }
+        const [configAccount, platformAccount] = await fetchRequiredAccountPair(
+          connection,
+          { pubkey: configId, label: "Launch config" },
+          { pubkey: platformId, label: "Launch platform" },
+        );
         return {
           poolId,
           poolInfo,
@@ -1075,16 +1115,11 @@ async function loadPoolContextByPoolId(raydium, connection, poolIdInput, quoteAs
   const platformId = poolInfo.platformId && poolInfo.platformId.toBase58
     ? poolInfo.platformId
     : new PublicKey(String(poolInfo.platformId || ""));
-  const [configAccount, platformAccount] = await Promise.all([
-    connection.getAccountInfo(configId),
-    connection.getAccountInfo(platformId),
-  ]);
-  if (!configAccount) {
-    throw new Error(`Launch config account not found: ${configId.toBase58()}`);
-  }
-  if (!platformAccount) {
-    throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
-  }
+  const [configAccount, platformAccount] = await fetchRequiredAccountPair(
+    connection,
+    { pubkey: configId, label: "Launch config" },
+    { pubkey: platformId, label: "Launch platform" },
+  );
   const quote = resolveQuoteAssetConfig(quoteAsset);
   return {
     poolId,
@@ -1211,8 +1246,13 @@ async function estimateDevBuyTokenAmount(raydium, connection, defaults, devBuy, 
   return new BN(curveQuote.amountA.amount.toString());
 }
 
-function buildUsd1RouteSetupCacheKey() {
-  return `usd1-route-setup:${PINNED_USD1_ROUTE_POOL_ID}:${PREFERRED_USD1_ROUTE_CONFIG}`;
+function buildUsd1RouteSetupCacheKey(connection) {
+  return [
+    "usd1-route-setup",
+    connectionCacheScope(connection),
+    PINNED_USD1_ROUTE_POOL_ID,
+    PREFERRED_USD1_ROUTE_CONFIG,
+  ].join(":");
 }
 
 function toBasicPoolInfo(pool) {
@@ -1228,7 +1268,7 @@ function toBasicPoolInfo(pool) {
 async function loadUsd1RouteSetup(raydium, connection, requestContext = null) {
   const context = ensureUsd1QuoteRequestContext(requestContext);
   const policy = getUsd1TopupPolicy();
-  const cacheKey = buildUsd1RouteSetupCacheKey();
+  const cacheKey = buildUsd1RouteSetupCacheKey(connection);
   if (context.localCache.has(cacheKey)) {
     addUsd1QuoteMetric(context.metrics, "routeSetupLocalHits");
     return context.localCache.get(cacheKey);
@@ -2283,10 +2323,12 @@ async function readRequest() {
   return raw ? JSON.parse(raw) : {};
 }
 
-async function main() {
-  const request = await readRequest();
+async function handleRequest(request) {
   let response;
   switch (request.action) {
+    case "ping":
+      response = { ok: true };
+      break;
     case "quote":
       response = await quoteLaunch(request);
       break;
@@ -2323,6 +2365,41 @@ async function main() {
     default:
       throw new Error(`Unsupported bonk helper action: ${request.action || "(missing)"}`);
   }
+  return response;
+}
+
+async function runWorkerLoop() {
+  const reader = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
+  for await (const line of reader) {
+    if (!line.trim()) {
+      continue;
+    }
+    let requestId = null;
+    try {
+      const envelope = JSON.parse(line);
+      requestId = envelope && envelope.requestId != null ? envelope.requestId : null;
+      const result = await handleRequest(envelope.request || {});
+      process.stdout.write(`${JSON.stringify({ requestId, ok: true, result })}\n`);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({
+        requestId,
+        ok: false,
+        error: error && error.message ? error.message : String(error),
+      })}\n`);
+    }
+  }
+}
+
+async function main() {
+  if (process.argv.includes("--worker")) {
+    await runWorkerLoop();
+    return;
+  }
+  const request = await readRequest();
+  const response = await handleRequest(request);
   process.stdout.write(JSON.stringify(response));
 }
 

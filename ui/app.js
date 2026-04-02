@@ -150,6 +150,7 @@ const agentSplitList = document.getElementById("agent-split-list");
 const agentSplitAdd = document.getElementById("agent-split-add");
 const agentSplitReset = document.getElementById("agent-split-reset");
 const agentSplitEven = document.getElementById("agent-split-even");
+const agentSplitClearAll = document.getElementById("agent-split-clear-all");
 const agentSplitTotal = document.getElementById("agent-split-total");
 const agentSplitBar = document.getElementById("agent-split-bar");
 const agentSplitLegendList = document.getElementById("agent-split-legend-list");
@@ -163,6 +164,7 @@ const feeSplitList = document.getElementById("fee-split-list");
 const feeSplitAdd = document.getElementById("fee-split-add");
 const feeSplitReset = document.getElementById("fee-split-reset");
 const feeSplitEven = document.getElementById("fee-split-even");
+const feeSplitClearAll = document.getElementById("fee-split-clear-all");
 const feeSplitTotal = document.getElementById("fee-split-total");
 const feeSplitBar = document.getElementById("fee-split-bar");
 const feeSplitLegendList = document.getElementById("fee-split-legend-list");
@@ -323,6 +325,8 @@ let importedCreatorFeeState = {
   githubUserId: "",
 };
 let feeSplitModalSnapshot = null;
+let feeSplitClearAllRestoreSnapshot = null;
+let agentSplitClearAllRestoreSnapshot = null;
 let walletStatusRequestSerial = 0;
 let appBootstrapState = {
   started: false,
@@ -339,6 +343,8 @@ let startupWarmState = {
 };
 const STARTUP_WARM_REQUEST_TIMEOUT_MS = 4000;
 const STARTUP_WARM_WAIT_TIMEOUT_MS = 1500;
+const RUNTIME_STATUS_REFRESH_INTERVAL_MS = 15000;
+const WARM_ACTIVITY_DEBOUNCE_MS = 1000;
 let quoteTimer = null;
 let defaultsApplied = false;
 const requestStates = {
@@ -368,6 +374,12 @@ let metadataUploadState = {
   staleWhileUploading: false,
   autoRetryFailures: 0,
   autoRetryDisabled: false,
+};
+let runtimeStatusRefreshTimer = null;
+let warmActivityState = {
+  debounceTimer: null,
+  inFlightPromise: null,
+  lastSentAtMs: 0,
 };
 let imageLibraryState = {
   images: [],
@@ -719,6 +731,55 @@ function applyFeeSplitDraft(value, { persist = false } = {}) {
   if (persist) setStoredFeeSplitDraft(draft);
 }
 
+function feeSplitClearAllDraft() {
+  const deployerAddress = latestWalletStatus && latestWalletStatus.wallet ? latestWalletStatus.wallet : "";
+  return normalizeFeeSplitDraft({
+    enabled: true,
+    suppressDefaultRow: false,
+    rows: [{
+      type: "wallet",
+      value: deployerAddress,
+      githubUserId: "",
+      sharePercent: "100",
+      defaultReceiver: true,
+      targetLocked: true,
+    }],
+  });
+}
+
+function updateFeeSplitClearAllButton() {
+  if (!feeSplitClearAll) return;
+  feeSplitClearAll.textContent = feeSplitClearAllRestoreSnapshot ? "Restore All" : "Clear All";
+}
+
+function clearFeeSplitRestoreState() {
+  feeSplitClearAllRestoreSnapshot = null;
+  updateFeeSplitClearAllButton();
+}
+
+function agentSplitClearAllDraft() {
+  return normalizeAgentSplitDraft({
+    rows: [{
+      locked: true,
+      type: "wallet",
+      value: "",
+      sharePercent: "100",
+      defaultReceiver: false,
+      targetLocked: true,
+    }],
+  });
+}
+
+function updateAgentSplitClearAllButton() {
+  if (!agentSplitClearAll) return;
+  agentSplitClearAll.textContent = agentSplitClearAllRestoreSnapshot ? "Restore All" : "Clear All";
+}
+
+function clearAgentSplitRestoreState() {
+  agentSplitClearAllRestoreSnapshot = null;
+  updateAgentSplitClearAllButton();
+}
+
 function serializeAgentSplitDraft() {
   return {
     rows: getAgentSplitRows().map((row) => ({
@@ -744,6 +805,77 @@ function normalizeAgentSplitDraft(value) {
     }))
     : [];
   return { rows };
+}
+
+function buildAgentSplitDraftFromFeeSplitDraft(value) {
+  const draft = normalizeFeeSplitDraft(value);
+  if (!draft.enabled && draft.rows.length === 0) {
+    return normalizeAgentSplitDraft({ rows: [] });
+  }
+  const defaultReceiverRow = draft.rows.find((row) => row.defaultReceiver);
+  const carriedRows = draft.rows
+    .filter((row) => !row.defaultReceiver)
+    .map((row) => ({
+      locked: false,
+      type: row.type === "github" ? "github" : "wallet",
+      value: row.value,
+      sharePercent: row.sharePercent,
+      defaultReceiver: false,
+      targetLocked: Boolean(row.targetLocked),
+    }));
+  if (!defaultReceiverRow && carriedRows.length === 0) {
+    return normalizeAgentSplitDraft({ rows: [] });
+  }
+  return normalizeAgentSplitDraft({
+    rows: [
+      {
+        locked: true,
+        type: "wallet",
+        value: "",
+        sharePercent: defaultReceiverRow ? defaultReceiverRow.sharePercent : (carriedRows.length > 0 ? "0" : ""),
+        defaultReceiver: false,
+        targetLocked: true,
+      },
+      ...carriedRows,
+    ],
+  });
+}
+
+function buildFeeSplitDraftFromAgentSplitDraft(value) {
+  const draft = normalizeAgentSplitDraft(value);
+  if (draft.rows.length === 0) {
+    return normalizeFeeSplitDraft({ enabled: false, rows: [] });
+  }
+  const agentRow = draft.rows.find((row) => row.locked || row.type === "agent");
+  const deployerAddress = latestWalletStatus && latestWalletStatus.wallet ? latestWalletStatus.wallet : "";
+  const carriedRows = draft.rows
+    .filter((row) => !row.locked && row.type !== "agent")
+    .map((row) => ({
+      type: row.type === "github" ? "github" : "wallet",
+      value: row.value,
+      githubUserId: "",
+      sharePercent: row.sharePercent,
+      defaultReceiver: false,
+      targetLocked: Boolean(row.targetLocked),
+    }));
+  if ((!agentRow || !agentRow.sharePercent) && carriedRows.length === 0) {
+    return normalizeFeeSplitDraft({ enabled: false, rows: [] });
+  }
+  return normalizeFeeSplitDraft({
+    enabled: carriedRows.length > 0 || Boolean(agentRow && agentRow.sharePercent),
+    suppressDefaultRow: false,
+    rows: [
+      {
+        type: "wallet",
+        value: deployerAddress,
+        githubUserId: "",
+        sharePercent: agentRow ? agentRow.sharePercent : "",
+        defaultReceiver: true,
+        targetLocked: true,
+      },
+      ...carriedRows,
+    ],
+  });
 }
 
 function getStoredAgentSplitDraft() {
@@ -845,6 +977,20 @@ function applyAgentSplitDraft(value, { persist = false } = {}) {
   normalizeAgentSplitStructure();
   syncAgentSplitTotals();
   if (persist) setStoredAgentSplitDraft(draft);
+}
+
+function syncAgentSplitDraftFromFeeSplitDraft(value) {
+  const draft = buildAgentSplitDraftFromFeeSplitDraft(value);
+  applyAgentSplitDraft(draft, { persist: false });
+  setStoredAgentSplitDraft(draft);
+  return draft;
+}
+
+function syncFeeSplitDraftFromAgentSplitDraft(value) {
+  const draft = buildFeeSplitDraftFromAgentSplitDraft(value);
+  applyFeeSplitDraft(draft, { persist: false });
+  setStoredFeeSplitDraft(draft);
+  return draft;
 }
 
 function formatShareBpsAsPercent(shareBps) {
@@ -1731,6 +1877,25 @@ function formatBackendRegionValue(value, fallback = "global") {
   return normalized || fallback;
 }
 
+function formatWarmProviders(values = []) {
+  const normalized = Array.isArray(values)
+    ? values.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  return normalized.length ? normalized.join(" | ") : "--";
+}
+
+function formatWarmTimestamp(value) {
+  const timestampMs = Number(value || 0);
+  if (!timestampMs) return "--";
+  const date = new Date(timestampMs);
+  if (Number.isNaN(date.getTime())) return "--";
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function renderBackendRegionSummary(regionRouting = latestWalletStatus && latestWalletStatus.regionRouting) {
   if (!settingsBackendRegionSummary) return;
   if (!regionRouting || typeof regionRouting !== "object") {
@@ -1748,6 +1913,9 @@ function renderBackendRegionSummary(regionRouting = latestWalletStatus && latest
   }
   const shared = regionRouting && regionRouting.shared ? regionRouting.shared : {};
   const providers = regionRouting && regionRouting.providers ? regionRouting.providers : {};
+  const warm = latestRuntimeStatus && latestRuntimeStatus.warm && typeof latestRuntimeStatus.warm === "object"
+    ? latestRuntimeStatus.warm
+    : null;
   const sharedConfigured = formatBackendRegionValue(shared.configured, "None");
   const sharedEffective = formatBackendRegionValue(shared.effective);
   const providerRows = ["helius-sender", "jito-bundle"].map((provider) => {
@@ -1767,6 +1935,17 @@ function renderBackendRegionSummary(regionRouting = latestWalletStatus && latest
       </div>
     `;
   }).join("");
+  const warmCard = warm ? `
+      <div class="settings-region-card settings-region-card-shared">
+        <div class="settings-region-card-head">
+          <strong>Warm</strong>
+          <span class="settings-region-effective">${escapeHTML(warm.active ? "active" : "suspended")}</span>
+        </div>
+        <div class="settings-region-meta">${escapeHTML(String(warm.reason || "--"))}</div>
+        <div class="settings-region-meta">Providers: ${escapeHTML(formatWarmProviders(warm.selectedProviders))}</div>
+        <div class="settings-region-meta">Last active: ${escapeHTML(formatWarmTimestamp(warm.lastActivityAtMs))}</div>
+      </div>
+    ` : "";
   const markup = `
     <div class="settings-region-row">
       <div class="settings-region-card settings-region-card-shared">
@@ -1777,6 +1956,7 @@ function renderBackendRegionSummary(regionRouting = latestWalletStatus && latest
         <div class="settings-region-meta">Configured: ${escapeHTML(sharedConfigured)}</div>
       </div>
       ${providerRows}
+      ${warmCard}
     </div>
     <div class="settings-sidebar-note">
       Region defaults are recommended because provider fanout usually reaches more nearby supported endpoints and lands faster and more reliably than pinning one endpoint. Change backend env values, then run <code>npm restart</code>.
@@ -2643,9 +2823,9 @@ function ensureStandardRpcSlippageDefault(input, provider) {
 function standardRpcSlippageWarningText(sideLabel, input) {
   const parsed = parseNumericSettingValue(input && input.value);
   const overrideText = parsed != null && parsed > Number(STANDARD_RPC_SLIPPAGE_DEFAULT)
-    ? " You set it above 20%. Only keep that if intentional."
-    : " Default is 20%. Raise it only if intentional.";
-  return `Warning: Standard RPC ${sideLabel} can slip badly. Watch slippage.${overrideText}`;
+    ? " Over 20% is only for intentional edge cases."
+    : " Default is 20%."
+  return `Standard RPC ${sideLabel}: higher slip risk.${overrideText}`;
 }
 
 function syncStandardRpcWarnings() {
@@ -3504,6 +3684,7 @@ function showFeeSplitModal() {
   const mode = getMode();
   if (mode === "regular" || mode.startsWith("bags-")) {
     feeSplitModalSnapshot = normalizeFeeSplitDraft(serializeFeeSplitDraft());
+    clearFeeSplitRestoreState();
     feeSplitEnabled.checked = true;
     updateFeeSplitVisibility();
     ensureFeeSplitDefaultRow();
@@ -3518,6 +3699,7 @@ function showFeeSplitModal() {
 
 function hideFeeSplitModal() {
   setFeeSplitModalError("");
+  clearFeeSplitRestoreState();
   if (feeSplitModal) feeSplitModal.hidden = true;
 }
 
@@ -3531,6 +3713,7 @@ function attemptCloseFeeSplitModal() {
   applyFeeSplitDraft(nextDraft, { persist: false });
   updateFeeSplitVisibility();
   setStoredFeeSplitDraft(nextDraft);
+  syncAgentSplitDraftFromFeeSplitDraft(nextDraft);
   feeSplitModalSnapshot = nextDraft;
   hideFeeSplitModal();
   return true;
@@ -3665,12 +3848,14 @@ function initAgentSplitIfEmpty() {
 function showAgentSplitModal() {
   if (getMode() !== "agent-custom") return;
   initAgentSplitIfEmpty();
+  clearAgentSplitRestoreState();
   syncAgentSplitTotals();
   if (agentSplitModalError) agentSplitModalError.textContent = "";
   if (agentSplitModal) agentSplitModal.hidden = false;
 }
 
 function hideAgentSplitModal() {
+  clearAgentSplitRestoreState();
   if (agentSplitModal) agentSplitModal.hidden = true;
 }
 
@@ -3729,7 +3914,9 @@ function attemptCloseAgentSplitModal() {
     setAgentSplitModalError(errors[0]);
     return false;
   }
-  setStoredAgentSplitDraft(serializeAgentSplitDraft());
+  const nextDraft = normalizeAgentSplitDraft(serializeAgentSplitDraft());
+  setStoredAgentSplitDraft(nextDraft);
+  syncFeeSplitDraftFromAgentSplitDraft(nextDraft);
   setAgentSplitModalError("");
   hideAgentSplitModal();
   return true;
@@ -3890,6 +4077,7 @@ function applyPersistentDefaults(config) {
   if (!config || defaultsApplied) return;
   const defaults = config.defaults || {};
   setImportedCreatorFeeState(null);
+  const defaultMode = defaults.mode || "regular";
   const storedSniperDraft = getStoredSniperDraft();
   const storedMode = getStoredLaunchMode();
   const storedLaunchpad = getStoredLaunchpad();
@@ -3897,6 +4085,9 @@ function applyPersistentDefaults(config) {
   const storedFeeSplitDraft = getStoredFeeSplitDraft();
   const storedAgentSplitDraft = getStoredAgentSplitDraft();
   const storedAutoSellDraft = getStoredAutoSellDraft();
+  const resolvedMode = storedMode || defaultMode;
+  const resolvedFeeSplitDraft = storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null;
+  const resolvedAgentSplitDraft = storedAgentSplitDraft || (defaults.misc && defaults.misc.agentSplitDraft) || null;
   setLaunchpad(storedLaunchpad || defaults.launchpad || "pump");
   if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
   setConfig(config);
@@ -3930,14 +4121,13 @@ function applyPersistentDefaults(config) {
       marketCapTimeoutAction: defaults.automaticDevSell.marketCapTimeoutAction || "stop",
     }, { persist: false });
   }
-  applyFeeSplitDraft(
-    storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null,
-    { persist: false },
-  );
-  applyAgentSplitDraft(
-    storedAgentSplitDraft || (defaults.misc && defaults.misc.agentSplitDraft) || null,
-    { persist: false },
-  );
+  applyFeeSplitDraft(resolvedFeeSplitDraft, { persist: false });
+  applyAgentSplitDraft(resolvedAgentSplitDraft, { persist: false });
+  if (resolvedMode === "agent-custom" && resolvedAgentSplitDraft) {
+    syncFeeSplitDraftFromAgentSplitDraft(resolvedAgentSplitDraft);
+  } else if (resolvedFeeSplitDraft) {
+    syncAgentSplitDraftFromFeeSplitDraft(resolvedFeeSplitDraft);
+  }
   if (defaults.misc && defaults.misc.bagsIdentity) {
     setBagsIdentityStateInputs({
       mode: String(defaults.misc.bagsIdentity.mode || "wallet-only").trim().toLowerCase() === "linked"
@@ -3946,7 +4136,7 @@ function applyPersistentDefaults(config) {
       agentUsername: defaults.misc.bagsIdentity.agentUsername || "",
     });
   }
-  setMode(storedMode || defaults.mode || "regular");
+  setMode(resolvedMode);
   setPresetEditing(Boolean(defaults.presetEditing));
   if (!storedSniperDraft && defaults.misc && defaults.misc.sniperDraft) {
     sniperFeature.setState(normalizeSniperDraftState(defaults.misc.sniperDraft));
@@ -4425,8 +4615,66 @@ function applyBootstrapFastPayload(payload) {
 function applyRuntimeStatusPayload(payload) {
   latestRuntimeStatus = payload;
   markBootstrapState({ runtimeLoaded: true });
+  renderBackendRegionSummary();
   syncFollowStatusChrome();
   refreshFollowJobs({ silent: true }).catch(() => {});
+}
+
+function currentWarmActivityPayload() {
+  return {
+    creationProvider: providerSelect ? providerSelect.value : "",
+    buyProvider: buyProviderSelect ? buyProviderSelect.value : "",
+    sellProvider: sellProviderSelect ? sellProviderSelect.value : "",
+  };
+}
+
+async function flushWarmActivity() {
+  if (warmActivityState.debounceTimer) {
+    window.clearTimeout(warmActivityState.debounceTimer);
+    warmActivityState.debounceTimer = null;
+  }
+  if (warmActivityState.inFlightPromise) return warmActivityState.inFlightPromise;
+  warmActivityState.lastSentAtMs = Date.now();
+  warmActivityState.inFlightPromise = fetch("/api/warm/activity", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(currentWarmActivityPayload()),
+  })
+    .then((response) => response.json().catch(() => ({})).then((payload) => ({ response, payload })))
+    .then(({ response, payload }) => {
+      if (!response.ok || !payload.ok || !payload.warm) return;
+      latestRuntimeStatus = {
+        ...(latestRuntimeStatus || {}),
+        warm: payload.warm,
+      };
+      renderBackendRegionSummary();
+    })
+    .catch(() => {})
+    .finally(() => {
+      warmActivityState.inFlightPromise = null;
+    });
+  return warmActivityState.inFlightPromise;
+}
+
+function queueWarmActivity({ immediate = false } = {}) {
+  const now = Date.now();
+  if (immediate || now - warmActivityState.lastSentAtMs >= WARM_ACTIVITY_DEBOUNCE_MS) {
+    flushWarmActivity().catch(() => {});
+    return;
+  }
+  if (warmActivityState.debounceTimer) window.clearTimeout(warmActivityState.debounceTimer);
+  warmActivityState.debounceTimer = window.setTimeout(() => {
+    flushWarmActivity().catch(() => {});
+  }, WARM_ACTIVITY_DEBOUNCE_MS);
+}
+
+function startRuntimeStatusRefreshLoop() {
+  if (runtimeStatusRefreshTimer) window.clearInterval(runtimeStatusRefreshTimer);
+  runtimeStatusRefreshTimer = window.setInterval(() => {
+    refreshRuntimeStatus().catch(() => {});
+  }, RUNTIME_STATUS_REFRESH_INTERVAL_MS);
 }
 
 function runtimeFollowDaemonStatus() {
@@ -6103,7 +6351,7 @@ function benchmarkModeLabel(mode) {
   const normalized = String(mode || "").trim().toLowerCase();
   if (!normalized) return "";
   if (normalized === "off") return "Off";
-  if (normalized === "basic") return "Basic";
+  if (normalized === "light" || normalized === "basic") return "Light";
   if (normalized === "full") return "Full";
   return String(mode || "").trim();
 }
@@ -6144,6 +6392,53 @@ function benchmarkTimingGroupsFromPayload(benchmark = {}, execution = {}) {
 
 function benchmarkTimingGroupByKey(groups, key) {
   return Array.isArray(groups) ? groups.find((group) => group && group.key === key) : null;
+}
+
+function currentReportsTerminalAutoFee() {
+  const execution = currentReportsTerminalExecution();
+  return execution && execution.autoFee && typeof execution.autoFee === "object"
+    ? execution.autoFee
+    : null;
+}
+
+function formatLamportsForReport(value) {
+  const numeric = parseReportMetricNumber(value);
+  if (numeric == null) return "--";
+  return numeric.toLocaleString();
+}
+
+function buildAutoFeeActionCards(label, action) {
+  if (!action || typeof action !== "object" || !action.enabled) return [];
+  return [
+    { label: `${label} Provider`, value: action.provider || "--" },
+    { label: `${label} Priority Source`, value: action.prioritySource || "--", detail: action.priorityEstimateLamports != null ? `${formatLamportsForReport(action.priorityEstimateLamports)} est` : "" },
+    { label: `${label} Priority Used`, value: action.resolvedPriorityLamports != null ? formatLamportsForReport(action.resolvedPriorityLamports) : "--" },
+    { label: `${label} Tip Source`, value: action.tipSource || "--", detail: action.tipEstimateLamports != null ? `${formatLamportsForReport(action.tipEstimateLamports)} est` : "" },
+    { label: `${label} Tip Used`, value: action.resolvedTipLamports != null ? formatLamportsForReport(action.resolvedTipLamports) : "--" },
+    { label: `${label} Cap`, value: action.capLamports != null ? formatLamportsForReport(action.capLamports) : "--" },
+  ];
+}
+
+function buildAutoFeeBenchmarkSection(autoFee, benchmarkMode) {
+  if (!autoFee || benchmarkMode !== "Full") return "";
+  const snapshot = autoFee.snapshot && typeof autoFee.snapshot === "object" ? autoFee.snapshot : {};
+  const snapshotCards = [
+    { label: "Generic Helius", value: snapshot.helius_priority_lamports != null ? formatLamportsForReport(snapshot.helius_priority_lamports) : "--" },
+    { label: "Launch Template", value: snapshot.helius_launch_priority_lamports != null ? formatLamportsForReport(snapshot.helius_launch_priority_lamports) : "--" },
+    { label: "Trade Template", value: snapshot.helius_trade_priority_lamports != null ? formatLamportsForReport(snapshot.helius_trade_priority_lamports) : "--" },
+    { label: "Jito p99", value: snapshot.jito_tip_p99_lamports != null ? formatLamportsForReport(snapshot.jito_tip_p99_lamports) : "--" },
+  ];
+  const actionCards = []
+    .concat(buildAutoFeeActionCards("Creation", autoFee.creation))
+    .concat(buildAutoFeeActionCards("Buy", autoFee.buy))
+    .concat(buildAutoFeeActionCards("Sell", autoFee.sell));
+  return `
+    <section class="reports-panel-section">
+      <div class="reports-panel-title">Auto-Fee Sources</div>
+      <div class="reports-panel-note">Full benchmark mode only. Shows the warm snapshot values and which source each live auto-fee path used.</div>
+      ${renderReportMetricGrid(snapshotCards.concat(actionCards))}
+    </section>
+  `;
 }
 
 function sumMetricNumbers(values = []) {
@@ -6265,8 +6560,8 @@ function buildBenchmarkReconciliationSections(timings = {}, benchmarkMode = "") 
       buildTimingMetricItem("Simulate total", rollup.simulateTotal, "inclusive simulate stage"),
       buildTimingMetricItem("Send total", rollup.sendTotal, "inclusive send stage"),
       buildTimingMetricItem("Reporting overhead", rollup.reportingOverhead, "persist/render/report-sync work kept out of core execution"),
-      buildTimingMetricItem("Backend remainder", rollup.backendRemainder, modeLabel === "Basic"
-        ? "backend time not broken into smaller steps in basic mode"
+      buildTimingMetricItem("Backend remainder", rollup.backendRemainder, modeLabel === "Light"
+        ? "backend time not broken into smaller steps in light mode"
         : "backend time not yet broken into smaller steps", { hideZero: true }),
     ],
   };
@@ -6460,6 +6755,18 @@ function shortenReportEndpoint(endpoint) {
   }
 }
 
+function formatReportEndpointList(endpoints = []) {
+  const normalized = Array.isArray(endpoints)
+    ? endpoints
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+    : [];
+  if (!normalized.length) return "--";
+  return Array.from(new Set(normalized))
+    .map((value) => shortenReportEndpoint(value))
+    .join(" | ");
+}
+
 function formatWatcherModeLabel(mode) {
   const normalized = String(mode || "").trim().toLowerCase();
   if (!normalized) return "";
@@ -6608,6 +6915,11 @@ function buildReportsOverviewMarkup() {
   const problemCount = actions.filter((action) => ["failed", "cancelled", "expired"].includes(String(action.state || "").toLowerCase())).length;
   const runningCount = actions.filter((action) => ["running", "eligible", "armed", "queued", "sent"].includes(String(action.state || "").toLowerCase())).length;
   const combinedWatcherCard = buildCombinedFollowWatcherCard(actions, health);
+  const formatDaemonCapacityValue = (available, max) => {
+    if (max == null) return "Uncapped";
+    if (available == null) return "--";
+    return String(available);
+  };
   const overviewCards = [
     { label: "Action", value: entry && entry.action ? entry.action : payload && payload.action ? payload.action : "--" },
     { label: "Mint", value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--" },
@@ -6626,8 +6938,8 @@ function buildReportsOverviewMarkup() {
       { label: "Signature Watcher", value: health.signatureWatcher || "--", detail: buildWatcherDetail(health.signatureWatcherMode) },
       { label: "Market Watcher", value: health.marketWatcher || "--", detail: buildWatcherDetail(health.marketWatcherMode) },
       { label: "Queue Depth", value: String(health.queueDepth != null ? health.queueDepth : "--") },
-      { label: "Compile Slots", value: String(health.availableCompileSlots != null ? health.availableCompileSlots : "--") },
-      { label: "Send Slots", value: String(health.availableSendSlots != null ? health.availableSendSlots : "--") },
+      { label: "Compile Slots", value: formatDaemonCapacityValue(health.availableCompileSlots, health.maxConcurrentCompiles) },
+      { label: "Send Slots", value: formatDaemonCapacityValue(health.availableSendSlots, health.maxConcurrentSends) },
     ]
     : [];
   return `
@@ -6703,12 +7015,16 @@ function buildReportsActionsMarkup() {
                 <div class="reports-action-head">
                   <div>
                     <strong>${escapeHTML(formatLaunchTransactionLabel(sent.label || "launch"))}</strong>
-                    <div class="reports-action-subtitle">${escapeHTML(execution.resolvedProvider || execution.provider || execution.transportType || "--")}</div>
+                    <div class="reports-action-subtitle">${escapeHTML([
+                      execution.resolvedProvider || execution.provider || execution.transportType || "--",
+                      sent.endpoint ? `winning ${shortenReportEndpoint(sent.endpoint)}` : "",
+                    ].filter(Boolean).join(" | "))}</div>
                   </div>
                   <span class="reports-state-badge ${reportStateClass(sent.confirmationStatus)}">${escapeHTML(sent.confirmationStatus || "sent")}</span>
                 </div>
                 ${renderReportMetricGrid([
-                  { label: "Endpoint", value: shortenReportEndpoint(sent.endpoint) },
+                  { label: "Winning Endpoint", value: shortenReportEndpoint(sent.endpoint) },
+                  { label: "Attempted Endpoints", value: formatReportEndpointList(sent.attemptedEndpoints), detail: Array.isArray(sent.attemptedEndpoints) && sent.attemptedEndpoints.length > 1 ? `${sent.attemptedEndpoints.length} attempted` : "" },
                   { label: "Send Block Height", value: sent.sendObservedBlockHeight != null ? String(sent.sendObservedBlockHeight) : "--" },
                   { label: "Confirm Block Height", value: sent.confirmedObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight) : "--" },
                   { label: "Blocks To Confirm", value: sent.confirmedObservedBlockHeight != null && sent.sendObservedBlockHeight != null ? String(sent.confirmedObservedBlockHeight - sent.sendObservedBlockHeight) : "--" },
@@ -6757,6 +7073,7 @@ function buildReportsActionsMarkup() {
 function buildReportsBenchmarksMarkup() {
   const benchmark = currentReportsTerminalBenchmark() || {};
   const execution = currentReportsTerminalExecution() || {};
+  const autoFee = currentReportsTerminalAutoFee();
   const timings = benchmark.timings || execution.timings || {};
   const benchmarkGroups = benchmarkTimingGroupsFromPayload(benchmark, execution);
   const sent = Array.isArray(benchmark.sent) && benchmark.sent.length ? benchmark.sent : (Array.isArray(execution.sent) ? execution.sent : []);
@@ -6777,6 +7094,7 @@ function buildReportsBenchmarksMarkup() {
   return `
     <div class="reports-panel-stack">
       ${benchmarkMode ? `<section class="reports-panel-section"><div class="reports-panel-title">Benchmark Mode</div><div class="reports-panel-note">${escapeHTML(benchmarkMode)} benchmark collection is active for this report.</div></section>` : ""}
+      ${buildAutoFeeBenchmarkSection(autoFee, benchmarkMode)}
       ${launchSpeedCards.length ? `
         <section class="reports-panel-section reports-panel-section-launch-speed">
           <div class="reports-panel-title">Launch Speed</div>
@@ -8164,6 +8482,7 @@ document.addEventListener("click", (event) => {
 });
 
 feeSplitAdd.addEventListener("click", () => {
+  clearFeeSplitRestoreState();
   if (getFeeSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) return;
   feeSplitList.appendChild(createFeeSplitRow({ type: "wallet", sharePercent: "" }));
   syncFeeSplitTotals();
@@ -8172,6 +8491,7 @@ feeSplitAdd.addEventListener("click", () => {
 });
 
 feeSplitReset.addEventListener("click", () => {
+  clearFeeSplitRestoreState();
   getFeeSplitRows().forEach((row) => {
     row.querySelector(".recipient-share").value = "0";
     row.querySelector(".recipient-slider").value = "0";
@@ -8182,6 +8502,7 @@ feeSplitReset.addEventListener("click", () => {
 });
 
 feeSplitEven.addEventListener("click", () => {
+  clearFeeSplitRestoreState();
   const rows = getFeeSplitRows();
   const targetRows = rows;
   if (targetRows.length === 0) return;
@@ -8202,9 +8523,29 @@ feeSplitEven.addEventListener("click", () => {
   setFeeSplitModalError("");
 });
 
+if (feeSplitClearAll) {
+  feeSplitClearAll.addEventListener("click", () => {
+    if (feeSplitClearAllRestoreSnapshot) {
+      applyFeeSplitDraft(feeSplitClearAllRestoreSnapshot, { persist: false });
+      syncFeeSplitTotals();
+      setStoredFeeSplitDraft(serializeFeeSplitDraft());
+      clearFeeSplitRestoreState();
+      setFeeSplitModalError("");
+      return;
+    }
+    feeSplitClearAllRestoreSnapshot = normalizeFeeSplitDraft(serializeFeeSplitDraft());
+    applyFeeSplitDraft(feeSplitClearAllDraft(), { persist: false });
+    syncFeeSplitTotals();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
+    updateFeeSplitClearAllButton();
+    setFeeSplitModalError("");
+  });
+}
+
 feeSplitList.addEventListener("click", (event) => {
   const lockToggle = event.target.closest(".recipient-lock-toggle");
   if (lockToggle) {
+    clearFeeSplitRestoreState();
     const row = lockToggle.closest(".fee-split-row");
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
     syncFeeSplitTotals();
@@ -8214,6 +8555,7 @@ feeSplitList.addEventListener("click", (event) => {
   }
   const tab = event.target.closest(".recipient-type-tab");
   if (tab) {
+    clearFeeSplitRestoreState();
     updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
     setFeeSplitModalError("");
@@ -8221,6 +8563,7 @@ feeSplitList.addEventListener("click", (event) => {
   }
   const removeButton = event.target.closest(".recipient-remove");
   if (removeButton) {
+    clearFeeSplitRestoreState();
     removeButton.closest(".fee-split-row").remove();
     ensureFeeSplitDefaultRow();
     syncFeeSplitTotals();
@@ -8232,6 +8575,7 @@ feeSplitList.addEventListener("click", (event) => {
 feeSplitList.addEventListener("input", (event) => {
   const row = event.target.closest(".fee-split-row");
   if (!row) return;
+  clearFeeSplitRestoreState();
   if (event.target.classList.contains("recipient-target")) {
     event.target.setCustomValidity("");
   }
@@ -8250,6 +8594,7 @@ feeSplitList.addEventListener("input", (event) => {
 });
 
 agentSplitAdd.addEventListener("click", () => {
+  clearAgentSplitRestoreState();
   if (getAgentSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) {
     setAgentSplitModalError(`Agent custom fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
     return;
@@ -8262,6 +8607,7 @@ agentSplitAdd.addEventListener("click", () => {
 });
 
 agentSplitReset.addEventListener("click", () => {
+  clearAgentSplitRestoreState();
   getAgentSplitRows().forEach((row) => {
     row.querySelector(".recipient-share").value = "0";
     row.querySelector(".recipient-slider").value = "0";
@@ -8272,6 +8618,7 @@ agentSplitReset.addEventListener("click", () => {
 });
 
 agentSplitEven.addEventListener("click", () => {
+  clearAgentSplitRestoreState();
   const rows = getAgentSplitRows();
   const targetRows = rows;
   if (targetRows.length === 0) return;
@@ -8292,9 +8639,29 @@ agentSplitEven.addEventListener("click", () => {
   setAgentSplitModalError("");
 });
 
+if (agentSplitClearAll) {
+  agentSplitClearAll.addEventListener("click", () => {
+    if (agentSplitClearAllRestoreSnapshot) {
+      applyAgentSplitDraft(agentSplitClearAllRestoreSnapshot, { persist: false });
+      syncAgentSplitTotals();
+      setStoredAgentSplitDraft(serializeAgentSplitDraft());
+      clearAgentSplitRestoreState();
+      setAgentSplitModalError("");
+      return;
+    }
+    agentSplitClearAllRestoreSnapshot = normalizeAgentSplitDraft(serializeAgentSplitDraft());
+    applyAgentSplitDraft(agentSplitClearAllDraft(), { persist: false });
+    syncAgentSplitTotals();
+    setStoredAgentSplitDraft(serializeAgentSplitDraft());
+    updateAgentSplitClearAllButton();
+    setAgentSplitModalError("");
+  });
+}
+
 agentSplitList.addEventListener("click", (event) => {
   const lockToggle = event.target.closest(".recipient-lock-toggle");
   if (lockToggle) {
+    clearAgentSplitRestoreState();
     const row = lockToggle.closest(".fee-split-row");
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
     syncAgentSplitTotals();
@@ -8304,6 +8671,7 @@ agentSplitList.addEventListener("click", (event) => {
   }
   const tab = event.target.closest(".recipient-type-tab");
   if (tab && tab.dataset.type) {
+    clearAgentSplitRestoreState();
     updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
     syncAgentSplitTotals();
     setStoredAgentSplitDraft(serializeAgentSplitDraft());
@@ -8312,6 +8680,7 @@ agentSplitList.addEventListener("click", (event) => {
   }
   const removeButton = event.target.closest(".recipient-remove");
   if (removeButton) {
+    clearAgentSplitRestoreState();
     removeButton.closest(".fee-split-row").remove();
     normalizeAgentSplitStructure();
     syncAgentSplitTotals();
@@ -8323,6 +8692,7 @@ agentSplitList.addEventListener("click", (event) => {
 agentSplitList.addEventListener("input", (event) => {
   const row = event.target.closest(".fee-split-row");
   if (!row) return;
+  clearAgentSplitRestoreState();
   if (event.target.classList.contains("recipient-target")) {
     event.target.setCustomValidity("");
   }
@@ -8590,6 +8960,8 @@ renderSniperUI();
 renderReportsTerminalOutput();
 Promise.resolve(bootstrapApp())
   .then(() => {
+    startRuntimeStatusRefreshLoop();
+    queueWarmActivity({ immediate: true });
     completeInitialBoot();
   })
   .catch((error) => {
@@ -8602,3 +8974,36 @@ Promise.resolve(bootstrapApp())
       if (noteNode) noteNode.textContent = error.message || "Refresh the page and check the backend runtime.";
     }
   });
+
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (target.matches("input, textarea, select") || target.isContentEditable) {
+    queueWarmActivity();
+  }
+}, true);
+
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (target.matches("input, textarea, select")) {
+    queueWarmActivity({ immediate: true });
+  }
+}, true);
+
+document.addEventListener("click", (event) => {
+  const target = event.target instanceof Element
+    ? event.target.closest("button, .button, [data-action]")
+    : null;
+  if (target) queueWarmActivity({ immediate: true });
+}, true);
+
+window.addEventListener("focus", () => {
+  queueWarmActivity({ immediate: true });
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  queueWarmActivity({ immediate: true });
+  refreshRuntimeStatus().catch(() => {});
+});

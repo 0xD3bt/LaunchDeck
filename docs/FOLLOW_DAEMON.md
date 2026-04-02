@@ -64,6 +64,24 @@ This keeps delayed follow behavior off the main request path while still letting
 
 ## Trigger Modes
 
+### Trigger Matrix
+
+This is the quickest way to understand which part of LaunchDeck actually decides that a follow action is ready:
+
+| UI Trigger | Primary trigger owner | What it waits on |
+| --- | --- | --- |
+| `Same Time` | main host | launch submission path itself |
+| `On Submit + Delay` | daemon timer | observed submit time plus delay |
+| `On Confirmed Block +0` | signature watcher | launch confirmation only |
+| `On Confirmed Block +N` | signature watcher, then shared offset worker | launch confirmation, then confirmed block-height offset |
+| `Market Cap` | market watcher | market-cap threshold or timeout |
+
+Important notes:
+
+- `On Confirmed Block +0` does not use the shared offset worker
+- `On Confirmed Block +N` uses confirmation first, then the shared offset worker only for the extra block distance
+- `Same Time` is host-owned even though the daemon may still handle a later retry path
+
 ### `Same Time`
 
 Same-time sniper buys are not primarily daemon-triggered. They are submitted alongside launch creation.
@@ -95,6 +113,7 @@ How it works:
 - non-zero values wait from observed submit plus the configured delay
 - execution happens in the daemon, not inline with the launch flow
 - this mode is faster than `On Confirmed Block`, but it can still fail if the buy reaches chain execution before creation is live
+- for Pump `agent-custom` and `agent-locked`, delayed buys with `targetBlockOffset > 0` are compiled live in the daemon instead of being locked to an early pre-signed payload
 
 ### `On Confirmed Block`
 
@@ -141,9 +160,25 @@ Operational notes:
 
 Current watcher modes:
 
-- slot watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
-- signature watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
-- market watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and supported
+- slot watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
+- signature watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
+- market watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
+
+### Watcher Selection Matrix
+
+| Condition | Slot / Signature / Market watcher mode |
+| --- | --- |
+| `SOLANA_WS_URL` is unset or no watch endpoint is available | websocket watcher cannot be used; LaunchDeck falls back to non-websocket behavior where that watcher path supports it |
+| watch endpoint is not Helius | standard websocket watcher |
+| watch endpoint is Helius, but `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=false` | standard websocket watcher |
+| watch endpoint is Helius and `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` | try Helius `transactionSubscribe` first |
+| Helius `transactionSubscribe` attempt fails | fall back to standard websocket watcher |
+
+Operational meaning:
+
+- watcher mode is selected from the websocket watch path, not from the send transport by itself
+- a launch can still send with `standard-rpc` or `jito-bundle` and use the enhanced Helius watcher path if `SOLANA_WS_URL` is Helius
+- watcher fallback is automatic; the env flag enables the attempt, not a hard failure mode
 
 For the best current setup:
 
@@ -151,7 +186,7 @@ For the best current setup:
 - use Helius for `SOLANA_WS_URL`
 - use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `helius-sender` as the provider
-- enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and your websocket supports it
+- enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and LaunchDeck is watching through a Helius websocket endpoint
 
 Helius dev tier is strongly recommended here because it gives a major improvement in realtime watcher quality and follow execution behavior compared with a bare-minimum setup.
 
@@ -189,7 +224,9 @@ How it works:
 
 Useful tuning env vars for this path:
 
-- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS`
+- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
+- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
+- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS` (legacy / no longer the main offset timing knob)
 - `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
 - `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
 
@@ -205,13 +242,16 @@ How it works:
 
 ## Agent-Mode Sell Hardening
 
-Agent launch modes receive extra handling on the sell side.
+Agent launch modes receive extra handling on the follow side.
 
 How it works:
 
-- `agent-custom` and `agent-locked` prefer the post-setup creator-vault authority path
-- creator-vault seed mismatch can trigger targeted sell retry behavior
-- daemon-side snipe sells track attempt counters in reports
+- `agent-custom` and `agent-locked` use an explicit split between same-window and delayed follow actions
+- same-window `+0` buys and sells stay on the original launch-creator / deployer vault path
+- delayed buys and sells with `targetBlockOffset > 0` prefer the post-setup fee-sharing config vault path
+- creator-vault seed mismatch can trigger targeted rebuild-and-retry behavior instead of blindly resubmitting the same stale pre-signed payload
+- pre-signed Pump sell slippage failures can also be rebuilt with a fresh sell quote before retry
+- daemon-side follow actions track attempt counters in reports
 
 ## Telemetry And Timing Profiles
 
@@ -260,3 +300,11 @@ Key daemon env vars:
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 - `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH`
+
+Capacity behavior:
+
+- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` = uncapped active jobs
+- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` = uncapped compile concurrency
+- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` = uncapped send concurrency
+- invalid non-numeric values are treated as uncapped and produce a startup warning
+- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` only matters when one of those caps is explicitly set

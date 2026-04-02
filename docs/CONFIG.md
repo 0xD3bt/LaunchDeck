@@ -38,6 +38,8 @@ LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recomm
   Main RPC used for reads, confirmations, and general runtime behavior.
 - `SOLANA_WS_URL`
   Websocket endpoint used by realtime watchers. This matters for follow actions, sniper timing, and daemon health.
+- `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
+  Optional comma-separated extra submit endpoints used only for `standard-rpc` send fanout. `SOLANA_RPC_URL` remains the primary read/confirm RPC; these extra endpoints are used only to fan out the same signed payload in parallel on the optimized standard-RPC transport path. We suggest setting your shyft rpc in this slot.
 - `LAUNCHDECK_WARM_RPC_URL`
   Optional alternate RPC used for startup warmup and block-height observation. Leave it blank to reuse `SOLANA_RPC_URL`.
 - `USER_REGION`
@@ -54,45 +56,104 @@ Recommended practice:
 
 If you omit `SOLANA_WS_URL`, LaunchDeck cannot do its best realtime follow behavior.
 
+Standard RPC transport note:
+
+- `standard-rpc` currently resolves to the optimized `standard-rpc-fanout` transport
+- the engine always includes `SOLANA_RPC_URL` as the primary read/confirm RPC on that path
+- `LAUNCHDECK_STANDARD_RPC_SEND_URLS` adds extra submit-only endpoints for the same signed payload
+- this path currently forces `skipPreflight=true` and `maxRetries=0`
+
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE`
-  Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers when your Helius websocket supports it. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
+  Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers whenever the current follow job is using a Helius websocket watch endpoint. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
+
+Watch endpoint vs execution provider:
+
+- `execution.provider`, `execution.buyProvider`, and `execution.sellProvider` decide how transactions are sent
+- `SOLANA_WS_URL` decides which websocket watch endpoint the follow daemon uses for realtime watchers
+- those are related but not identical decisions
+- a launch can send with `standard-rpc` or `jito-bundle` and still use Helius realtime watchers if `SOLANA_WS_URL` is Helius
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` means "if the watch endpoint is Helius, try the enhanced Helius watcher path"
 
 ### Warmup, Block-Height, And Report Timing
 
+- `LAUNCHDECK_ENABLE_STARTUP_WARM`
+  One-shot startup warm toggle. `true|false`, with blank defaulting to `true`.
+- `LAUNCHDECK_ENABLE_CONTINUOUS_WARM`
+  Shared active keep-warm toggle. `true|false`, with blank defaulting to `true` while the browser/app is being used. When enabled, LaunchDeck keeps all actively configured live provider routes warm, which can become very consuming if creation, buy, and sell use different providers.
+- `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND`
+  Idle suspend toggle for active keep-warm. Blank defaults to `true`.
+- `LAUNCHDECK_IDLE_WARM_TIMEOUT_MS`
+  Idle timeout before active keep-warm suspends. Blank defaults to `30000`.
+- `LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS`
+  Active keep-warm cadence. Blank defaults to `10000`.
 - `LAUNCHDECK_DISABLE_STARTUP_WARM`
-  Disables the explicit startup-warm endpoint path.
+  Legacy negative startup-warm fallback. This is only consulted when `LAUNCHDECK_ENABLE_STARTUP_WARM` is unset.
 - `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
   Shared cache TTL for block-height reads.
 - `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
   Maximum age for sampled block-height snapshots used by reporting and diagnostics before a fresh read is forced.
+- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
+  Post-confirmation follow offset worker cadence for actions with `targetBlockOffset > 0`. Blank defaults to `400ms`.
+- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
+  Optional env-only low-request mode for follow offset timing. When enabled, the follow daemon uses an approximate local timer after confirmation instead of real `getBlockHeight` polling for offset waits. Disabled by default.
 - `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS`
-  Shared follow-daemon block-height worker cadence while block-offset jobs are active.
+  Legacy follow-daemon block-height refresh knob. It no longer drives the main offset worker after the offset-worker switch and should generally stay unset unless a later non-offset block-height refresher is introduced.
 - `LAUNCHDECK_BENCHMARK_MODE`
-  Report timing detail level. Supported values: `off`, `basic`, `full`. Blank defaults to `full`.
+  Current runtime report timing mode. Supported values: `off`, `light`, `full`. Blank defaults to `full`. Legacy `basic` is still accepted and maps to `light`.
 - `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT`
-  Default for `execution.trackSendBlockHeight`. When enabled, reports also capture observed block height at send time and confirmation time.
+  Default for `execution.trackSendBlockHeight`. When enabled, reports also capture observed block height at send time and confirmation time. This env default is only applied when benchmark mode is `full`; `off` and `light` keep it off by default unless a request or preset explicitly sets `execution.trackSendBlockHeight`.
 
 How these settings fit together:
 
-- `LAUNCHDECK_BENCHMARK_MODE` controls report timing detail only
+- `LAUNCHDECK_ENABLE_STARTUP_WARM` is the primary startup-warm flag now.
+- `LAUNCHDECK_DISABLE_STARTUP_WARM` remains only as a legacy fallback for older env setups.
+- Continuous warm runs as the active-browser keep-warm layer, and idle suspend can automatically pause it when no meaningful operator interaction happens for the configured timeout.
+- Meaningful interaction includes form edits, provider/mode changes, recipient edits, toggles, and build / simulate / deploy style actions.
+- If continuous warm is enabled while multiple different providers are actively configured for live use, LaunchDeck should keep all of those active routes warm, which can materially increase request volume and connection usage.
+- `LAUNCHDECK_BENCHMARK_MODE` uses `off`, `light`, `full`.
+- Meaning:
+  - `off` = benchmarking disabled
+  - `light` = useful low-overhead live-safe measurement with no benchmark-only RPC calls
+  - `full` = full diagnostics
+- Legacy `basic` is treated as `light` during migration so older envs do not break.
 - `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` controls whether send/confirm block-height snapshots are captured by default
-- `LAUNCHDECK_WARM_RPC_URL` is used for the warm/block-height observation path so those reads can be separated from your main execution RPC
+- `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` should effectively stay off in `off`, stay off by default in `light`, and may be enabled in `full` when deeper diagnostics are wanted
+- `LAUNCHDECK_WARM_RPC_URL` is used for startup warm, continuous keep-warm probes, and block-height observation so those reads can be separated from your main execution RPC
 - for most operators, the best practical split is Helius for `SOLANA_RPC_URL` and `SOLANA_WS_URL`, plus Shyft for `LAUNCHDECK_WARM_RPC_URL`
+- follow `targetBlockOffset > 0` actions now use a post-confirmation shared offset worker rather than the old always-active shared follow block-height polling path
+- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS` controls the real `getBlockHeight` polling cadence for that offset worker
+- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER` is an env-only low-request alternative that trades accuracy for fewer RPC reads
+- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS` should not be treated as the main follow offset timing knob anymore
+- the Settings UI also surfaces a Warm status card based on runtime state and recent operator activity pings
 
 ### Auto-Fee And Helper Runtime Tuning
 
 - `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL`
   Helius priority-fee selector for auto-fee mode. Supported values: `recommended`, `none`, `low`, `medium`, `high`, `veryHigh`, `unsafeMax`.
 - `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE`
-  Jito tip-floor percentile selector for auto-fee mode. Supported values: `p25`, `p50`, `p75`, `p95`, `p99`.
+  Jito tip-floor percentile selector for auto-fee mode. Supported values: `p25`, `p50`, `p75`, `p95`, `p99`. Bags setup bundle tip selection follows this shared setting too; there is no separate Bags percentile override.
+- `LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT`
+- `LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT`
+- `LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT`
+- `LAUNCHDECK_SNIPER_BUY_COMPUTE_UNIT_LIMIT`
+- `LAUNCHDECK_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT`
+- `LAUNCHDECK_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT`
+  Optional per-action default compute unit limits used when no explicit `tx.computeUnitLimit` override is set. The shipped defaults are based on observed successful transactions, with a 10% safety buffer and rounded-up values.
 - `LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS`
   Shared timeout for helper-backed launchpad scripts such as Bonk and Bags.
 - `LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY`
   Shared concurrency cap for helper-backed launchpad scripts.
+- `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER`
+  Optional toggle for a persistent Bags helper worker process. Disabled by default.
+- `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER`
+  Optional toggle for a persistent Bonk helper worker process. Disabled by default.
 
 Practical note:
 
 - the current recommended auto-fee default is `veryHigh` plus `p99`, then cap cost in the UI with a max auto-fee value if needed
+- current shipped compute-unit defaults are `340000` launch, `180000` agent setup, `175000` follow-up, `120000` sniper buy, `145000` dev auto-sell, and `90000` Bonk `usd1` top-up
+- helper worker mode keeps one Node helper process alive for repeated Bonk/Bags requests
+- if a helper worker transport call fails or times out, LaunchDeck falls back to restarting the helper and retrying instead of permanently requiring worker mode
 
 ### Wallet Import
 
@@ -131,7 +192,13 @@ Follow concurrency and capacity:
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 
-These matter if you are running several follow jobs at once or if the daemon is rejecting new work because capacity is exhausted.
+These are advanced follow-daemon tuning knobs.
+
+- Blank or `0` for `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` means uncapped active jobs.
+- Blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` means uncapped follow compile concurrency.
+- Blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` means uncapped follow send concurrency.
+- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` only matters when at least one of those caps is set.
+- Invalid non-numeric values are treated as uncapped and produce a startup warning.
 
 ### Local Persistence Paths
 
@@ -300,6 +367,7 @@ For `helius-sender`:
 For all providers:
 
 - removed provider values such as `auto` are not valid live config values anymore
+- the shipped engine is `rust-native-only`, so unsupported launchpad / mode combinations hard-fail instead of falling back to a generic JS compiler path
 
 ### Fee-Sharing And Mode Rules
 
@@ -315,6 +383,11 @@ For all providers:
 - follow constraints and retry budgets are validated
 - dev auto-sell supports an exclusive `time` or `market-cap` trigger family
 - market-cap timeout is stored in seconds and supports `timeoutAction=stop|sell`
+- Pump `agent-custom` and `agent-locked` use an explicit creator-vault split for follow actions:
+  - same-window `+0` buys and sells stay on the original launch-creator / deployer vault path
+  - delayed buys and delayed sells with `targetBlockOffset > 0` prefer the post-setup fee-sharing config vault path
+  - delayed Pump buys in those modes are compiled live in the daemon instead of being pre-signed too early, so they can pick up the current on-chain vault state
+  - if a pre-signed Pump follow action still lands against stale state, the daemon can clear it and rebuild a fresh payload before retrying
 
 ## Provider Defaults And Preset Defaults
 
@@ -382,9 +455,11 @@ Reports can include:
 - resolved provider
 - transport type
 - endpoint information
+- winning endpoint and attempted endpoint list for multi-endpoint transports
 - send order
 - signature and confirmation state
 - benchmark timing data
+- auto-fee source summaries when auto-fee resolved live estimates
 - follow-job snapshot
 - follow-action outcomes
 - watcher health

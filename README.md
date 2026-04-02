@@ -36,7 +36,7 @@ If you have Helius dev tier and your websocket endpoint supports it, also enable
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
-That unlocks the enhanced `transactionSubscribe` path for follow-daemon slot, signature, and market watchers while still falling back safely when unsupported.
+In the current runtime, that unlocks the enhanced `transactionSubscribe` watcher path whenever the follow daemon is using a Helius websocket watch endpoint, while still falling back safely to standard websocket watchers when unsupported.
 
 ## What It Does
 
@@ -82,6 +82,11 @@ Verified and Rust-native for:
 - `agent-custom`
 - `agent-unlocked`
 - `agent-locked`
+- immediate dev buy
+- same-time sniper buys
+- snipe buys
+- snipe sells
+- automatic dev sell
 
 Pump launch assembly, transaction shaping, simulation, send orchestration, and reporting are handled in the Rust engine.
 
@@ -101,6 +106,8 @@ Verified for:
 Bonk validation, transport planning, reporting, simulation, and send execution are Rust-owned. Launch assembly uses the Raydium LaunchLab-backed helper bridge.
 
 Bonk `usd1` currently uses a pinned Raydium `SOL -> USD1` route pool, and same-time `usd1` sniper buys are assembled as atomic swap-and-buy transactions.
+
+The shipped engine is now `rust-native-only`. Unsupported launchpad or mode combinations hard-fail during validation instead of falling back to a generic legacy JS compile path. Bonk and Bags helper scripts remain targeted helper bridges, not a general fallback runtime.
 
 ### Experimental
 
@@ -146,7 +153,7 @@ Optional but common:
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` ([Pinata](https://pinata.cloud/))
 - `PINATA_JWT`
 - `BAGS_API_KEY`
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced `transactionSubscribe` watcher path
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced watcher path whenever LaunchDeck is watching through a Helius websocket endpoint
 
 Recommended practical setup:
 
@@ -206,7 +213,9 @@ Important rules:
 
 - `Helius Sender` is the current default, fastest, and most reliable starting point for most operators
 - `Helius Sender` requires `skipPreflight=true`, a positive compute-unit price, and a tip of at least `200000` lamports
-- `Standard RPC` uses standard RPC semantics and does not use tip
+- `Standard RPC` uses the optimized `standard-rpc-fanout` transport and does not use tip
+- `Standard RPC` always submits with `skipPreflight=true` and `maxRetries=0`
+- `Standard RPC` can fan out to `SOLANA_RPC_URL` plus optional extra submit endpoints from `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
 - `Jito Bundle` uses bundle submission and status polling
 - private relay integrations such as `bloxroute`, `astralane`, and `hello moon` are planned next
 
@@ -234,9 +243,20 @@ Current follow behavior includes:
 - snipe sells
 - same-time retry for eligible sniper buys
 
+Trigger note:
+
+- `On Confirmed Block +0` is confirmation-driven, while `On Confirmed Block +N` uses the shared offset worker after confirmation
+
 Current limitation:
 
 - `followLaunch.snipes[].postBuySell` is not supported yet and is rejected by config validation
+
+Pump agent-mode follow note:
+
+- for `agent-custom` and `agent-locked`, same-window `+0` follow buys and sells stay on the original launch-creator / deployer vault path
+- delayed Pump follow buys and sells with `targetBlockOffset > 0` prefer the post-setup fee-sharing config vault path
+- delayed Pump buys in those modes are compiled live by the daemon instead of being pre-signed too early, which helps them pick up the current on-chain creator-vault state
+- if an older pre-signed Pump follow action still hits stale creator-vault or sell-quote state, the daemon can rebuild and retry a fresh payload
 
 Follow system details: `docs/FOLLOW_DAEMON.md` and `docs/STRATEGIES.md`
 
@@ -253,24 +273,22 @@ LaunchDeck writes durable local data under `.local/launchdeck` by default:
 
 Reports capture both requested settings and actual execution outcomes, including provider, transport type, endpoint information, signatures, confirmations, and timing breakdowns.
 
+In the History UI, report detail now also surfaces the winning endpoint, attempted endpoints, and auto-fee source summaries when that data is available.
+
 History/report usage: `docs/REPORTING.md`
 
 ## Documentation Map
 
-Primary operator docs:
-
-- `docs/USAGE.md`
-- `docs/CONFIG.md`
-- `docs/LAUNCHPADS.md`
-- `docs/PROVIDERS.md`
-- `docs/STRATEGIES.md`
-- `docs/FOLLOW_DAEMON.md`
-- `docs/REPORTING.md`
-- `docs/TROUBLESHOOTING.md`
-- `docs/ARCHITECTURE.md`
-- `docs/VPS_SETUP.md`
-
-Supporting or internal documents:
-
-- `docs/EXECUTION_PROVIDER_PLAN.md`
-- `docs/FRONTEND_REGRESSION_CHECKLIST.md`
+```text
+docs/
+|-- USAGE.md
+|-- CONFIG.md
+|-- LAUNCHPADS.md
+|-- PROVIDERS.md
+|-- STRATEGIES.md
+|-- FOLLOW_DAEMON.md
+|-- REPORTING.md
+|-- TROUBLESHOOTING.md
+|-- ARCHITECTURE.md
+`-- VPS_SETUP.md
+```

@@ -88,6 +88,15 @@ Verified Pump modes:
 - `agent-unlocked`
 - `agent-locked`
 
+Verified Pump support also includes:
+
+- immediate dev buy
+- same-time sniper buys
+- delayed sniper buys
+- snipe sells
+- automatic dev sell
+- compile-time and daemon-side follow handling for agent-mode creator-vault transitions
+
 ### Bonk
 
 Bonk is Rust-orchestrated but not fully Rust-assembled.

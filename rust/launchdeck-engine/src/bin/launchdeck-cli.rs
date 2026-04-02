@@ -6,6 +6,8 @@ mod bonk_native;
 mod config;
 #[path = "../fs_utils.rs"]
 mod fs_utils;
+#[path = "../helper_worker.rs"]
+mod helper_worker;
 #[path = "../launchpad_dispatch.rs"]
 mod launchpad_dispatch;
 #[path = "../observability.rs"]
@@ -18,6 +20,8 @@ mod providers;
 mod pump_native;
 #[path = "../report.rs"]
 mod report;
+#[path = "../reports_browser.rs"]
+mod reports_browser;
 #[path = "../rpc.rs"]
 mod rpc;
 #[path = "../transport.rs"]

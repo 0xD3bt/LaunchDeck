@@ -190,6 +190,10 @@ pub struct FollowJobRecord {
     pub tokenMayhemMode: bool,
     pub jitoTipAccount: String,
     #[serde(default)]
+    pub buyTipAccount: String,
+    #[serde(default)]
+    pub sellTipAccount: String,
+    #[serde(default)]
     pub preferPostSetupCreatorVaultForSell: bool,
     pub mint: Option<String>,
     pub launchCreator: Option<String>,
@@ -217,6 +221,13 @@ pub fn should_use_post_setup_creator_vault_for_sell(
     job_prefers_post_setup_creator_vault && action.targetBlockOffset.unwrap_or_default() > 0
 }
 
+pub fn should_use_post_setup_creator_vault_for_buy(
+    job_prefers_post_setup_creator_vault: bool,
+    action: &FollowActionRecord,
+) -> bool {
+    job_prefers_post_setup_creator_vault && action.targetBlockOffset.unwrap_or_default() > 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowDaemonHealth {
     pub running: bool,
@@ -229,11 +240,16 @@ pub struct FollowDaemonHealth {
     pub updatedAtMs: u128,
     pub queueDepth: usize,
     pub activeJobs: usize,
-    pub maxActiveJobs: usize,
-    pub maxConcurrentCompiles: usize,
-    pub maxConcurrentSends: usize,
-    pub availableCompileSlots: usize,
-    pub availableSendSlots: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxActiveJobs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxConcurrentCompiles: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxConcurrentSends: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availableCompileSlots: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availableSendSlots: Option<usize>,
     pub slotWatcher: FollowWatcherHealth,
     #[serde(default)]
     pub slotWatcherMode: Option<String>,
@@ -266,6 +282,10 @@ pub struct FollowReserveRequest {
     pub execution: NormalizedExecution,
     pub tokenMayhemMode: bool,
     pub jitoTipAccount: String,
+    #[serde(default)]
+    pub buyTipAccount: String,
+    #[serde(default)]
+    pub sellTipAccount: String,
     #[serde(default)]
     pub preferPostSetupCreatorVaultForSell: bool,
     #[serde(default)]
@@ -589,11 +609,11 @@ impl FollowDaemonStore {
                 updatedAtMs: now_ms(),
                 queueDepth: 0,
                 activeJobs: 0,
-                maxActiveJobs: 0,
-                maxConcurrentCompiles: 0,
-                maxConcurrentSends: 0,
-                availableCompileSlots: 0,
-                availableSendSlots: 0,
+                maxActiveJobs: None,
+                maxConcurrentCompiles: None,
+                maxConcurrentSends: None,
+                availableCompileSlots: None,
+                availableSendSlots: None,
                 slotWatcher: FollowWatcherHealth::Healthy,
                 slotWatcherMode: None,
                 signatureWatcher: FollowWatcherHealth::Healthy,
@@ -740,6 +760,8 @@ impl FollowDaemonStore {
             execution: request.execution,
             tokenMayhemMode: request.tokenMayhemMode,
             jitoTipAccount: request.jitoTipAccount,
+            buyTipAccount: request.buyTipAccount,
+            sellTipAccount: request.sellTipAccount,
             preferPostSetupCreatorVaultForSell: request.preferPostSetupCreatorVaultForSell,
             mint: None,
             launchCreator: None,
