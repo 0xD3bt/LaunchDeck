@@ -2,7 +2,7 @@
 
 This guide walks through a simple VPS deployment flow for LaunchDeck.
 
-For most operators, start with Helius-first routing. The current recommendation is:
+For most operators, start with a Helius-first setup and place the VPS near your provider endpoints. A good default is:
 
 - US: Newark, Virginia, or New York area
 - EU: Frankfurt or Amsterdam
@@ -113,7 +113,7 @@ The startup script will:
 - install Node.js `20`
 - clone the repo into `/opt/launchdeck`
 - run `npm install`
-- copy `.env.example` to `.env` if needed
+- copy `.env.example` to `.env` if needed; use `.env.advanced` as the full variable reference
 - install and enable a `systemd` service called `launchdeck`
 - enable `ufw` and `fail2ban`
 
@@ -145,6 +145,7 @@ At minimum, most operators will want to fill in:
 
 - `SOLANA_RPC_URL`
 - `SOLANA_WS_URL`
+- `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height reads off your main RPC
 - `SOLANA_PRIVATE_KEY` or your `SOLANA_PRIVATE_KEY*` set
 - `USER_REGION`
 
@@ -158,9 +159,10 @@ Recommended setup:
 
 - use a Helius mainnet RPC URL for `SOLANA_RPC_URL`
 - use the matching Helius websocket URL for `SOLANA_WS_URL`
+- use a [Shyft](https://shyft.to/) RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `Helius Sender` as your provider in LaunchDeck
 
-At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path.
+At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path. Helius dev tier is highly recommended if you want the biggest improvement in watcher quality, execution speed, and overall runtime behavior.
 
 Full env reference:
 

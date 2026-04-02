@@ -68,6 +68,8 @@ const LOOKUP_TABLE_CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct NativePumpArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
+    pub creation_transactions: Vec<CompiledTransaction>,
+    pub deferred_setup_transactions: Vec<CompiledTransaction>,
     pub report: Value,
     pub text: String,
     pub compile_timings: NativeCompileTimings,
@@ -77,11 +79,15 @@ pub struct NativePumpArtifacts {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeCompileTimings {
+    pub launch_creator_prep_ms: u128,
     pub alt_load_ms: u128,
     pub blockhash_fetch_ms: u128,
     pub global_fetch_ms: Option<u128>,
     pub follow_up_prep_ms: Option<u128>,
     pub tx_serialize_ms: u128,
+    pub launch_serialize_ms: Option<u128>,
+    pub follow_up_serialize_ms: Option<u128>,
+    pub tip_serialize_ms: Option<u128>,
 }
 
 #[allow(dead_code, non_snake_case)]
@@ -200,7 +206,7 @@ pub async fn try_compile_native_pump(
         blockhash_future,
         global_future
     );
-    let (_launch_creator_prep_ms, (launch_creator, launch_pre_instructions)) =
+    let (launch_creator_prep_ms, (launch_creator, launch_pre_instructions)) =
         launch_creator_result?;
     let (alt_load_ms, lookup_tables) = lookup_tables_result?;
     let (blockhash_fetch_ms, (blockhash, last_valid_block_height)) = blockhash_result?;
@@ -208,11 +214,15 @@ pub async fn try_compile_native_pump(
     let global_fetch_ms = global_result.as_ref().map(|(elapsed_ms, _)| *elapsed_ms);
     let global = global_result.map(|(_, global)| global);
     let mut compile_timings = NativeCompileTimings {
+        launch_creator_prep_ms,
         alt_load_ms,
         blockhash_fetch_ms,
         global_fetch_ms,
         follow_up_prep_ms: None,
         tx_serialize_ms: 0,
+        launch_serialize_ms: None,
+        follow_up_serialize_ms: None,
+        tip_serialize_ms: None,
     };
     let tx_format = select_native_format(&config.execution.txFormat, !lookup_tables.is_empty())?;
     let creation_compute_unit_price_micro_lamports =
@@ -264,12 +274,15 @@ pub async fn try_compile_native_pump(
         &launch_lookup_table_variants,
     )?;
     compile_timings.tx_serialize_ms += launch_serialize_started.elapsed().as_millis();
+    compile_timings.launch_serialize_ms = Some(launch_serialize_started.elapsed().as_millis());
     let mut launch_metrics = launch_metrics;
     launch_metrics.warnings.extend(transaction_size_diagnostics(
         &launch_tx_instructions,
         &launch_tx_config,
     ));
-    let mut compiled_transactions = vec![launch_compiled];
+    let mut compiled_transactions = vec![launch_compiled.clone()];
+    let mut creation_transactions = vec![launch_compiled];
+    let mut deferred_setup_transactions = vec![];
     let mut compile_metrics = vec![launch_metrics];
     let mut instruction_summaries = vec![summarize_instructions(&launch_tx_instructions)];
 
@@ -330,6 +343,8 @@ pub async fn try_compile_native_pump(
             &follow_up_lookup_table_variants,
         )?;
         compile_timings.tx_serialize_ms += follow_up_serialize_started.elapsed().as_millis();
+        compile_timings.follow_up_serialize_ms =
+            Some(follow_up_serialize_started.elapsed().as_millis());
         let mut follow_up_metrics = follow_up_metrics;
         follow_up_metrics
             .warnings
@@ -353,6 +368,7 @@ pub async fn try_compile_native_pump(
                     },
                 },
             ));
+        deferred_setup_transactions.push(follow_up_compiled.clone());
         compiled_transactions.push(follow_up_compiled);
         compile_metrics.push(follow_up_metrics);
         instruction_summaries.push(summarize_instructions(&follow_up_tx_instructions));
@@ -380,6 +396,7 @@ pub async fn try_compile_native_pump(
             &tip_lookup_table_variants,
         )?;
         compile_timings.tx_serialize_ms += tip_serialize_started.elapsed().as_millis();
+        compile_timings.tip_serialize_ms = Some(tip_serialize_started.elapsed().as_millis());
         let mut tip_metrics = tip_metrics;
         tip_metrics.warnings.extend(transaction_size_diagnostics(
             &tip_tx_instructions,
@@ -389,6 +406,7 @@ pub async fn try_compile_native_pump(
                 jito_tip_account: config.tx.jitoTipAccount.clone(),
             },
         ));
+        creation_transactions.push(tip_compiled.clone());
         compiled_transactions.push(tip_compiled);
         compile_metrics.push(tip_metrics);
         instruction_summaries.push(summarize_instructions(&tip_tx_instructions));
@@ -428,6 +446,8 @@ pub async fn try_compile_native_pump(
 
     Ok(Some(NativePumpArtifacts {
         compiled_transactions,
+        creation_transactions,
+        deferred_setup_transactions,
         report,
         text,
         compile_timings,
@@ -701,13 +721,27 @@ async fn resolve_follow_creator_vault_authority(
     prefer_post_setup_creator_vault: bool,
 ) -> Result<Pubkey, String> {
     let sharing_config = fee_sharing_config_pda(mint)?;
-    if prefer_post_setup_creator_vault {
-        return Ok(sharing_config);
+    Ok(select_follow_creator_vault_authority(
+        launch_creator,
+        &sharing_config,
+        prefer_post_setup_creator_vault,
+        fetch_account_exists(rpc_url, &sharing_config.to_string(), "confirmed").await?,
+    ))
+}
+
+fn select_follow_creator_vault_authority(
+    launch_creator: &Pubkey,
+    sharing_config: &Pubkey,
+    prefer_post_setup_creator_vault: bool,
+    sharing_config_exists: bool,
+) -> Pubkey {
+    if sharing_config_exists {
+        return *sharing_config;
     }
-    if fetch_account_exists(rpc_url, &sharing_config.to_string(), "confirmed").await? {
-        return Ok(sharing_config);
-    }
-    Ok(*launch_creator)
+    let _ = prefer_post_setup_creator_vault;
+    // Same-window sells can execute before deferred fee-sharing setup, so the live account state
+    // decides which creator-vault seed path is valid.
+    *launch_creator
 }
 
 fn fee_program_global_pda() -> Result<Pubkey, String> {
@@ -1049,6 +1083,19 @@ fn quote_sell_sol_from_curve(
         .unwrap_or_default()
 }
 
+fn quote_buy_curve_input_from_tokens(global: &PumpGlobalState, token_amount: u64) -> u64 {
+    if token_amount == 0 {
+        return 0;
+    }
+    let amount = u128::from(token_amount).min(u128::from(global.initial_real_token_reserves));
+    let virtual_token_reserves = u128::from(global.initial_virtual_token_reserves);
+    let virtual_sol_reserves = u128::from(global.initial_virtual_sol_reserves);
+    (((amount * virtual_sol_reserves) / (virtual_token_reserves.saturating_sub(amount))) + 1)
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn current_market_cap_lamports(curve: &PumpBondingCurveState) -> u64 {
     if curve.virtual_token_reserves == 0 {
         return 0;
@@ -1085,6 +1132,14 @@ fn resolve_dev_buy_quote(
         "Unsupported devBuy.mode for native Pump compile: {}",
         dev_buy.mode
     ))
+}
+
+pub async fn predict_dev_buy_token_amount(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+) -> Result<Option<u64>, String> {
+    let global = fetch_global_state_cached(rpc_url).await?;
+    Ok(resolve_dev_buy_quote(config, &global)?.map(|(_, token_amount)| token_amount))
 }
 
 #[allow(dead_code)]
@@ -1381,6 +1436,35 @@ pub async fn compile_follow_sell_transaction(
     sell_percent: u8,
     prefer_post_setup_creator_vault: bool,
 ) -> Result<Option<CompiledTransaction>, String> {
+    compile_follow_sell_transaction_with_token_amount(
+        rpc_url,
+        execution,
+        token_mayhem_mode,
+        jito_tip_account,
+        wallet_secret,
+        mint,
+        launch_creator,
+        sell_percent,
+        prefer_post_setup_creator_vault,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn compile_follow_sell_transaction_with_token_amount(
+    rpc_url: &str,
+    execution: &NormalizedExecution,
+    token_mayhem_mode: bool,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    launch_creator: &str,
+    sell_percent: u8,
+    prefer_post_setup_creator_vault: bool,
+    token_amount_override: Option<u64>,
+    cashback_enabled_override: Option<bool>,
+) -> Result<Option<CompiledTransaction>, String> {
     let user_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let user = user_keypair.pubkey();
     let mint = parse_pubkey(mint, "mint")?;
@@ -1393,32 +1477,55 @@ pub async fn compile_follow_sell_transaction(
     )
     .await?;
     let global = fetch_global_state_cached(rpc_url).await?;
-    let curve = fetch_bonding_curve_state(rpc_url, &mint).await?;
-    let associated_user =
-        get_associated_token_address_with_program_id(&user, &mint, &token_2022_program_id()?);
-    let account_key = associated_user.to_string();
-    let mut account_data = None;
-    let mut last_error = None;
-    for attempt in 0..15 {
-        match fetch_account_data(rpc_url, &account_key, &execution.commitment).await {
-            Ok(data) => {
-                account_data = Some(data);
-                last_error = None;
-                break;
-            }
-            Err(error) if error.contains("was not found") && attempt < 14 => {
-                last_error = Some(error);
-                sleep(Duration::from_millis(200)).await;
-            }
-            Err(error) => return Err(error),
+    let curve = if let Some(token_amount_override) = token_amount_override {
+        let curve_input = quote_buy_curve_input_from_tokens(&global, token_amount_override);
+        PumpBondingCurveState {
+            virtual_token_reserves: global
+                .initial_virtual_token_reserves
+                .saturating_sub(token_amount_override),
+            virtual_sol_reserves: global.initial_virtual_sol_reserves.saturating_add(curve_input),
+            real_token_reserves: global
+                .initial_real_token_reserves
+                .saturating_sub(token_amount_override),
+            real_sol_reserves: curve_input,
+            token_total_supply: global.initial_real_token_reserves,
+            complete: false,
+            creator: launch_creator,
+            cashback_enabled: cashback_enabled_override.unwrap_or(false),
         }
-    }
-    let account_data = account_data.ok_or_else(|| {
-        last_error.unwrap_or_else(|| format!("Account {account_key} was not found."))
-    })?;
-    let token_balance = read_token_account_amount(&account_data)?;
-    let token_amount = ((u128::from(token_balance) * u128::from(sell_percent)) / 100u128)
-        .min(u128::from(u64::MAX)) as u64;
+    } else {
+        fetch_bonding_curve_state(rpc_url, &mint).await?
+    };
+    let token_amount = if let Some(token_amount_override) = token_amount_override {
+        ((u128::from(token_amount_override) * u128::from(sell_percent)) / 100u128)
+            .min(u128::from(u64::MAX)) as u64
+    } else {
+        let associated_user =
+            get_associated_token_address_with_program_id(&user, &mint, &token_2022_program_id()?);
+        let account_key = associated_user.to_string();
+        let mut account_data = None;
+        let mut last_error = None;
+        for attempt in 0..15 {
+            match fetch_account_data(rpc_url, &account_key, &execution.commitment).await {
+                Ok(data) => {
+                    account_data = Some(data);
+                    last_error = None;
+                    break;
+                }
+                Err(error) if error.contains("was not found") && attempt < 14 => {
+                    last_error = Some(error);
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let account_data = account_data.ok_or_else(|| {
+            last_error.unwrap_or_else(|| format!("Account {account_key} was not found."))
+        })?;
+        let token_balance = read_token_account_amount(&account_data)?;
+        ((u128::from(token_balance) * u128::from(sell_percent)) / 100u128)
+            .min(u128::from(u64::MAX)) as u64
+    };
     if token_amount == 0 {
         return Ok(None);
     }
@@ -2783,12 +2890,17 @@ fn apply_transaction_details(
         let raw = BASE64
             .decode(&compiled.serializedBase64)
             .map_err(|error| error.to_string())?;
+        let encoded_len = compiled.serializedBase64.len();
         summary.legacyLength = metrics.legacy_length;
+        summary.legacyBase64Length = metrics.legacy_length.map(|_| encoded_len);
         summary.v0Length = metrics.v0_length;
+        summary.v0Base64Length = metrics.v0_length.map(|_| encoded_len);
         summary.v0AltLength = metrics.v0_alt_length;
+        summary.v0AltBase64Length = metrics.v0_alt_length.map(|_| encoded_len);
         if compiled.format == "legacy" {
             if summary.legacyLength.is_none() {
                 summary.legacyLength = Some(raw.len());
+                summary.legacyBase64Length = Some(encoded_len);
             }
             summary.v0Error = Some("Native path compiled as legacy only.".to_string());
             summary.v0AltError = Some("Native path compiled as legacy only.".to_string());
@@ -2796,11 +2908,13 @@ fn apply_transaction_details(
             if compiled.format == "v0-alt" {
                 if summary.v0AltLength.is_none() {
                     summary.v0AltLength = Some(raw.len());
+                    summary.v0AltBase64Length = Some(encoded_len);
                 }
                 summary.v0Error = Some("Native path compiled with lookup tables.".to_string());
             } else {
                 if summary.v0Length.is_none() {
                     summary.v0Length = Some(raw.len());
+                    summary.v0Base64Length = Some(encoded_len);
                 }
                 summary.v0AltError =
                     Some("Native path compiled as versioned without lookup tables.".to_string());
@@ -3404,6 +3518,36 @@ mod tests {
             &instruction.data[..8],
             &[144, 224, 59, 211, 78, 248, 202, 220]
         );
+    }
+
+    #[test]
+    fn follow_sell_uses_launch_creator_until_sharing_config_exists() {
+        let launch_creator = Pubkey::new_unique();
+        let sharing_config = Pubkey::new_unique();
+
+        let authority = select_follow_creator_vault_authority(
+            &launch_creator,
+            &sharing_config,
+            true,
+            false,
+        );
+
+        assert_eq!(authority, launch_creator);
+    }
+
+    #[test]
+    fn follow_sell_switches_to_sharing_config_once_live() {
+        let launch_creator = Pubkey::new_unique();
+        let sharing_config = Pubkey::new_unique();
+
+        let authority = select_follow_creator_vault_authority(
+            &launch_creator,
+            &sharing_config,
+            true,
+            true,
+        );
+
+        assert_eq!(authority, sharing_config);
     }
 
     #[test]

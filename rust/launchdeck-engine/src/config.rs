@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use thiserror::Error;
 
 const TOKEN_NAME_MAX_LENGTH: usize = 32;
@@ -690,6 +691,17 @@ pub struct NormalizedRecipient {
 
 fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
+}
+
+fn configured_track_send_block_height_default() -> bool {
+    matches!(
+        env::var("LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_bool(value: &Option<Value>, fallback: bool) -> bool {
@@ -1546,7 +1558,10 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                 "confirmed",
             )?,
             skipPreflight: parse_bool(&raw.execution.skipPreflight, false),
-            trackSendBlockHeight: parse_bool(&raw.execution.trackSendBlockHeight, false),
+            trackSendBlockHeight: parse_bool(
+                &raw.execution.trackSendBlockHeight,
+                configured_track_send_block_height_default(),
+            ),
             provider: parse_choice(
                 &raw.execution.provider,
                 "execution.provider",

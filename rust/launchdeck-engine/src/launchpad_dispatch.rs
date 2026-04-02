@@ -26,6 +26,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct NativeLaunchArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
+    pub creation_transactions: Vec<CompiledTransaction>,
+    pub deferred_setup_transactions: Vec<CompiledTransaction>,
     pub report: Value,
     pub text: String,
     pub compile_timings: NativeCompileTimings,
@@ -37,6 +39,8 @@ impl From<NativePumpArtifacts> for NativeLaunchArtifacts {
     fn from(value: NativePumpArtifacts) -> Self {
         Self {
             compiled_transactions: value.compiled_transactions,
+            creation_transactions: value.creation_transactions,
+            deferred_setup_transactions: value.deferred_setup_transactions,
             report: value.report,
             text: value.text,
             compile_timings: value.compile_timings,
@@ -50,6 +54,8 @@ impl From<NativeBonkArtifacts> for NativeLaunchArtifacts {
     fn from(value: NativeBonkArtifacts) -> Self {
         Self {
             compiled_transactions: value.compiled_transactions,
+            creation_transactions: value.creation_transactions,
+            deferred_setup_transactions: value.deferred_setup_transactions,
             report: value.report,
             text: value.text,
             compile_timings: value.compile_timings,
@@ -61,8 +67,11 @@ impl From<NativeBonkArtifacts> for NativeLaunchArtifacts {
 
 impl From<NativeBagsArtifacts> for NativeLaunchArtifacts {
     fn from(value: NativeBagsArtifacts) -> Self {
+        let compiled_transactions = value.compiled_transactions;
         Self {
-            compiled_transactions: value.compiled_transactions,
+            creation_transactions: compiled_transactions.clone(),
+            compiled_transactions,
+            deferred_setup_transactions: vec![],
             report: value.report,
             text: value.text,
             compile_timings: value.compile_timings,

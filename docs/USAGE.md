@@ -236,7 +236,7 @@ For a safe first session:
 
 1. set up one wallet
 2. choose `Pump` or `Bonk`
-3. leave the provider on `Helius Sender`
+3. use the recommended stack first: Helius for `SOLANA_RPC_URL` and `SOLANA_WS_URL`, optional Shyft for `LAUNCHDECK_WARM_RPC_URL`, and leave the provider on `Helius Sender`
 4. keep follow actions off
 5. run `Build`
 6. run `Simulate`

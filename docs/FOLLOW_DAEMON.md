@@ -149,8 +149,11 @@ For the best current setup:
 
 - use Helius for `SOLANA_RPC_URL`
 - use Helius for `SOLANA_WS_URL`
+- use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `helius-sender` as the provider
 - enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and your websocket supports it
+
+Helius dev tier is strongly recommended here because it gives a major improvement in realtime watcher quality and follow execution behavior compared with a bare-minimum setup.
 
 The daemon now persists both watcher health and watcher mode so reports and follow-job state show whether a market-cap action used the enhanced Helius path or the standard websocket fallback.
 
@@ -180,8 +183,15 @@ The runtime uses warmed blockhash caches in both the host and daemon.
 How it works:
 
 - blockhashes are warmed for `processed`, `confirmed`, and `finalized`
+- block-height observation can be offloaded to `LAUNCHDECK_WARM_RPC_URL` instead of your main execution RPC
 - cache hits can make `compileBlockhashFetchMs` look like `0ms` in reports
 - lookup tables and follow-runtime state are also warmed where relevant
+
+Useful tuning env vars for this path:
+
+- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS`
+- `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
+- `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
 
 ## Same-Time Fee Safeguard
 

@@ -23,7 +23,10 @@ const {
   Connection,
   Keypair,
   PublicKey,
+  SystemInstruction,
+  SystemProgram,
   Transaction,
+  TransactionMessage,
   VersionedTransaction,
 } = require("@solana/web3.js");
 const {
@@ -159,6 +162,114 @@ function normalizeTransactions(transactions, {
     inlineTipLamports,
     inlineTipAccount: inlineTipLamports && inlineTipAccount ? inlineTipAccount : null,
   }));
+}
+
+async function resolveLookupTableAccounts(connection, transaction) {
+  if (!(transaction instanceof VersionedTransaction)) {
+    return [];
+  }
+  const lookups = transaction.message.addressTableLookups || [];
+  const resolved = await Promise.all(lookups.map(async (lookup) => {
+    const response = await connection.getAddressLookupTable(lookup.accountKey);
+    if (!response || !response.value) {
+      throw new Error(`Address lookup table not found: ${lookup.accountKey.toBase58()}`);
+    }
+    return response.value;
+  }));
+  return resolved;
+}
+
+async function decompileTransactionInstructions(connection, transaction) {
+  if (transaction instanceof VersionedTransaction) {
+    const addressLookupTableAccounts = await resolveLookupTableAccounts(connection, transaction);
+    const message = TransactionMessage.decompile(transaction.message, { addressLookupTableAccounts });
+    return {
+      instructions: message.instructions,
+      addressLookupTableAccounts,
+    };
+  }
+  return {
+    instructions: transaction.instructions || [],
+    addressLookupTableAccounts: [],
+  };
+}
+
+function isInlineTipInstruction(instruction, ownerPubkey, tipAccount, tipLamports) {
+  if (!tipAccount || !tipLamports) return false;
+  if (!instruction.programId || !instruction.programId.equals(SystemProgram.programId)) {
+    return false;
+  }
+  try {
+    if (SystemInstruction.decodeInstructionType(instruction) !== "Transfer") {
+      return false;
+    }
+    const decoded = SystemInstruction.decodeTransfer(instruction);
+    return decoded.fromPubkey.equals(ownerPubkey)
+      && decoded.toPubkey.equals(new PublicKey(tipAccount))
+      && Number(decoded.lamports) === Number(tipLamports);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function buildInlineTipInstruction(ownerPubkey, tipAccount, tipLamports) {
+  if (!tipAccount || !tipLamports) return null;
+  return SystemProgram.transfer({
+    fromPubkey: ownerPubkey,
+    toPubkey: new PublicKey(tipAccount),
+    lamports: Number(tipLamports),
+  });
+}
+
+async function ensureInlineTipOnTransaction(connection, owner, transaction, txConfig) {
+  const tipInstruction = buildInlineTipInstruction(
+    owner.publicKey,
+    txConfig && txConfig.tipAccount,
+    txConfig && txConfig.tipLamports,
+  );
+  if (!tipInstruction) {
+    return signTransaction(transaction, owner);
+  }
+  if (transaction instanceof VersionedTransaction) {
+    const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction);
+    if (instructions.some((instruction) => (
+      isInlineTipInstruction(
+        instruction,
+        owner.publicKey,
+        txConfig && txConfig.tipAccount,
+        txConfig && txConfig.tipLamports,
+      )
+    ))) {
+      return signTransaction(transaction, owner);
+    }
+    const rebuilt = new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: owner.publicKey,
+        recentBlockhash: readTransactionBlockhash(transaction),
+        instructions: [...instructions, tipInstruction],
+      }).compileToV0Message(addressLookupTableAccounts),
+    );
+    rebuilt.sign([owner]);
+    return rebuilt;
+  }
+  const instructions = transaction.instructions || [];
+  if (instructions.some((instruction) => (
+    isInlineTipInstruction(
+      instruction,
+      owner.publicKey,
+      txConfig && txConfig.tipAccount,
+      txConfig && txConfig.tipLamports,
+    )
+  ))) {
+    return signTransaction(transaction, owner);
+  }
+  const rebuilt = new Transaction();
+  rebuilt.feePayer = owner.publicKey;
+  rebuilt.recentBlockhash = readTransactionBlockhash(transaction);
+  instructions.forEach((instruction) => rebuilt.add(instruction));
+  rebuilt.add(tipInstruction);
+  rebuilt.sign(owner);
+  return rebuilt;
 }
 
 function parseDecimalToBigInt(raw, decimals, label) {
@@ -808,10 +919,18 @@ async function compileFollowBuy(request) {
     quoteResponse: quote,
     userPublicKey: owner.publicKey,
   });
+  const transaction = await ensureInlineTipOnTransaction(connection, owner, swap.transaction, request.txConfig);
   return {
-    compiledTransaction: normalizeTransactions([swap.transaction], {
+    compiledTransaction: normalizeTransactions([transaction], {
       labelPrefix: request.labelPrefix || "follow-buy",
       computeUnitLimit: swap.computeUnitLimit || null,
+      computeUnitPriceMicroLamports: Number(
+        request.txConfig && request.txConfig.computeUnitPriceMicroLamports || 0
+      ) || null,
+      inlineTipLamports: Number(request.txConfig && request.txConfig.tipLamports || 0) || null,
+      inlineTipAccount: request.txConfig && request.txConfig.tipAccount
+        ? String(request.txConfig.tipAccount).trim()
+        : null,
       lastValidBlockHeight: swap.lastValidBlockHeight,
     })[0],
     quote,
@@ -849,10 +968,18 @@ async function compileFollowSell(request) {
     quoteResponse: quote,
     userPublicKey: owner.publicKey,
   });
+  const transaction = await ensureInlineTipOnTransaction(connection, owner, swap.transaction, request.txConfig);
   return {
-    compiledTransaction: normalizeTransactions([swap.transaction], {
+    compiledTransaction: normalizeTransactions([transaction], {
       labelPrefix: request.labelPrefix || "follow-sell",
       computeUnitLimit: swap.computeUnitLimit || null,
+      computeUnitPriceMicroLamports: Number(
+        request.txConfig && request.txConfig.computeUnitPriceMicroLamports || 0
+      ) || null,
+      inlineTipLamports: Number(request.txConfig && request.txConfig.tipLamports || 0) || null,
+      inlineTipAccount: request.txConfig && request.txConfig.tipAccount
+        ? String(request.txConfig.tipAccount).trim()
+        : null,
       lastValidBlockHeight: swap.lastValidBlockHeight,
     })[0],
     quote,

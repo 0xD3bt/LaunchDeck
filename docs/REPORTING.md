@@ -49,6 +49,7 @@ Typical report data includes:
 - confirmation state
 - applied tip and compute-unit settings
 - benchmark timing data
+- optional send/confirm block-height snapshots when `execution.trackSendBlockHeight` is enabled
 
 When follow behavior is enabled, reports can also include:
 
@@ -86,6 +87,19 @@ This helps distinguish:
 - metadata upload delay
 - backend compile time
 - chain confirmation time
+
+Benchmark detail levels:
+
+- `off` keeps timing detail minimal
+- `basic` records core timings plus first-snapshot timing
+- `full` records grouped timings plus reporting-overhead timing
+
+`LAUNCHDECK_BENCHMARK_MODE` controls this report timing detail. It does not enable block-height capture by itself.
+
+For block-height capture in reports:
+
+- use `execution.trackSendBlockHeight` per launch or preset
+- or set `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT=true` to make that the default
 
 ## Follow Telemetry
 

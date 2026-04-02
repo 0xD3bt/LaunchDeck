@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 
 use crate::{
     config::{
@@ -39,8 +40,11 @@ pub struct TransactionSummary {
     pub label: String,
     pub instructionSummary: Vec<InstructionSummary>,
     pub legacyLength: Option<usize>,
+    pub legacyBase64Length: Option<usize>,
     pub v0Length: Option<usize>,
+    pub v0Base64Length: Option<usize>,
     pub v0AltLength: Option<usize>,
+    pub v0AltBase64Length: Option<usize>,
     pub legacyError: Option<String>,
     pub v0Error: Option<String>,
     pub v0AltError: Option<String>,
@@ -73,6 +77,18 @@ pub struct SentItem {
     pub skipPreflight: bool,
     pub maxRetries: u32,
     pub confirmationStatus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmationSource: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submittedAtMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firstObservedStatus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firstObservedSlot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firstObservedAtMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmedAtMs: Option<u128>,
     pub sendObservedBlockHeight: Option<u64>,
     pub confirmedObservedBlockHeight: Option<u64>,
     pub confirmedSlot: Option<u64>,
@@ -86,26 +102,159 @@ pub struct SentItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmarkMode: Option<String>,
     pub totalElapsedMs: Option<u128>,
     pub backendTotalElapsedMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executionTotalMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observedWallClockMs: Option<u128>,
     pub clientPreRequestMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepareRequestPayloadMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apiRoundTripOverheadMs: Option<u128>,
     pub formToRawConfigMs: Option<u128>,
     pub normalizeConfigMs: Option<u128>,
     pub walletLoadMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transportPlanBuildMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoFeeResolveMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sameTimeFeeGuardMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followDaemonReadyMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followDaemonReserveMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followDaemonArmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followDaemonStatusRefreshMs: Option<u128>,
     pub reportBuildMs: Option<u128>,
     pub compileTransactionsMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileLaunchCreatorPrepMs: Option<u128>,
     pub compileAltLoadMs: Option<u128>,
     pub compileBlockhashFetchMs: Option<u128>,
     pub compileGlobalFetchMs: Option<u128>,
     pub compileFollowUpPrepMs: Option<u128>,
     pub compileTxSerializeMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileLaunchSerializeMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileFollowUpSerializeMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileTipSerializeMs: Option<u128>,
     pub simulateMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulateLaunchMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulateFollowUpMs: Option<u128>,
     pub sendMs: Option<u128>,
     pub sendSubmitMs: Option<u128>,
     pub sendConfirmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendTransportSubmitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendTransportConfirmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendBundleStatusMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendWatchFallbackMs: Option<u128>,
     pub bagsSetupSubmitMs: Option<u128>,
     pub bagsSetupConfirmMs: Option<u128>,
     pub persistReportMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistInitialSnapshotMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistFinalReportUpdateMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followSnapshotFlushMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportRenderMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportListRefreshMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backendOtherMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executionOtherMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endToEndOtherMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportingOverheadMs: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FollowActionTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcherWaitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibilityMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executionTotalMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportSyncMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportingOverheadMs: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FollowJobTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmarkMode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserveMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cachePrepMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watcherWaitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligibilityMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compileMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executionTotalMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportSyncMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followSnapshotFlushMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reportingOverheadMs: Option<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkTimingItem {
+    pub key: String,
+    pub label: String,
+    pub valueMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub inclusive: bool,
+    #[serde(default)]
+    pub remainder: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BenchmarkTimingGroup {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub items: Vec<BenchmarkTimingItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -121,8 +270,44 @@ pub struct BenchmarkSentItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BenchmarkSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub timings: ExecutionTimings,
+    #[serde(default)]
+    pub timingGroups: Vec<BenchmarkTimingGroup>,
     pub sent: Vec<BenchmarkSentItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkMode {
+    Off,
+    Basic,
+    Full,
+}
+
+impl BenchmarkMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Basic => "basic",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "full" => Self::Full,
+            "" => Self::Full,
+            _ => Self::Basic,
+        }
+    }
+}
+
+pub fn configured_benchmark_mode() -> BenchmarkMode {
+    BenchmarkMode::from_value(
+        &env::var("LAUNCHDECK_BENCHMARK_MODE").unwrap_or_else(|_| "full".to_string()),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +356,22 @@ pub struct SavedBagsReportConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BonkUsd1LaunchSummary {
+    pub compilePath: String,
+    pub currentQuoteAmount: String,
+    pub requiredQuoteAmount: String,
+    pub shortfallQuoteAmount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputSol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expectedQuoteOut: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minQuoteOut: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atomicFallbackReason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchReport {
     pub builtAt: String,
     pub configPath: Option<String>,
@@ -206,6 +407,8 @@ pub struct LaunchReport {
     pub savedAgentFeeRecipients: Option<Vec<NormalizedRecipient>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub savedCreatorFee: Option<NormalizedCreatorFee>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonkUsd1Launch: Option<BonkUsd1LaunchSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followDaemon: Option<Value>,
     #[serde(default)]
@@ -378,6 +581,14 @@ fn short_address(value: &str, left: usize, right: usize) -> String {
     format!("{}...{}", &value[..left], &value[value.len() - right..])
 }
 
+fn format_duration_ms(value_ms: u128) -> String {
+    if value_ms < 1_000 {
+        format!("{value_ms}ms")
+    } else {
+        format!("{:.3}s", value_ms as f64 / 1_000.0)
+    }
+}
+
 fn parse_lookup_table_addresses(config: &NormalizedConfig) -> Vec<String> {
     let mut values = Vec::new();
     if config.tx.useDefaultLookupTables {
@@ -411,8 +622,11 @@ fn planned_transactions(
         label: "launch".to_string(),
         instructionSummary: vec![],
         legacyLength: None,
+        legacyBase64Length: None,
         v0Length: None,
+        v0Base64Length: None,
         v0AltLength: None,
+        v0AltBase64Length: None,
         legacyError: None,
         v0Error: None,
         v0AltError: None,
@@ -445,8 +659,11 @@ fn planned_transactions(
             label: display_transaction_label(label),
             instructionSummary: vec![],
             legacyLength: None,
+            legacyBase64Length: None,
             v0Length: None,
+            v0Base64Length: None,
             v0AltLength: None,
+            v0AltBase64Length: None,
             legacyError: None,
             v0Error: None,
             v0AltError: None,
@@ -478,8 +695,11 @@ fn planned_transactions(
             label: "jito-tip".to_string(),
             instructionSummary: vec![],
             legacyLength: None,
+            legacyBase64Length: None,
             v0Length: None,
+            v0Base64Length: None,
             v0AltLength: None,
+            v0AltBase64Length: None,
             legacyError: None,
             v0Error: None,
             v0AltError: None,
@@ -689,10 +909,746 @@ pub fn build_report(
             Some(config.agent.feeRecipients.clone())
         },
         savedCreatorFee: Some(config.creatorFee.clone()),
+        bonkUsd1Launch: None,
         followDaemon: None,
         benchmark: None,
         outPath: None,
     }
+}
+
+fn timing_metric(
+    key: &str,
+    label: &str,
+    value_ms: Option<u128>,
+    detail: Option<&str>,
+    inclusive: bool,
+    remainder: bool,
+) -> BenchmarkTimingItem {
+    BenchmarkTimingItem {
+        key: key.to_string(),
+        label: label.to_string(),
+        valueMs: value_ms,
+        detail: detail.map(str::to_string),
+        inclusive,
+        remainder,
+    }
+}
+
+fn sum_known(values: &[Option<u128>]) -> Option<u128> {
+    let mut total = 0u128;
+    let mut has_any = false;
+    for value in values.iter().flatten() {
+        total = total.saturating_add(*value);
+        has_any = true;
+    }
+    has_any.then_some(total)
+}
+
+fn remaining_time(total: Option<u128>, children: &[Option<u128>]) -> Option<u128> {
+    let total = total?;
+    let child_sum = sum_known(children)?;
+    Some(total.saturating_sub(child_sum))
+}
+
+fn pick_first(values: &[Option<u128>]) -> Option<u128> {
+    values.iter().flatten().copied().next()
+}
+
+pub fn sanitize_execution_timings_for_mode(
+    timings: &ExecutionTimings,
+    mode: BenchmarkMode,
+) -> ExecutionTimings {
+    let mut sanitized = timings.clone();
+    sanitized.benchmarkMode = Some(mode.as_str().to_string());
+    match mode {
+        BenchmarkMode::Full => sanitized,
+        BenchmarkMode::Basic => {
+            sanitized.apiRoundTripOverheadMs = None;
+            sanitized.transportPlanBuildMs = None;
+            sanitized.autoFeeResolveMs = None;
+            sanitized.sameTimeFeeGuardMs = None;
+            sanitized.followDaemonReadyMs = None;
+            sanitized.followDaemonReserveMs = None;
+            sanitized.followDaemonArmMs = None;
+            sanitized.followDaemonStatusRefreshMs = None;
+            sanitized.compileLaunchCreatorPrepMs = None;
+            sanitized.compileLaunchSerializeMs = None;
+            sanitized.compileFollowUpSerializeMs = None;
+            sanitized.compileTipSerializeMs = None;
+            sanitized.simulateLaunchMs = None;
+            sanitized.simulateFollowUpMs = None;
+            sanitized.sendTransportSubmitMs = None;
+            sanitized.sendTransportConfirmMs = None;
+            sanitized.sendBundleStatusMs = None;
+            sanitized.sendWatchFallbackMs = None;
+            sanitized.persistFinalReportUpdateMs = None;
+            sanitized.followSnapshotFlushMs = None;
+            sanitized.reportRenderMs = None;
+            sanitized.reportListRefreshMs = None;
+            sanitized.reportingOverheadMs = None;
+            sanitized
+        }
+        BenchmarkMode::Off => ExecutionTimings {
+            benchmarkMode: Some(mode.as_str().to_string()),
+            totalElapsedMs: timings.totalElapsedMs,
+            backendTotalElapsedMs: timings.backendTotalElapsedMs,
+            executionTotalMs: timings.executionTotalMs,
+            observedWallClockMs: timings.observedWallClockMs,
+            clientPreRequestMs: timings.clientPreRequestMs,
+            persistInitialSnapshotMs: timings.persistInitialSnapshotMs,
+            ..ExecutionTimings::default()
+        },
+    }
+}
+
+pub fn build_benchmark_timing_groups(
+    timings: &ExecutionTimings,
+    follow_timings: Option<&FollowJobTimings>,
+) -> Vec<BenchmarkTimingGroup> {
+    let prep_total = sum_known(&[
+        timings.prepareRequestPayloadMs,
+        timings.formToRawConfigMs,
+        timings.normalizeConfigMs,
+        timings.walletLoadMs,
+        timings.transportPlanBuildMs,
+        timings.autoFeeResolveMs,
+        timings.sameTimeFeeGuardMs,
+        timings.followDaemonReadyMs,
+        timings.followDaemonReserveMs,
+        timings.followDaemonArmMs,
+        timings.followDaemonStatusRefreshMs,
+        timings.reportBuildMs,
+    ]);
+    let compile_other = remaining_time(
+        timings.compileTransactionsMs,
+        &[
+            timings.compileLaunchCreatorPrepMs,
+            timings.compileAltLoadMs,
+            timings.compileBlockhashFetchMs,
+            timings.compileGlobalFetchMs,
+            timings.compileFollowUpPrepMs,
+            timings.compileLaunchSerializeMs,
+            timings.compileFollowUpSerializeMs,
+            timings.compileTipSerializeMs,
+            timings.compileTxSerializeMs,
+        ],
+    );
+    let simulate_other = remaining_time(
+        timings.simulateMs,
+        &[timings.simulateLaunchMs, timings.simulateFollowUpMs],
+    );
+    let send_other = remaining_time(
+        timings.sendMs,
+        &[timings.sendSubmitMs, timings.sendConfirmMs],
+    );
+    let submit_other = remaining_time(
+        timings.sendSubmitMs,
+        &[
+            timings.bagsSetupSubmitMs,
+            timings.sendTransportSubmitMs,
+            pick_first(&[
+                timings.compileLaunchSerializeMs,
+                timings.compileFollowUpSerializeMs,
+                timings.compileTipSerializeMs,
+            ]),
+        ],
+    );
+    let confirm_other = remaining_time(
+        timings.sendConfirmMs,
+        &[
+            timings.bagsSetupConfirmMs,
+            timings.sendTransportConfirmMs,
+            timings.sendBundleStatusMs,
+            timings.sendWatchFallbackMs,
+        ],
+    );
+    let reporting_total = timings.reportingOverheadMs.or_else(|| {
+        sum_known(&[
+            timings.persistInitialSnapshotMs.or(timings.persistReportMs),
+            timings.persistFinalReportUpdateMs,
+            timings.followSnapshotFlushMs,
+            timings.reportRenderMs,
+            timings.reportListRefreshMs,
+        ])
+    });
+    let execution_total = timings.backendTotalElapsedMs.map(|backend| {
+        backend.saturating_sub(reporting_total.unwrap_or_default())
+    }).or(timings.executionTotalMs);
+    let backend_other = timings.backendOtherMs.or_else(|| {
+        remaining_time(
+            execution_total,
+            &[
+                prep_total,
+                timings.compileTransactionsMs,
+                timings.simulateMs,
+                timings.sendMs,
+            ],
+        )
+    });
+    let end_to_end_other = timings.endToEndOtherMs.or_else(|| {
+        remaining_time(
+            timings.totalElapsedMs,
+            &[timings.clientPreRequestMs, timings.backendTotalElapsedMs],
+        )
+    });
+    let top_level = BenchmarkTimingGroup {
+        key: "topLevel".to_string(),
+        label: "Top-Level Timings".to_string(),
+        items: vec![
+            timing_metric(
+                "totalElapsedMs",
+                "End-to-end",
+                timings.totalElapsedMs,
+                Some("client + backend inclusive"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "executionTotalMs",
+                "Execution total",
+                execution_total,
+                Some("core execution without reporting overhead"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "reportingOverheadMs",
+                "Reporting overhead",
+                reporting_total,
+                Some("persist + render + follow snapshot writes"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "clientPreRequestMs",
+                "Client overhead",
+                timings.clientPreRequestMs,
+                Some("before engine work starts"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "backendTotalElapsedMs",
+                "Backend total",
+                timings.backendTotalElapsedMs,
+                Some("all engine work observed by the backend"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "backendOtherMs",
+                "Backend remainder",
+                backend_other,
+                Some("known backend groups do not fully explain this remainder"),
+                false,
+                true,
+            ),
+            timing_metric(
+                "endToEndOtherMs",
+                "End-to-end remainder",
+                end_to_end_other,
+                Some("known client and backend totals do not fully explain this remainder"),
+                false,
+                true,
+            ),
+            timing_metric(
+                "observedWallClockMs",
+                "Observed wall clock",
+                timings.observedWallClockMs,
+                Some("reference only, not a speed benchmark"),
+                false,
+                false,
+            ),
+        ],
+    };
+    let prep = BenchmarkTimingGroup {
+        key: "prep".to_string(),
+        label: "Preparation".to_string(),
+        items: vec![
+            timing_metric(
+                "prepareRequestPayloadMs",
+                "Prepare request payload",
+                timings.prepareRequestPayloadMs,
+                Some("client payload assembly before POST"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "formToRawConfigMs",
+                "Form to raw config",
+                timings.formToRawConfigMs,
+                Some("UI payload to engine config"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "normalizeConfigMs",
+                "Normalize config",
+                timings.normalizeConfigMs,
+                Some("validation + normalization"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "walletLoadMs",
+                "Wallet load",
+                timings.walletLoadMs,
+                Some("wallet/env hydration"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "transportPlanBuildMs",
+                "Transport plan",
+                timings.transportPlanBuildMs,
+                Some("provider + endpoint routing selection"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "autoFeeResolveMs",
+                "Auto-fee resolve",
+                timings.autoFeeResolveMs,
+                Some("priority fee + tip estimation and caps"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "sameTimeFeeGuardMs",
+                "Same-time fee guard",
+                timings.sameTimeFeeGuardMs,
+                Some("same-time launch/snipe safety adjustments"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "followDaemonReadyMs",
+                "Follow ready check",
+                timings.followDaemonReadyMs,
+                Some("follow daemon readiness validation"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "followDaemonReserveMs",
+                "Follow reserve",
+                timings.followDaemonReserveMs,
+                Some("follow daemon reservation request"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "followDaemonArmMs",
+                "Follow arm",
+                timings.followDaemonArmMs,
+                Some("follow daemon arm request"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "followDaemonStatusRefreshMs",
+                "Follow status refresh",
+                timings.followDaemonStatusRefreshMs,
+                Some("final follow daemon status read"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "reportBuildMs",
+                "Report build",
+                timings.reportBuildMs,
+                Some("initial report object assembly"),
+                false,
+                false,
+            ),
+        ],
+    };
+    let compile = BenchmarkTimingGroup {
+        key: "compile".to_string(),
+        label: "Compile Breakdown".to_string(),
+        items: vec![
+            timing_metric(
+                "compileTransactionsMs",
+                "Compile total",
+                timings.compileTransactionsMs,
+                Some("inclusive compile stage total"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "compileLaunchCreatorPrepMs",
+                "Launch creator prep",
+                timings.compileLaunchCreatorPrepMs,
+                Some("launch creator + pre-instruction resolution"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileAltLoadMs",
+                "ALT load",
+                timings.compileAltLoadMs,
+                Some("lookup table fetch"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileBlockhashFetchMs",
+                "Blockhash fetch",
+                timings.compileBlockhashFetchMs,
+                Some("latest blockhash fetch"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileGlobalFetchMs",
+                "Global fetch",
+                timings.compileGlobalFetchMs,
+                Some("shared launch context"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileFollowUpPrepMs",
+                "Follow-up prep",
+                timings.compileFollowUpPrepMs,
+                Some("follow action planning"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileLaunchSerializeMs",
+                "Launch serialize",
+                timings.compileLaunchSerializeMs,
+                Some("launch transaction serialization"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileFollowUpSerializeMs",
+                "Follow-up serialize",
+                timings.compileFollowUpSerializeMs,
+                Some("follow-up transaction serialization"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileTipSerializeMs",
+                "Tip serialize",
+                timings.compileTipSerializeMs,
+                Some("tip transaction serialization"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileTxSerializeMs",
+                "Serialize total",
+                timings.compileTxSerializeMs,
+                Some("all transaction serialization work"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "compileOtherMs",
+                "Compile remainder",
+                compile_other,
+                Some("known compile children do not fully explain this remainder"),
+                false,
+                true,
+            ),
+        ],
+    };
+    let simulate = BenchmarkTimingGroup {
+        key: "simulate".to_string(),
+        label: "Simulate Breakdown".to_string(),
+        items: vec![
+            timing_metric(
+                "simulateMs",
+                "Simulate total",
+                timings.simulateMs,
+                Some("inclusive simulation stage total"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "simulateLaunchMs",
+                "Launch simulate",
+                timings.simulateLaunchMs,
+                Some("launch simulation only"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "simulateFollowUpMs",
+                "Follow-up simulate",
+                timings.simulateFollowUpMs,
+                Some("follow-up simulation only"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "simulateOtherMs",
+                "Simulate remainder",
+                simulate_other,
+                Some("known simulate children do not fully explain this remainder"),
+                false,
+                true,
+            ),
+        ],
+    };
+    let send = BenchmarkTimingGroup {
+        key: "send".to_string(),
+        label: "Send Breakdown".to_string(),
+        items: vec![
+            timing_metric(
+                "sendMs",
+                "Send total",
+                timings.sendMs,
+                Some("inclusive stage total"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "sendSubmitMs",
+                "Submit total",
+                timings.sendSubmitMs,
+                Some("all transaction submissions"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "sendTransportSubmitMs",
+                "Transport submit",
+                timings.sendTransportSubmitMs,
+                Some("send RPC/provider submit only"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "bagsSetupSubmitMs",
+                "Setup submit",
+                timings.bagsSetupSubmitMs,
+                Some("setup transaction submit"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "sendSubmitOtherMs",
+                "Submit remainder",
+                submit_other,
+                Some("known submit children do not fully explain this remainder"),
+                false,
+                true,
+            ),
+            timing_metric(
+                "sendConfirmMs",
+                "Confirm total",
+                timings.sendConfirmMs,
+                Some("all confirmation waits"),
+                true,
+                false,
+            ),
+            timing_metric(
+                "sendTransportConfirmMs",
+                "Transport confirm",
+                timings.sendTransportConfirmMs,
+                Some("provider confirmation path only"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "sendBundleStatusMs",
+                "Bundle status",
+                timings.sendBundleStatusMs,
+                Some("Jito bundle status polling"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "sendWatchFallbackMs",
+                "Watch fallback",
+                timings.sendWatchFallbackMs,
+                Some("websocket fallback or poll wait"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "bagsSetupConfirmMs",
+                "Setup confirm",
+                timings.bagsSetupConfirmMs,
+                Some("setup transaction confirmation"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "sendConfirmOtherMs",
+                "Confirm remainder",
+                confirm_other,
+                Some("known confirm children do not fully explain this remainder"),
+                false,
+                true,
+            ),
+            timing_metric(
+                "sendOtherMs",
+                "Send remainder",
+                send_other,
+                Some("known send children do not fully explain this remainder"),
+                false,
+                true,
+            ),
+        ],
+    };
+    let reporting = BenchmarkTimingGroup {
+        key: "reporting".to_string(),
+        label: "Reporting Overhead".to_string(),
+        items: vec![
+            timing_metric(
+                "persistInitialSnapshotMs",
+                "Persist first snapshot",
+                timings.persistInitialSnapshotMs.or(timings.persistReportMs),
+                Some("first crash-safe snapshot write"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "persistFinalReportUpdateMs",
+                "Persist final update",
+                timings.persistFinalReportUpdateMs,
+                Some("final report enrichment write"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "followSnapshotFlushMs",
+                "Follow snapshot flush",
+                timings.followSnapshotFlushMs,
+                Some("follow daemon snapshot write"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "reportRenderMs",
+                "Report render",
+                timings.reportRenderMs,
+                Some("text report rendering"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "reportListRefreshMs",
+                "Report list refresh",
+                timings.reportListRefreshMs,
+                Some("report index/list refresh"),
+                false,
+                false,
+            ),
+        ],
+    };
+    let mut groups = vec![top_level, prep, compile, simulate, send, reporting];
+    if let Some(follow) = follow_timings {
+        groups.push(BenchmarkTimingGroup {
+            key: "followDaemon".to_string(),
+            label: "Follow Daemon Timing".to_string(),
+            items: vec![
+                timing_metric(
+                    "followReserveMs",
+                    "Reserve",
+                    follow.reserveMs,
+                    Some("initial follow reservation"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followArmMs",
+                    "Arm",
+                    follow.armMs,
+                    Some("follow arm request"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followCachePrepMs",
+                    "Cache prep",
+                    follow.cachePrepMs,
+                    Some("follow buy cache preparation"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followWatcherWaitMs",
+                    "Watcher wait",
+                    follow.watcherWaitMs,
+                    Some("slot/signature/market watcher waits"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followEligibilityMs",
+                    "Eligibility",
+                    follow.eligibilityMs,
+                    Some("time to become runnable"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followCompileMs",
+                    "Compile",
+                    follow.compileMs,
+                    Some("follow compile work"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followSubmitMs",
+                    "Submit",
+                    follow.submitMs,
+                    Some("follow action submission"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followConfirmMs",
+                    "Confirm",
+                    follow.confirmMs,
+                    Some("follow action confirmation"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followExecutionTotalMs",
+                    "Execution total",
+                    follow.executionTotalMs,
+                    Some("aggregated follow execution timing"),
+                    true,
+                    false,
+                ),
+                timing_metric(
+                    "followReportSyncMs",
+                    "Report sync",
+                    follow.reportSyncMs,
+                    Some("follow snapshot/report sync work"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followSnapshotFlushMs",
+                    "Snapshot flush",
+                    follow.followSnapshotFlushMs,
+                    Some("coalesced snapshot file writes"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followReportingOverheadMs",
+                    "Reporting overhead",
+                    follow.reportingOverheadMs,
+                    Some("follow reporting overhead total"),
+                    false,
+                    false,
+                ),
+            ],
+        });
+    }
+    groups
 }
 
 pub fn render_report(report: &LaunchReport) -> String {
@@ -750,7 +1706,7 @@ pub fn render_report(report: &LaunchReport) -> String {
         report.execution.trackSendBlockHeight
     ));
     if let Some(endpoint) = &report.execution.heliusSenderEndpoint {
-        lines.push(format!("Helius Sender endpoint: {}", endpoint));
+        lines.push(format!("Helius Sender responder: {}", endpoint));
     }
     if report.bundleJitoTip {
         lines.push("Jito tip handling: separate bundled tip transaction".to_string());
@@ -915,13 +1871,22 @@ pub fn render_report(report: &LaunchReport) -> String {
             display_transaction_label(&tx.label),
             tx.instructionSummary.len(),
             tx.legacyLength
-                .map(|value| format!("{value} bytes"))
+                .map(|value| match tx.legacyBase64Length {
+                    Some(encoded) => format!("{value} bytes / {encoded} b64"),
+                    None => format!("{value} bytes"),
+                })
                 .unwrap_or_else(|| "n/a".to_string()),
             tx.v0Length
-                .map(|value| format!("{value} bytes"))
+                .map(|value| match tx.v0Base64Length {
+                    Some(encoded) => format!("{value} bytes / {encoded} b64"),
+                    None => format!("{value} bytes"),
+                })
                 .unwrap_or_else(|| "n/a".to_string()),
             tx.v0AltLength
-                .map(|value| format!("{value} bytes"))
+                .map(|value| match tx.v0AltBase64Length {
+                    Some(encoded) => format!("{value} bytes / {encoded} b64"),
+                    None => format!("{value} bytes"),
+                })
                 .unwrap_or_else(|| "n/a".to_string())
         ));
         if !tx.lookupTablesUsed.is_empty() {
@@ -944,6 +1909,9 @@ pub fn render_report(report: &LaunchReport) -> String {
                 sent.signature.as_deref().unwrap_or("(missing)"),
                 sent.confirmationStatus.as_deref().unwrap_or("(pending)")
             );
+            if let Some(source) = sent.confirmationSource.as_deref() {
+                summary.push_str(&format!(" | via={source}"));
+            }
             if let Some(block_height) = sent.sendObservedBlockHeight {
                 summary.push_str(&format!(" | send block height={block_height}"));
             }
@@ -962,6 +1930,25 @@ pub fn render_report(report: &LaunchReport) -> String {
             if let Some(slot) = sent.confirmedSlot {
                 summary.push_str(&format!(" | confirmed slot={slot}"));
             }
+            if let (Some(submitted_at), Some(first_seen_at)) = (sent.submittedAtMs, sent.firstObservedAtMs)
+            {
+                summary.push_str(&format!(
+                    " | first seen {} after submit",
+                    format_duration_ms(first_seen_at.saturating_sub(submitted_at))
+                ));
+            }
+            if let Some(status) = sent.firstObservedStatus.as_deref() {
+                summary.push_str(&format!(" | first status={status}"));
+            }
+            if let Some(slot) = sent.firstObservedSlot {
+                summary.push_str(&format!(" | first slot={slot}"));
+            }
+            if let (Some(submitted_at), Some(confirmed_at)) = (sent.submittedAtMs, sent.confirmedAtMs) {
+                summary.push_str(&format!(
+                    " | confirmed seen {} after submit",
+                    format_duration_ms(confirmed_at.saturating_sub(submitted_at))
+                ));
+            }
             lines.push(summary);
         }
     }
@@ -977,6 +1964,28 @@ pub fn render_report(report: &LaunchReport) -> String {
         lines.push("Notes:".to_string());
         for note in &report.execution.notes {
             lines.push(format!("- {}", note));
+        }
+    }
+    if let Some(usd1) = &report.bonkUsd1Launch {
+        lines.push(String::new());
+        lines.push("Bonk USD1 Launch:".to_string());
+        lines.push(format!("  Compile path: {}", usd1.compilePath));
+        lines.push(format!(
+            "  Wallet USD1: current={} | required={} | shortfall={}",
+            usd1.currentQuoteAmount, usd1.requiredQuoteAmount, usd1.shortfallQuoteAmount
+        ));
+        if let Some(input_sol) = usd1.inputSol.as_deref() {
+            let mut quote_parts = vec![format!("input SOL={input_sol}")];
+            if let Some(expected) = usd1.expectedQuoteOut.as_deref() {
+                quote_parts.push(format!("expected USD1 out={expected}"));
+            }
+            if let Some(min_out) = usd1.minQuoteOut.as_deref() {
+                quote_parts.push(format!("min USD1 out={min_out}"));
+            }
+            lines.push(format!("  Top-up quote: {}", quote_parts.join(" | ")));
+        }
+        if let Some(reason) = usd1.atomicFallbackReason.as_deref() {
+            lines.push(format!("  Fallback: {reason}"));
         }
     }
     lines.join("\n")
@@ -1058,5 +2067,92 @@ mod tests {
             report.loadedLookupTables,
             vec!["LoadedLookup2222222222222222222222222222222".to_string()]
         );
+    }
+
+    #[test]
+    fn benchmark_groups_reconcile_execution_totals() {
+        let timings = ExecutionTimings {
+            benchmarkMode: Some("full".to_string()),
+            totalElapsedMs: Some(818),
+            backendTotalElapsedMs: Some(700),
+            executionTotalMs: Some(660),
+            clientPreRequestMs: Some(118),
+            prepareRequestPayloadMs: Some(12),
+            formToRawConfigMs: Some(18),
+            normalizeConfigMs: Some(20),
+            walletLoadMs: Some(30),
+            reportBuildMs: Some(20),
+            compileTransactionsMs: Some(210),
+            compileLaunchCreatorPrepMs: Some(20),
+            compileAltLoadMs: Some(40),
+            compileBlockhashFetchMs: Some(25),
+            compileGlobalFetchMs: Some(15),
+            compileFollowUpPrepMs: Some(10),
+            compileLaunchSerializeMs: Some(30),
+            compileFollowUpSerializeMs: Some(20),
+            compileTipSerializeMs: Some(10),
+            compileTxSerializeMs: Some(60),
+            simulateMs: Some(40),
+            sendMs: Some(250),
+            sendSubmitMs: Some(90),
+            sendTransportSubmitMs: Some(75),
+            sendConfirmMs: Some(160),
+            sendTransportConfirmMs: Some(120),
+            sendWatchFallbackMs: Some(20),
+            persistInitialSnapshotMs: Some(12),
+            persistFinalReportUpdateMs: Some(18),
+            reportRenderMs: Some(10),
+            reportingOverheadMs: Some(40),
+            ..ExecutionTimings::default()
+        };
+        let groups = build_benchmark_timing_groups(&timings, None);
+        let top_level = groups
+            .iter()
+            .find(|group| group.key == "topLevel")
+            .expect("top level group");
+        let execution_total = top_level
+            .items
+            .iter()
+            .find(|item| item.key == "executionTotalMs")
+            .and_then(|item| item.valueMs)
+            .expect("execution total");
+        let reporting_overhead = top_level
+            .items
+            .iter()
+            .find(|item| item.key == "reportingOverheadMs")
+            .and_then(|item| item.valueMs)
+            .expect("reporting overhead");
+        let backend_remainder = top_level
+            .items
+            .iter()
+            .find(|item| item.key == "backendOtherMs")
+            .and_then(|item| item.valueMs)
+            .expect("backend remainder");
+        assert_eq!(execution_total, 660);
+        assert_eq!(reporting_overhead, 40);
+        assert_eq!(backend_remainder, 60);
+    }
+
+    #[test]
+    fn benchmark_mode_off_strips_detailed_timings() {
+        let timings = ExecutionTimings {
+            benchmarkMode: Some("full".to_string()),
+            totalElapsedMs: Some(500),
+            backendTotalElapsedMs: Some(420),
+            executionTotalMs: Some(400),
+            clientPreRequestMs: Some(80),
+            compileTransactionsMs: Some(140),
+            sendTransportSubmitMs: Some(40),
+            persistInitialSnapshotMs: Some(12),
+            ..ExecutionTimings::default()
+        };
+        let sanitized = sanitize_execution_timings_for_mode(&timings, BenchmarkMode::Off);
+        assert_eq!(sanitized.totalElapsedMs, Some(500));
+        assert_eq!(sanitized.backendTotalElapsedMs, Some(420));
+        assert_eq!(sanitized.executionTotalMs, Some(400));
+        assert_eq!(sanitized.clientPreRequestMs, Some(80));
+        assert_eq!(sanitized.persistInitialSnapshotMs, Some(12));
+        assert_eq!(sanitized.compileTransactionsMs, None);
+        assert_eq!(sanitized.sendTransportSubmitMs, None);
     }
 }

@@ -29,7 +29,8 @@ use crate::{
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
-        FollowJobResponse, FollowReadyRequest, FollowReserveRequest, FollowStopAllRequest,
+        FollowJobResponse, FollowReserveRequest, FollowStopAllRequest, build_action_records,
+        should_use_post_setup_creator_vault_for_sell,
     },
     fs_utils::atomic_write,
     image_library::{
@@ -44,13 +45,24 @@ use crate::{
         log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
-    pump_native::{warm_default_lookup_tables, warm_pump_global_state},
-    report::{LaunchReport, build_report, render_report},
+    bonk_native::{
+        derive_canonical_pool_id as derive_bonk_canonical_pool_id,
+        predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount,
+        warm_bonk_state,
+    },
+    pump_native::{predict_dev_buy_token_amount, warm_default_lookup_tables, warm_pump_global_state},
+    report::{
+        BenchmarkMode, ExecutionTimings, FollowJobTimings, LaunchReport,
+        build_benchmark_timing_groups, build_report, configured_benchmark_mode, render_report,
+        sanitize_execution_timings_for_mode,
+    },
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
     rpc::{
         CompiledTransaction, confirm_submitted_transactions_for_transport,
-        confirm_transactions_with_websocket_fallback, send_transactions_bundle,
-        simulate_transactions, spawn_blockhash_refresh_task,
+        confirm_transactions_with_websocket_fallback, configured_warm_rpc_url,
+        fetch_current_block_height,
+        send_transactions_bundle,
+        simulate_transactions, spawn_blockhash_refresh_task, prewarm_rpc_endpoint,
         submit_independent_transactions_for_transport, submit_transactions_for_transport,
         submit_transactions_sequential,
     },
@@ -60,7 +72,8 @@ use crate::{
     },
     strategies::strategy_registry,
     transport::{
-        build_transport_plan, configured_helius_sender_endpoint, configured_jito_bundle_endpoints,
+        build_transport_plan, configured_helius_sender_endpoint,
+        configured_helius_sender_endpoints_for_profile, configured_jito_bundle_endpoints,
         configured_provider_region, configured_shared_region, default_endpoint_profile,
         default_endpoint_profile_for_provider, estimate_transaction_count,
         helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
@@ -114,6 +127,9 @@ struct EngineRequest {
     form: Option<Value>,
     #[serde(rename = "rawConfig")]
     raw_config: Option<Value>,
+    #[serde(default)]
+    #[serde(rename = "prepareRequestPayloadMs")]
+    prepare_request_payload_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -133,6 +149,9 @@ struct RunRequest {
     #[serde(default)]
     #[serde(rename = "clientPreRequestMs")]
     client_pre_request_ms: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "prepareRequestPayloadMs")]
+    prepare_request_payload_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +353,17 @@ fn configured_rpc_url() -> String {
         }
     }
     "http://127.0.0.1:8899".to_string()
+}
+
+fn configured_startup_warm_enabled() -> bool {
+    !matches!(
+        std::env::var("LAUNCHDECK_DISABLE_STARTUP_WARM")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn configured_base_url() -> String {
@@ -569,12 +599,51 @@ fn set_optional_report_timing(report: &mut Value, key: &str, value_ms: Option<u1
     }
 }
 
-fn refresh_report_benchmark(report: &mut Value) {
-    let timings = report
+fn set_report_benchmark_mode(report: &mut Value, mode: BenchmarkMode) {
+    if let Some(execution) = report.get_mut("execution") {
+        if execution.get("timings").is_none()
+            || execution.get("timings").is_some_and(Value::is_null)
+        {
+            execution["timings"] = json!({});
+        }
+        execution["timings"]["benchmarkMode"] = Value::String(mode.as_str().to_string());
+    }
+}
+
+fn report_benchmark_mode(report: &Value) -> BenchmarkMode {
+    report
+        .get("execution")
+        .and_then(|value| value.get("timings"))
+        .and_then(|timings| timings.get("benchmarkMode"))
+        .and_then(Value::as_str)
+        .map(BenchmarkMode::from_value)
+        .unwrap_or_else(configured_benchmark_mode)
+}
+
+fn parse_report_execution_timings(report: &Value) -> ExecutionTimings {
+    report
         .get("execution")
         .and_then(|value| value.get("timings"))
         .cloned()
-        .unwrap_or_else(|| json!({}));
+        .and_then(|value| serde_json::from_value::<ExecutionTimings>(value).ok())
+        .unwrap_or_default()
+}
+
+fn parse_follow_job_timings(report: &Value) -> Option<FollowJobTimings> {
+    report
+        .get("followDaemon")
+        .and_then(|value| value.get("job"))
+        .and_then(|job| job.get("timings"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<FollowJobTimings>(value).ok())
+}
+
+fn refresh_report_benchmark(report: &mut Value) {
+    let mode = report_benchmark_mode(report);
+    let timings = sanitize_execution_timings_for_mode(&parse_report_execution_timings(report), mode);
+    if let Some(execution) = report.get_mut("execution") {
+        execution["timings"] = serde_json::to_value(&timings).unwrap_or_else(|_| json!({}));
+    }
     let sent_items = report
         .get("execution")
         .and_then(|value| value.get("sent"))
@@ -602,8 +671,15 @@ fn refresh_report_benchmark(report: &mut Value) {
             })
         })
         .collect::<Vec<_>>();
+    let timing_groups = if mode == BenchmarkMode::Off {
+        Vec::new()
+    } else {
+        build_benchmark_timing_groups(&timings, parse_follow_job_timings(report).as_ref())
+    };
     report["benchmark"] = json!({
+        "mode": mode.as_str(),
         "timings": timings,
+        "timingGroups": timing_groups,
         "sent": sent,
     });
 }
@@ -759,6 +835,8 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
 ];
 const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "veryhigh";
 const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
+const FEE_MARKET_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const FEE_MARKET_MAX_AGE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Default, Clone)]
 struct FeeMarketSnapshot {
@@ -771,8 +849,6 @@ struct CachedFeeMarketSnapshot {
     snapshot: FeeMarketSnapshot,
     fetched_at: Instant,
 }
-
-const FEE_MARKET_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn fee_market_cache() -> &'static Mutex<HashMap<String, CachedFeeMarketSnapshot>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedFeeMarketSnapshot>>> = OnceLock::new();
@@ -794,7 +870,7 @@ fn get_cached_fee_market_snapshot(
         helius_priority_level,
         jito_tip_percentile,
     ))?;
-    if entry.fetched_at.elapsed() > FEE_MARKET_CACHE_TTL {
+    if entry.fetched_at.elapsed() > FEE_MARKET_MAX_AGE {
         return None;
     }
     Some(entry.snapshot.clone())
@@ -902,14 +978,9 @@ fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u
     }
 }
 
-async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
     let helius_priority_level = auto_fee_helius_priority_level();
     let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    if let Some(snapshot) =
-        get_cached_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile)
-    {
-        return Ok(snapshot);
-    }
     let client = shared_fee_market_http_client();
     let helius_options = if helius_priority_level == "recommended" {
         json!({
@@ -1029,6 +1100,26 @@ async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, S
         &snapshot,
     );
     Ok(snapshot)
+}
+
+async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    if let Some(snapshot) =
+        get_cached_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile)
+    {
+        return Ok(snapshot);
+    }
+    fetch_fee_market_snapshot_live(rpc_url).await
+}
+
+fn spawn_fee_market_snapshot_refresh_task(rpc_url: String) {
+    tokio::spawn(async move {
+        loop {
+            let _ = fetch_fee_market_snapshot_live(&rpc_url).await;
+            tokio::time::sleep(FEE_MARKET_REFRESH_INTERVAL).await;
+        }
+    });
 }
 
 async fn resolve_auto_execution_fees(
@@ -1342,6 +1433,142 @@ async fn compile_same_time_snipes(
         .map(|groups| groups.into_iter().flatten().collect())
 }
 
+async fn compile_presigned_follow_actions(
+    rpc_url: &str,
+    normalized: &NormalizedConfig,
+    mint: &str,
+    launch_creator: &str,
+    allow_ata_creation: bool,
+) -> Result<Vec<crate::follow::FollowActionRecord>, String> {
+    let mut actions = build_action_records(&normalized.followLaunch);
+    let mut predicted_dev_buy_tokens: Option<Option<u64>> = None;
+    let mut predicted_bonk_dev_buy_tokens: Option<Option<u64>> = None;
+    let bonk_pool_id = if normalized.launchpad == "bonk" {
+        Some(derive_bonk_canonical_pool_id(&normalized.quoteAsset, mint).await?)
+    } else {
+        None
+    };
+    for action in &mut actions {
+        let wallet_key = selected_wallet_key_or_default(&action.walletEnvKey)
+            .ok_or_else(|| format!("Wallet env key not found: {}", action.walletEnvKey))?;
+        let wallet_secret = load_solana_wallet_by_env_key(&wallet_key)?;
+        if let Some(pool_id) = bonk_pool_id.as_ref() {
+            action.poolId = Some(pool_id.clone());
+        }
+        match action.kind {
+            crate::follow::FollowActionKind::SniperBuy => {
+                let Some(buy_amount_sol) = action.buyAmountSol.as_deref() else {
+                    continue;
+                };
+                let mut tx = compile_atomic_follow_buy_for_launchpad(
+                    &normalized.launchpad,
+                    &normalized.mode,
+                    &normalized.quoteAsset,
+                    rpc_url,
+                    &normalized.execution,
+                    normalized.token.mayhemMode,
+                    &normalized.tx.jitoTipAccount,
+                    &wallet_secret,
+                    mint,
+                    launch_creator,
+                    buy_amount_sol,
+                    allow_ata_creation,
+                )
+                .await?;
+                tx.label = action.actionId.clone();
+                action.preSignedTransactions = vec![tx];
+            }
+            crate::follow::FollowActionKind::DevAutoSell
+                if normalized.launchpad == "pump"
+                    && action.walletEnvKey == normalized.selectedWalletKey =>
+            {
+                let predicted_tokens = match predicted_dev_buy_tokens {
+                    Some(value) => value,
+                    None => {
+                        let value = predict_dev_buy_token_amount(rpc_url, normalized).await?;
+                        predicted_dev_buy_tokens = Some(value);
+                        value
+                    }
+                };
+                let Some(predicted_tokens) = predicted_tokens else {
+                    continue;
+                };
+                let Some(sell_percent) = action.sellPercent else {
+                    continue;
+                };
+                let Some(mut tx) = crate::pump_native::compile_follow_sell_transaction_with_token_amount(
+                    rpc_url,
+                    &normalized.execution,
+                    normalized.token.mayhemMode,
+                    &normalized.tx.jitoTipAccount,
+                    &wallet_secret,
+                    mint,
+                    launch_creator,
+                    sell_percent,
+                    should_use_post_setup_creator_vault_for_sell(
+                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                        action,
+                    ),
+                    Some(predicted_tokens),
+                    Some(normalized.mode == "cashback"),
+                )
+                .await? else {
+                    continue;
+                };
+                tx.label = action.actionId.clone();
+                action.preSignedTransactions = vec![tx];
+            }
+            crate::follow::FollowActionKind::DevAutoSell
+                if normalized.launchpad == "bonk"
+                    && action.walletEnvKey == normalized.selectedWalletKey =>
+            {
+                let predicted_tokens = match predicted_bonk_dev_buy_tokens {
+                    Some(value) => value,
+                    None => {
+                        let value = predict_bonk_dev_buy_token_amount(rpc_url, normalized).await?;
+                        predicted_bonk_dev_buy_tokens = Some(value);
+                        value
+                    }
+                };
+                let Some(predicted_tokens) = predicted_tokens else {
+                    continue;
+                };
+                let Some(sell_percent) = action.sellPercent else {
+                    continue;
+                };
+                match crate::bonk_native::compile_follow_sell_transaction_with_token_amount(
+                    rpc_url,
+                    &normalized.quoteAsset,
+                    &normalized.execution,
+                    &normalized.tx.jitoTipAccount,
+                    &wallet_secret,
+                    mint,
+                    sell_percent,
+                    Some(predicted_tokens),
+                    bonk_pool_id.as_deref(),
+                    Some(&normalized.mode),
+                    Some(launch_creator),
+                )
+                .await
+                {
+                    Ok(Some(mut tx)) => {
+                        tx.label = action.actionId.clone();
+                        action.preSignedTransactions = vec![tx];
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        action.lastError = Some(format!(
+                            "Bonk dev-auto-sell pre-sign unavailable; daemon will compile live after launch: {error}"
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(actions)
+}
+
 async fn build_status_payload(
     state: &Arc<AppState>,
     requested_wallet: &str,
@@ -1449,6 +1676,9 @@ fn build_bootstrap_fast_payload(
         "providers": provider_availability_registry(),
         "providerRegistry": provider_registry(),
         "launchpads": launchpad_registry(),
+        "startupWarm": {
+            "enabled": configured_startup_warm_enabled(),
+        },
         "regionRouting": build_region_routing_payload(),
         "config": read_persistent_config(),
     }))
@@ -1548,8 +1778,10 @@ async fn execute_engine_action_payload(
     payload: EngineRequest,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let trace = new_trace_context();
-    let action_started_ms = trace.startedAtMs;
+    let action_started = Instant::now();
     let action = payload.action.unwrap_or_else(|| "unknown".to_string());
+    let benchmark_mode = configured_benchmark_mode();
+    let prepare_request_payload_ms = payload.prepare_request_payload_ms.map(u128::from);
     if action == "quote" {
         let form_value = payload.form.ok_or_else(|| {
             (
@@ -1583,7 +1815,7 @@ async fn execute_engine_action_payload(
             "elapsedMs": current_time_ms().saturating_sub(trace.startedAtMs),
         }));
     }
-    let form_prepare_started_ms = current_time_ms();
+    let form_prepare_started = Instant::now();
     let (raw_config_value, prepared_metadata_uri, form_to_raw_config_ms) =
         if let Some(raw_config_value) = payload.raw_config {
             (raw_config_value, None, None)
@@ -1613,7 +1845,7 @@ async fn execute_engine_action_payload(
             (
                 raw_config_value,
                 metadata_uri,
-                Some(current_time_ms().saturating_sub(form_prepare_started_ms)),
+                Some(form_prepare_started.elapsed().as_millis()),
             )
         } else {
             return Err((
@@ -1635,7 +1867,7 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let normalize_started_ms = current_time_ms();
+    let normalize_started = Instant::now();
     let mut normalized = normalize_raw_config(parsed).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1646,7 +1878,7 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let normalize_config_ms = current_time_ms().saturating_sub(normalize_started_ms);
+    let normalize_config_ms = normalize_started.elapsed().as_millis();
     log_event(
         "engine_action_received",
         &trace.traceId,
@@ -1672,7 +1904,7 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
-    let wallet_load_started_ms = current_time_ms();
+    let wallet_load_started = Instant::now();
     let wallet_secret = load_solana_wallet_by_env_key(&selected_wallet_key).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1693,7 +1925,7 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let wallet_load_ms = current_time_ms().saturating_sub(wallet_load_started_ms);
+    let wallet_load_ms = wallet_load_started.elapsed().as_millis();
     let preview_agent_authority = if normalized.mode == "regular" || normalized.mode == "cashback" {
         None
     } else if !normalized.agent.authority.trim().is_empty() {
@@ -1701,11 +1933,14 @@ async fn execute_engine_action_payload(
     } else {
         Some(creator_public_key.clone())
     };
+    let transport_plan_started = Instant::now();
     let transport_plan = build_transport_plan(
         &normalized.execution,
         estimate_transaction_count(&normalized),
     );
+    let transport_plan_build_ms = transport_plan_started.elapsed().as_millis();
     let rpc_url = configured_rpc_url();
+    let auto_fee_started = Instant::now();
     let auto_fee_notes = resolve_auto_execution_fees(
         &rpc_url,
         &mut normalized,
@@ -1722,6 +1957,8 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
+    let auto_fee_resolve_ms = auto_fee_started.elapsed().as_millis();
+    let same_time_guard_started = Instant::now();
     let same_time_fee_guard_warning = apply_same_time_creation_fee_guard(&mut normalized).map_err(
         |error| {
             (
@@ -1734,9 +1971,10 @@ async fn execute_engine_action_payload(
             )
         },
     )?;
+    let same_time_fee_guard_ms = same_time_guard_started.elapsed().as_millis();
     let should_persist_report = normalized.tx.writeReport || action == "send";
     if action == "build" {
-        let report_build_started_ms = current_time_ms();
+        let report_build_started = Instant::now();
         let report = build_report(
             &normalized,
             &transport_plan,
@@ -1748,7 +1986,7 @@ async fn execute_engine_action_payload(
             Some("Rust native build".to_string()),
             vec![],
         );
-        let report_build_ms = current_time_ms().saturating_sub(report_build_started_ms);
+        let report_build_ms = report_build_started.elapsed().as_millis();
         let mut report_value = serde_json::to_value(&report).map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1762,6 +2000,12 @@ async fn execute_engine_action_payload(
         if let Some(warning) = same_time_fee_guard_warning.as_deref() {
             append_execution_warning(&mut report_value, warning);
         }
+        set_report_benchmark_mode(&mut report_value, benchmark_mode);
+        set_optional_report_timing(
+            &mut report_value,
+            "prepareRequestPayloadMs",
+            prepare_request_payload_ms,
+        );
         for note in &auto_fee_notes {
             append_execution_note(&mut report_value, note);
         }
@@ -1770,9 +2014,20 @@ async fn execute_engine_action_payload(
         }
         set_report_timing(&mut report_value, "normalizeConfigMs", normalize_config_ms);
         set_report_timing(&mut report_value, "walletLoadMs", wallet_load_ms);
+        set_report_timing(
+            &mut report_value,
+            "transportPlanBuildMs",
+            transport_plan_build_ms,
+        );
+        set_report_timing(&mut report_value, "autoFeeResolveMs", auto_fee_resolve_ms);
+        set_report_timing(
+            &mut report_value,
+            "sameTimeFeeGuardMs",
+            same_time_fee_guard_ms,
+        );
         set_report_timing(&mut report_value, "reportBuildMs", report_build_ms);
         let send_log_path = if should_persist_report {
-            let persist_started_ms = current_time_ms();
+            let persist_started = Instant::now();
             let path =
                 persist_launch_report(&trace.traceId, &action, &transport_plan, &report_value)
                     .map_err(|error| {
@@ -1788,20 +2043,25 @@ async fn execute_engine_action_payload(
             set_report_timing(
                 &mut report_value,
                 "persistReportMs",
-                current_time_ms().saturating_sub(persist_started_ms),
+                persist_started.elapsed().as_millis(),
+            );
+            set_report_timing(
+                &mut report_value,
+                "persistInitialSnapshotMs",
+                persist_started.elapsed().as_millis(),
             );
             report_value["outPath"] = Value::String(path.clone());
             Some(path)
         } else {
             None
         };
-        set_report_timing(
-            &mut report_value,
-            "totalElapsedMs",
-            current_time_ms().saturating_sub(action_started_ms),
-        );
+        let backend_elapsed_ms = action_started.elapsed().as_millis();
+        set_report_timing(&mut report_value, "executionTotalMs", backend_elapsed_ms);
+        set_report_timing(&mut report_value, "backendTotalElapsedMs", backend_elapsed_ms);
+        set_report_timing(&mut report_value, "totalElapsedMs", backend_elapsed_ms);
         refresh_report_benchmark(&mut report_value);
         if let Some(path) = send_log_path.as_ref() {
+            let finalize_started = Instant::now();
             update_persisted_launch_report(
                 path,
                 &trace.traceId,
@@ -1819,6 +2079,11 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?;
+            set_report_timing(
+                &mut report_value,
+                "persistFinalReportUpdateMs",
+                finalize_started.elapsed().as_millis(),
+            );
         }
         log_event(
             "engine_action_completed",
@@ -1914,6 +2179,8 @@ async fn execute_engine_action_payload(
     })?;
     let (
         mut compiled_transactions,
+        creation_transactions,
+        deferred_setup_transactions,
         mut report_value,
         text_value,
         assembly_executor,
@@ -1922,6 +2189,8 @@ async fn execute_engine_action_payload(
         compiled_launch_creator,
     ) = (
         native.compiled_transactions,
+        native.creation_transactions,
+        native.deferred_setup_transactions,
         native.report,
         Value::String(native.text),
         "rust-native".to_string(),
@@ -1939,6 +2208,11 @@ async fn execute_engine_action_payload(
         &mut report_value,
         "compileTransactionsMs",
         compile_transactions_ms,
+    );
+    set_report_timing(
+        &mut report_value,
+        "compileLaunchCreatorPrepMs",
+        compile_breakdown.launch_creator_prep_ms,
     );
     set_report_timing(
         &mut report_value,
@@ -1965,6 +2239,21 @@ async fn execute_engine_action_payload(
         "compileTxSerializeMs",
         compile_breakdown.tx_serialize_ms,
     );
+    set_optional_report_timing(
+        &mut report_value,
+        "compileLaunchSerializeMs",
+        compile_breakdown.launch_serialize_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "compileFollowUpSerializeMs",
+        compile_breakdown.follow_up_serialize_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "compileTipSerializeMs",
+        compile_breakdown.tip_serialize_ms,
+    );
 
     if action == "simulate" {
         let simulate_started_ms = current_time_ms();
@@ -1985,15 +2274,25 @@ async fn execute_engine_action_payload(
             )
         })?;
         let mut report = report_value;
+        set_report_benchmark_mode(&mut report, benchmark_mode);
+        set_optional_report_timing(&mut report, "prepareRequestPayloadMs", prepare_request_payload_ms);
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
         }
         set_report_timing(&mut report, "normalizeConfigMs", normalize_config_ms);
         set_report_timing(&mut report, "walletLoadMs", wallet_load_ms);
+        set_report_timing(&mut report, "transportPlanBuildMs", transport_plan_build_ms);
+        set_report_timing(&mut report, "autoFeeResolveMs", auto_fee_resolve_ms);
+        set_report_timing(&mut report, "sameTimeFeeGuardMs", same_time_fee_guard_ms);
         set_report_timing(
             &mut report,
             "compileTransactionsMs",
             compile_transactions_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "compileLaunchCreatorPrepMs",
+            compile_breakdown.launch_creator_prep_ms,
         );
         set_report_timing(
             &mut report,
@@ -2020,6 +2319,21 @@ async fn execute_engine_action_payload(
             "compileTxSerializeMs",
             compile_breakdown.tx_serialize_ms,
         );
+        set_optional_report_timing(
+            &mut report,
+            "compileLaunchSerializeMs",
+            compile_breakdown.launch_serialize_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileFollowUpSerializeMs",
+            compile_breakdown.follow_up_serialize_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileTipSerializeMs",
+            compile_breakdown.tip_serialize_ms,
+        );
         set_report_timing(
             &mut report,
             "simulateMs",
@@ -2037,7 +2351,7 @@ async fn execute_engine_action_payload(
             execution["warnings"] = Value::Array(existing_warnings);
         }
         let send_log_path = if should_persist_report {
-            let persist_started_ms = current_time_ms();
+            let persist_started = Instant::now();
             let path = persist_launch_report(&trace.traceId, &action, &transport_plan, &report)
                 .map_err(|error| {
                     (
@@ -2052,20 +2366,25 @@ async fn execute_engine_action_payload(
             set_report_timing(
                 &mut report,
                 "persistReportMs",
-                current_time_ms().saturating_sub(persist_started_ms),
+                persist_started.elapsed().as_millis(),
+            );
+            set_report_timing(
+                &mut report,
+                "persistInitialSnapshotMs",
+                persist_started.elapsed().as_millis(),
             );
             report["outPath"] = Value::String(path.clone());
             Some(path)
         } else {
             None
         };
-        set_report_timing(
-            &mut report,
-            "totalElapsedMs",
-            current_time_ms().saturating_sub(action_started_ms),
-        );
+        let backend_elapsed_ms = action_started.elapsed().as_millis();
+        set_report_timing(&mut report, "executionTotalMs", backend_elapsed_ms);
+        set_report_timing(&mut report, "backendTotalElapsedMs", backend_elapsed_ms);
+        set_report_timing(&mut report, "totalElapsedMs", backend_elapsed_ms);
         refresh_report_benchmark(&mut report);
         if let Some(path) = send_log_path.as_ref() {
+            let finalize_started = Instant::now();
             update_persisted_launch_report(
                 path,
                 &trace.traceId,
@@ -2083,6 +2402,11 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?;
+            set_report_timing(
+                &mut report,
+                "persistFinalReportUpdateMs",
+                finalize_started.elapsed().as_millis(),
+            );
         }
         log_event(
             "engine_action_completed",
@@ -2117,8 +2441,12 @@ async fn execute_engine_action_payload(
 
     if action == "send" {
         let execution_class = transport_plan.executionClass.clone();
-        let (same_time_snipes, deferred_follow_launch) =
-            split_same_time_snipes(&normalized.followLaunch);
+        let use_phased_follow_pipeline = matches!(normalized.launchpad.as_str(), "pump" | "bonk");
+        let (same_time_snipes, deferred_follow_launch) = if use_phased_follow_pipeline {
+            (vec![], normalized.followLaunch.clone())
+        } else {
+            split_same_time_snipes(&normalized.followLaunch)
+        };
         let same_time_retry_enabled = same_time_snipes.iter().any(|snipe| snipe.retryOnFailure);
         let follow_daemon_transport = configured_follow_daemon_transport().map_err(|error| {
             (
@@ -2153,65 +2481,71 @@ async fn execute_engine_action_payload(
         let mut bags_setup_warnings: Vec<String> = Vec::new();
         let mut bags_setup_submit_ms = 0u128;
         let mut bags_setup_confirm_ms = 0u128;
-        if let Some(client) = follow_daemon_client.as_ref() {
-            let ready = client
-                .ready(&FollowReadyRequest {
-                    followLaunch: deferred_follow_launch.clone(),
-                    quoteAsset: normalized.quoteAsset.clone(),
-                    execution: normalized.execution.clone(),
-                    watchEndpoint: transport_plan.watchEndpoint.clone(),
-                })
+        let mut follow_reserve_ms = 0u128;
+        let mut follow_arm_ms = 0u128;
+        let prebuilt_follow_actions = if use_phased_follow_pipeline && deferred_follow_launch.enabled
+        {
+            Some(
+                compile_presigned_follow_actions(
+                    &rpc_url,
+                    &normalized,
+                    &compiled_mint,
+                    &compiled_launch_creator,
+                    true,
+                )
                 .await
                 .map_err(|error| {
                     (
                         StatusCode::BAD_REQUEST,
                         Json(json!({
                             "ok": false,
-                            "error": format!("Follow daemon readiness check failed: {error}"),
+                            "error": format!("Pre-signing follow actions failed: {error}"),
                             "traceId": trace.traceId,
                         })),
                     )
-                })?;
-            if !ready.ready {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": ready.reason.clone().unwrap_or_else(|| "Follow daemon is not ready.".to_string()),
-                        "traceId": trace.traceId,
-                        "followDaemon": ready,
-                    })),
-                ));
-            }
-            reserved_follow_job = Some(
-                client
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut reserve_follow_job_task = if let Some(client) = follow_daemon_client.as_ref() {
+            let client = client.clone();
+            let trace_id = trace.traceId.clone();
+            let launchpad = normalized.launchpad.clone();
+            let quote_asset = normalized.quoteAsset.clone();
+            let launch_mode = normalized.mode.clone();
+            let selected_wallet_key = normalized.selectedWalletKey.clone();
+            let follow_launch = deferred_follow_launch.clone();
+            let execution = normalized.execution.clone();
+            let token_mayhem_mode = normalized.token.mayhemMode;
+            let jito_tip_account = normalized.tx.jitoTipAccount.clone();
+            let prefer_post_setup_creator_vault_for_sell =
+                matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked");
+            let prebuilt_actions = prebuilt_follow_actions.clone().unwrap_or_default();
+            let deferred_setup_transactions = deferred_setup_transactions.clone();
+            Some(tokio::spawn(async move {
+                let follow_reserve_started = Instant::now();
+                let reserved = client
                     .reserve(&FollowReserveRequest {
-                        traceId: trace.traceId.clone(),
-                        launchpad: normalized.launchpad.clone(),
-                        quoteAsset: normalized.quoteAsset.clone(),
-                        selectedWalletKey: normalized.selectedWalletKey.clone(),
-                        followLaunch: deferred_follow_launch.clone(),
-                        execution: normalized.execution.clone(),
-                        tokenMayhemMode: normalized.token.mayhemMode,
-                        jitoTipAccount: normalized.tx.jitoTipAccount.clone(),
-                        preferPostSetupCreatorVaultForSell: matches!(
-                            normalized.mode.as_str(),
-                            "agent-custom" | "agent-locked"
-                        ),
+                        traceId: trace_id,
+                        launchpad,
+                        quoteAsset: quote_asset,
+                        launchMode: launch_mode,
+                        selectedWalletKey: selected_wallet_key,
+                        followLaunch: follow_launch,
+                        execution,
+                        tokenMayhemMode: token_mayhem_mode,
+                        jitoTipAccount: jito_tip_account,
+                        preferPostSetupCreatorVaultForSell: prefer_post_setup_creator_vault_for_sell,
+                        prebuiltActions: prebuilt_actions,
+                        deferredSetupTransactions: deferred_setup_transactions,
                     })
-                    .await
-                    .map_err(|error| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "ok": false,
-                                "error": format!("Follow daemon reservation failed: {error}"),
-                                "traceId": trace.traceId,
-                            })),
-                        )
-                    })?,
-            );
-        }
+                    .await?;
+                Ok::<_, String>((reserved, follow_reserve_started.elapsed().as_millis()))
+            }))
+        } else {
+            None
+        };
         if let Some(prepared) = prepared_bags_send.as_ref() {
             for bundle in &prepared.setup_bundles {
                 let (mut bundle_sent, bundle_warnings, bundle_timing) = send_transactions_bundle(
@@ -2238,53 +2572,60 @@ async fn execute_engine_action_payload(
                 bags_setup_sent.append(&mut bundle_sent);
             }
             if !prepared.setup_transactions.is_empty() {
-                let (mut setup_sent, setup_warnings, setup_submit_ms) =
-                    submit_transactions_sequential(
-                        &rpc_url,
-                        &prepared.setup_transactions,
-                        &normalized.execution.commitment,
-                        normalized.execution.skipPreflight,
-                        normalized.execution.trackSendBlockHeight,
-                    )
-                    .await
-                    .map_err(|error| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "ok": false,
-                                "error": format!("Bags setup transaction send failed: {error}"),
-                                "traceId": trace.traceId,
-                            })),
+                for setup_transaction in &prepared.setup_transactions {
+                    let setup_batch = vec![setup_transaction.clone()];
+                    let (mut setup_sent, setup_warnings, setup_submit_ms) =
+                        submit_transactions_sequential(
+                            &rpc_url,
+                            &setup_batch,
+                            &normalized.execution.commitment,
+                            normalized.execution.skipPreflight,
+                            normalized.execution.trackSendBlockHeight,
                         )
-                    })?;
-                let (setup_confirm_warnings, setup_confirm_ms) = confirm_transactions_with_websocket_fallback(
-                    &rpc_url,
-                    transport_plan
-                        .watchEndpoint
-                        .as_deref()
-                        .or_else(|| transport_plan.watchEndpoints.first().map(String::as_str)),
-                    &mut setup_sent,
-                    &normalized.execution.commitment,
-                    normalized.execution.trackSendBlockHeight,
-                    225,
-                    400,
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Bags setup transaction confirmation failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
-                bags_setup_submit_ms += setup_submit_ms;
-                bags_setup_confirm_ms += setup_confirm_ms;
-                bags_setup_warnings.extend(setup_warnings);
-                bags_setup_warnings.extend(setup_confirm_warnings);
-                bags_setup_sent.append(&mut setup_sent);
+                        .await
+                        .map_err(|error| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "error": format!("Bags setup transaction send failed for {}: {error}", setup_transaction.label),
+                                    "traceId": trace.traceId,
+                                })),
+                            )
+                        })?;
+                    let (setup_confirm_warnings, setup_confirm_ms) =
+                        confirm_transactions_with_websocket_fallback(
+                            &rpc_url,
+                            transport_plan
+                                .watchEndpoint
+                                .as_deref()
+                                .or_else(|| transport_plan.watchEndpoints.first().map(String::as_str)),
+                            &mut setup_sent,
+                            &normalized.execution.commitment,
+                            normalized.execution.trackSendBlockHeight,
+                            225,
+                            400,
+                        )
+                        .await
+                        .map_err(|error| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "error": format!(
+                                        "Bags setup transaction confirmation failed for {}: {error}",
+                                        setup_transaction.label
+                                    ),
+                                    "traceId": trace.traceId,
+                                })),
+                            )
+                        })?;
+                    bags_setup_submit_ms += setup_submit_ms;
+                    bags_setup_confirm_ms += setup_confirm_ms;
+                    bags_setup_warnings.extend(setup_warnings);
+                    bags_setup_warnings.extend(setup_confirm_warnings);
+                    bags_setup_sent.append(&mut setup_sent);
+                }
             }
             let launch_compiled = compile_bags_launch_transaction(
                 &rpc_url,
@@ -2348,6 +2689,9 @@ async fn execute_engine_action_payload(
             } else {
                 same_time_independent_compiled = same_time_compiled;
             }
+        }
+        if use_phased_follow_pipeline {
+            compiled_transactions = creation_transactions.clone();
         }
         let submit_started_ms = current_time_ms();
         let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
@@ -2572,15 +2916,25 @@ async fn execute_engine_action_payload(
             }
         }
         let mut report = report_value;
+        set_report_benchmark_mode(&mut report, benchmark_mode);
+        set_optional_report_timing(&mut report, "prepareRequestPayloadMs", prepare_request_payload_ms);
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
         }
         set_report_timing(&mut report, "normalizeConfigMs", normalize_config_ms);
         set_report_timing(&mut report, "walletLoadMs", wallet_load_ms);
+        set_report_timing(&mut report, "transportPlanBuildMs", transport_plan_build_ms);
+        set_report_timing(&mut report, "autoFeeResolveMs", auto_fee_resolve_ms);
+        set_report_timing(&mut report, "sameTimeFeeGuardMs", same_time_fee_guard_ms);
         set_report_timing(
             &mut report,
             "compileTransactionsMs",
             compile_transactions_ms.saturating_add(same_time_sniper_compile_ms),
+        );
+        set_report_timing(
+            &mut report,
+            "compileLaunchCreatorPrepMs",
+            compile_breakdown.launch_creator_prep_ms,
         );
         set_report_timing(
             &mut report,
@@ -2607,6 +2961,21 @@ async fn execute_engine_action_payload(
             "compileTxSerializeMs",
             compile_breakdown.tx_serialize_ms,
         );
+        set_optional_report_timing(
+            &mut report,
+            "compileLaunchSerializeMs",
+            compile_breakdown.launch_serialize_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileFollowUpSerializeMs",
+            compile_breakdown.follow_up_serialize_ms,
+        );
+        set_optional_report_timing(
+            &mut report,
+            "compileTipSerializeMs",
+            compile_breakdown.tip_serialize_ms,
+        );
         set_report_timing(
             &mut report,
             "sendMs",
@@ -2619,7 +2988,33 @@ async fn execute_engine_action_payload(
             "sendSubmitMs",
             bags_setup_submit_ms.saturating_add(submit_ms),
         );
+        set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
         set_report_timing(&mut report, "sendConfirmMs", bags_setup_confirm_ms);
+        set_report_timing(&mut report, "sendTransportConfirmMs", 0);
+        if let Some(task) = reserve_follow_job_task.take() {
+            let (reserved, elapsed_ms) = task.await.map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Follow daemon reservation task failed: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?.map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Follow daemon reservation failed: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+            follow_reserve_ms = elapsed_ms;
+            reserved_follow_job = Some(reserved);
+        }
+        set_optional_report_timing(&mut report, "followDaemonReserveMs", Some(follow_reserve_ms));
         if bags_setup_submit_ms > 0 || bags_setup_confirm_ms > 0 {
             set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
             set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_confirm_ms);
@@ -2637,14 +3032,19 @@ async fn execute_engine_action_payload(
             Some(&normalized.followLaunch),
         );
         let send_log_path = if should_persist_report {
-            let persist_started_ms = current_time_ms();
+            let persist_started = Instant::now();
             match persist_launch_report(&trace.traceId, &action, &transport_plan, &report) {
                 Ok(path) => {
                     report_persisted = true;
                     set_report_timing(
                         &mut report,
                         "persistReportMs",
-                        current_time_ms().saturating_sub(persist_started_ms),
+                        persist_started.elapsed().as_millis(),
+                    );
+                    set_report_timing(
+                        &mut report,
+                        "persistInitialSnapshotMs",
+                        persist_started.elapsed().as_millis(),
                     );
                     report["outPath"] = Value::String(path.clone());
                     Some(path)
@@ -2661,44 +3061,6 @@ async fn execute_engine_action_payload(
         } else {
             None
         };
-        if let Some(client) = follow_daemon_client.as_ref() {
-            match client
-                .arm(&FollowArmRequest {
-                    traceId: trace.traceId.clone(),
-                    mint: compiled_mint.clone(),
-                    launchCreator: compiled_launch_creator.clone(),
-                    launchSignature: launch_signature.clone(),
-                    submitAtMs: current_time_ms(),
-                    sendObservedBlockHeight: launch_sent
-                        .first()
-                        .and_then(|result| result.sendObservedBlockHeight),
-                    confirmedObservedBlockHeight: launch_sent
-                        .first()
-                        .and_then(|result| result.confirmedObservedBlockHeight),
-                    reportPath: send_log_path.clone(),
-                    transportPlan: transport_plan.clone(),
-                })
-                .await
-            {
-                Ok(response) => {
-                    armed_follow_job = Some(response);
-                }
-                Err(error) => {
-                    let warning =
-                        format!("Launch submitted, but follow daemon arm failed: {error}");
-                    post_send_warnings.push(warning.clone());
-                    send_phase_errors.push(warning);
-                }
-            }
-            attach_follow_daemon_report(
-                &mut report,
-                Some(follow_daemon_transport.as_str()),
-                reserved_follow_job.as_ref(),
-                armed_follow_job.as_ref(),
-                None,
-                Some(&normalized.followLaunch),
-            );
-        }
         let (mut confirm_warnings, mut confirm_ms) =
             match confirm_submitted_transactions_for_transport(
                 &rpc_url,
@@ -2731,6 +3093,56 @@ async fn execute_engine_action_payload(
                     (vec![warning], 0)
                 }
             };
+        if launch_confirmed {
+            if let Some(client) = follow_daemon_client.as_ref() {
+                let mut confirmed_follow_block_height = launch_sent
+                    .first()
+                    .and_then(|result| result.confirmedObservedBlockHeight);
+                if confirmed_follow_block_height.is_none() {
+                    confirmed_follow_block_height =
+                        fetch_current_block_height(&rpc_url, "confirmed").await.ok();
+                }
+                let follow_arm_started = Instant::now();
+                match client
+                    .arm(&FollowArmRequest {
+                        traceId: trace.traceId.clone(),
+                        mint: compiled_mint.clone(),
+                        launchCreator: compiled_launch_creator.clone(),
+                        launchSignature: launch_signature.clone(),
+                        submitAtMs: current_time_ms(),
+                        sendObservedBlockHeight: launch_sent
+                            .first()
+                            .and_then(|result| result.sendObservedBlockHeight),
+                        confirmedObservedBlockHeight: confirmed_follow_block_height,
+                        reportPath: send_log_path.clone(),
+                        transportPlan: transport_plan.clone(),
+                    })
+                    .await
+                {
+                    Ok(response) => {
+                        follow_arm_ms = follow_arm_started.elapsed().as_millis();
+                        armed_follow_job = Some(response);
+                    }
+                    Err(error) => {
+                        follow_arm_ms = follow_arm_started.elapsed().as_millis();
+                        let warning =
+                            format!("Launch confirmed, but follow daemon arm failed: {error}");
+                        post_send_warnings.push(warning.clone());
+                        send_phase_errors.push(warning);
+                    }
+                }
+            }
+        }
+        if let Some(_client) = follow_daemon_client.as_ref() {
+            attach_follow_daemon_report(
+                &mut report,
+                Some(follow_daemon_transport.as_str()),
+                reserved_follow_job.as_ref(),
+                armed_follow_job.as_ref(),
+                None,
+                Some(&normalized.followLaunch),
+            );
+        }
         if !same_time_sent.is_empty() {
             match confirm_submitted_transactions_for_transport(
                 &rpc_url,
@@ -2769,23 +3181,6 @@ async fn execute_engine_action_payload(
                 }
             }
         }
-        let latest_follow_job_status = if let Some(client) = follow_daemon_client.as_ref() {
-            if reserved_follow_job.is_some() || armed_follow_job.is_some() {
-                match client.status(&trace.traceId).await {
-                    Ok(response) => Some(response),
-                    Err(error) => {
-                        post_send_warnings.push(format!(
-                            "Follow daemon final status refresh failed: {error}"
-                        ));
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let mut sent = bags_setup_sent;
         sent.append(&mut launch_sent);
         sent.append(&mut same_time_sent);
@@ -2804,13 +3199,40 @@ async fn execute_engine_action_payload(
             "sendSubmitMs",
             bags_setup_submit_ms.saturating_add(submit_ms),
         );
+        set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
         set_report_timing(
             &mut report,
             "sendConfirmMs",
             bags_setup_confirm_ms.saturating_add(confirm_ms),
         );
+        set_report_timing(&mut report, "sendTransportConfirmMs", confirm_ms);
+        set_report_timing(&mut report, "sendCreationSubmitMs", submit_ms);
+        set_report_timing(&mut report, "sendCreationConfirmMs", confirm_ms);
+        if use_phased_follow_pipeline {
+            append_execution_note(
+                &mut report,
+                "Pump/Bonk phased send path reserved pre-signed follow actions in the daemon and moved setup into deferred post-confirm execution.",
+            );
+            if !deferred_setup_transactions.is_empty() {
+                append_execution_note(
+                    &mut report,
+                    &format!(
+                        "Deferred post-confirm setup prepared {} transaction(s) for daemon-managed submission.",
+                        deferred_setup_transactions.len()
+                    ),
+                );
+            }
+        }
+        set_optional_report_timing(&mut report, "followDaemonReserveMs", Some(follow_reserve_ms));
+        set_optional_report_timing(&mut report, "followDaemonArmMs", Some(follow_arm_ms));
         if let Some(execution) = report.get_mut("execution") {
-            execution["sent"] = serde_json::to_value(sent).unwrap_or(Value::Array(vec![]));
+            execution["sent"] = serde_json::to_value(&sent).unwrap_or(Value::Array(vec![]));
+            if let Some(actual_responder) = sent
+                .iter()
+                .find_map(|entry| entry.endpoint.as_ref().filter(|value| !value.is_empty()).cloned())
+            {
+                execution["heliusSenderEndpoint"] = Value::String(actual_responder);
+            }
             let mut existing_warnings = execution
                 .get("warnings")
                 .and_then(Value::as_array)
@@ -2820,11 +3242,10 @@ async fn execute_engine_action_payload(
             existing_warnings.extend(post_send_warnings.iter().cloned().map(Value::String));
             execution["warnings"] = Value::Array(existing_warnings);
         }
-        set_report_timing(
-            &mut report,
-            "totalElapsedMs",
-            current_time_ms().saturating_sub(action_started_ms),
-        );
+        let backend_elapsed_ms = action_started.elapsed().as_millis();
+        set_report_timing(&mut report, "executionTotalMs", backend_elapsed_ms);
+        set_report_timing(&mut report, "backendTotalElapsedMs", backend_elapsed_ms);
+        set_report_timing(&mut report, "totalElapsedMs", backend_elapsed_ms);
         attach_follow_daemon_report(
             &mut report,
             if deferred_follow_launch.enabled {
@@ -2834,11 +3255,12 @@ async fn execute_engine_action_payload(
             },
             reserved_follow_job.as_ref(),
             armed_follow_job.as_ref(),
-            latest_follow_job_status.as_ref(),
+            None,
             Some(&normalized.followLaunch),
         );
         refresh_report_benchmark(&mut report);
         if let Some(path) = send_log_path.as_ref() {
+            let finalize_started = Instant::now();
             match update_persisted_launch_report(
                 path,
                 &trace.traceId,
@@ -2848,6 +3270,11 @@ async fn execute_engine_action_payload(
             ) {
                 Ok(()) => {
                     report_finalized = true;
+                    set_report_timing(
+                        &mut report,
+                        "persistFinalReportUpdateMs",
+                        finalize_started.elapsed().as_millis(),
+                    );
                 }
                 Err(error) => {
                     let warning = format!(
@@ -3539,6 +3966,96 @@ async fn api_pump_global_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)
     })))
 }
 
+async fn api_startup_warm() -> Json<Value> {
+    let started_at_ms = current_time_ms();
+    if !configured_startup_warm_enabled() {
+        return Json(attach_timing(
+            json!({
+                "ok": true,
+                "skipped": true,
+                "startupWarm": {
+                    "enabled": false,
+                    "reason": "disabled-by-env",
+                },
+            }),
+            started_at_ms,
+        ));
+    }
+    let main_rpc_url = configured_rpc_url();
+    let rpc_url = configured_warm_rpc_url(&main_rpc_url);
+    let helius_sender_endpoints =
+        configured_helius_sender_endpoints_for_profile(&default_endpoint_profile_for_provider(
+            "helius-sender",
+        ));
+    let (lookup_tables, pump_global, bonk_state, fee_market, sender_prewarm) = tokio::join!(
+        warm_default_lookup_tables(&rpc_url),
+        warm_pump_global_state(&rpc_url),
+        warm_bonk_state(&rpc_url),
+        fetch_fee_market_snapshot(&main_rpc_url),
+        async {
+            join_all(
+                helius_sender_endpoints
+                    .iter()
+                    .map(|endpoint| async move { (endpoint.clone(), prewarm_rpc_endpoint(endpoint).await) }),
+            )
+            .await
+        },
+    );
+    Json(attach_timing(
+        json!({
+            "ok": true,
+            "lookupTables": match lookup_tables {
+                Ok(loaded) => json!({
+                    "ok": true,
+                    "loaded": loaded,
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error,
+                }),
+            },
+            "pumpGlobal": match pump_global {
+                Ok(()) => json!({
+                    "ok": true,
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error,
+                }),
+            },
+            "bonkState": match bonk_state {
+                Ok(payload) => payload,
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error,
+                }),
+            },
+            "feeMarket": match fee_market {
+                Ok(snapshot) => json!({
+                    "ok": true,
+                    "heliusPriorityLamports": snapshot.helius_priority_lamports,
+                    "jitoTipP99Lamports": snapshot.jito_tip_p99_lamports,
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "error": error,
+                }),
+            },
+            "heliusSender": sender_prewarm
+                .into_iter()
+                .map(|(endpoint, result)| {
+                    json!({
+                        "endpoint": endpoint,
+                        "ok": result.is_ok(),
+                        "error": result.err(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+        started_at_ms,
+    ))
+}
+
 async fn api_wallet_status(
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -3740,6 +4257,7 @@ async fn api_run(
             action: Some(action.clone()),
             form: payload.form,
             raw_config: None,
+            prepare_request_payload_ms: payload.prepare_request_payload_ms,
         },
     )
     .await?;
@@ -3773,7 +4291,10 @@ async fn api_run(
             set_report_timing(report, "clientPreRequestMs", pre_request_ms);
         }
         refresh_report_benchmark(report);
+        let render_started = Instant::now();
         rendered_text = Some(render_report_value(report));
+        set_report_timing(report, "reportRenderMs", render_started.elapsed().as_millis());
+        refresh_report_benchmark(report);
         persisted_report_snapshot = Some(report.clone());
     }
     if let Some(text) = rendered_text {
@@ -4376,6 +4897,7 @@ async fn main() {
         auth_token: configured_auth_token(),
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
     });
+    spawn_fee_market_snapshot_refresh_task(rpc_url.clone());
     spawn_blockhash_refresh_task(rpc_url.clone(), "processed");
     spawn_blockhash_refresh_task(rpc_url.clone(), "confirmed");
     spawn_blockhash_refresh_task(rpc_url, "finalized");
@@ -4392,6 +4914,7 @@ async fn main() {
         )
         .route("/api/bootstrap-fast", get(api_bootstrap_fast))
         .route("/api/bootstrap", get(api_bootstrap))
+        .route("/api/startup-warm", post(api_startup_warm))
         .route("/api/lookup-tables/warm", post(api_lookup_tables_warm))
         .route("/api/pump-global/warm", post(api_pump_global_warm))
         .route("/api/wallet-status", get(api_wallet_status))

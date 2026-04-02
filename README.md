@@ -10,7 +10,7 @@ LaunchDeck is a self-hosted Solana launch and snipe tool built under the broader
 > ### Contract Address
 > `L73w5odyo5ZdJ1fPp319nfjqaFfHDdKifRmM8Kxpump`
 
-Instead of paying fees to third-party launch platforms, LaunchDeck lets you run the launcher locally, use your own wallets and provider keys, and customize how launches are built, simulated, and sent. The basic version can be run with a free-tier Helius key, so getting started does not require paid infrastructure.
+Instead of paying fees to third-party launch platforms, LaunchDeck lets you run the launcher locally, use your own wallets and provider keys, and customize how launches are built, simulated, and sent. You can get started with free infrastructure, but for serious use we strongly recommend a Helius dev-tier setup because it delivers a major improvement in realtime watcher quality, execution reliability, and overall performance.
 
 This repo is under active development. The README reflects the features we consider usable today.
 
@@ -23,9 +23,16 @@ For most operators today, the best-supported and fastest setup is:
 - [Helius](https://www.helius.dev/) for the full infrastructure stack
 - `Helius` for `SOLANA_RPC_URL`
 - `Helius` for `SOLANA_WS_URL`
+- a separate [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - `Helius Sender` as the creation, buy, and sell provider
 
-If you have a Helius dev-tier plan and your websocket endpoint supports it, also enable:
+Why this is the current recommended stack:
+
+- `LAUNCHDECK_WARM_RPC_URL` offloads startup warmup and block-height observation away from your main execution RPC
+- Shyft is a good fit for that warm path because you can use a free API key there
+- Helius dev tier gives a very noticeable improvement in watcher performance and live execution quality versus a bare-minimum free setup
+
+If you have Helius dev tier and your websocket endpoint supports it, also enable:
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
@@ -122,7 +129,7 @@ LaunchDeck uses:
 - Rust for the engine and daemon
 - Node.js for runtime helpers and launchpad helper scripts
 
-Install the repo dependencies, then create a local env file from `.env.example`.
+Install the repo dependencies, then copy `.env.example` to `.env` and fill in the quick-start values. If you want the full variable list, use `.env.advanced` as the reference.
 
 ### 2. Configure The Minimum Required Env Vars
 
@@ -130,6 +137,7 @@ Most operators only need to set:
 
 - `SOLANA_RPC_URL`
 - `SOLANA_WS_URL`
+- `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height observation off your main RPC
 - `SOLANA_PRIVATE_KEY` or `SOLANA_PRIVATE_KEY*`
 - `USER_REGION` for region-aware providers; this is usually better than pinning one specific sender or bundle endpoint because LaunchDeck can fan out across the endpoints in that region
 
@@ -139,6 +147,15 @@ Optional but common:
 - `PINATA_JWT`
 - `BAGS_API_KEY`
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced `transactionSubscribe` watcher path
+
+Recommended practical setup:
+
+- use a Helius mainnet RPC URL for `SOLANA_RPC_URL`
+- use the matching Helius websocket URL for `SOLANA_WS_URL`
+- use a Shyft RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
+- use `Helius Sender` as the provider in LaunchDeck
+
+That combination is currently the strongest default operator path in LaunchDeck. The app can run without paid infra, but Helius dev tier is highly recommended if you care about maximum speed, better watcher behavior, and better execution consistency.
 
 Full configuration reference: `docs/CONFIG.md`
 

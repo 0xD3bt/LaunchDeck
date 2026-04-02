@@ -2,7 +2,7 @@
 
 This page explains the configuration surface that operators interact with most often: environment variables, persisted UI settings, provider defaults, metadata upload behavior, and the rules the engine enforces regardless of what the UI stores.
 
-`.env.example` is the best starting point for setup. This document explains what the settings actually do.
+`.env.example` is the short easy-start template. `.env.advanced` contains the full variable list. This document explains what the settings actually do.
 
 ## Recommended Minimum Setup
 
@@ -10,6 +10,7 @@ Most operators can get started with just these values:
 
 - `SOLANA_RPC_URL`
 - `SOLANA_WS_URL`
+- `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height observation off your main RPC
 - `SOLANA_PRIVATE_KEY` or additional `SOLANA_PRIVATE_KEY*`
 - `USER_REGION` if you want a default regional provider preference
 
@@ -19,6 +20,16 @@ Optional but common:
 - `PINATA_JWT`
 - `BAGS_API_KEY`
 
+Current recommended operator stack:
+
+- use Helius for `SOLANA_RPC_URL`
+- use the matching Helius websocket for `SOLANA_WS_URL`
+- use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
+- use `helius-sender` as the creation, buy, and sell provider
+- if you have Helius dev tier and websocket support for it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+
+LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recommended if you want materially better watcher behavior, lower-latency execution, and a better overall operator experience.
+
 ## Environment Variable Categories
 
 ### Core Solana Connectivity
@@ -27,6 +38,8 @@ Optional but common:
   Main RPC used for reads, confirmations, and general runtime behavior.
 - `SOLANA_WS_URL`
   Websocket endpoint used by realtime watchers. This matters for follow actions, sniper timing, and daemon health.
+- `LAUNCHDECK_WARM_RPC_URL`
+  Optional alternate RPC used for startup warmup and block-height observation. Leave it blank to reuse `SOLANA_RPC_URL`.
 - `USER_REGION`
   Default region for providers that support endpoint profiles. Supported values are `global`, `us`, `eu`, `west`, and `asia`.
 
@@ -36,11 +49,50 @@ Recommended practice:
 - region fanout is usually faster and more reliable because LaunchDeck can send across that region's endpoint group instead of depending on a single host
 - use provider-specific region overrides only when one provider needs a different region than your shared default
 - for most operators, use Helius for both `SOLANA_RPC_URL` and `SOLANA_WS_URL` because it is currently the fastest and best-supported overall setup in LaunchDeck
+- for `LAUNCHDECK_WARM_RPC_URL`, a separate [Shyft](https://shyft.to/) RPC with a free API key is a good default so startup warm and block-height reads do not consume your main execution RPC budget
+- if you care about maximum performance, Helius dev tier is strongly recommended rather than treating the free tier as your long-term production setup
 
 If you omit `SOLANA_WS_URL`, LaunchDeck cannot do its best realtime follow behavior.
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE`
   Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers when your Helius websocket supports it. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
+
+### Warmup, Block-Height, And Report Timing
+
+- `LAUNCHDECK_DISABLE_STARTUP_WARM`
+  Disables the explicit startup-warm endpoint path.
+- `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
+  Shared cache TTL for block-height reads.
+- `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
+  Maximum age for sampled block-height snapshots used by reporting and diagnostics before a fresh read is forced.
+- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS`
+  Shared follow-daemon block-height worker cadence while block-offset jobs are active.
+- `LAUNCHDECK_BENCHMARK_MODE`
+  Report timing detail level. Supported values: `off`, `basic`, `full`. Blank defaults to `full`.
+- `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT`
+  Default for `execution.trackSendBlockHeight`. When enabled, reports also capture observed block height at send time and confirmation time.
+
+How these settings fit together:
+
+- `LAUNCHDECK_BENCHMARK_MODE` controls report timing detail only
+- `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` controls whether send/confirm block-height snapshots are captured by default
+- `LAUNCHDECK_WARM_RPC_URL` is used for the warm/block-height observation path so those reads can be separated from your main execution RPC
+- for most operators, the best practical split is Helius for `SOLANA_RPC_URL` and `SOLANA_WS_URL`, plus Shyft for `LAUNCHDECK_WARM_RPC_URL`
+
+### Auto-Fee And Helper Runtime Tuning
+
+- `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL`
+  Helius priority-fee selector for auto-fee mode. Supported values: `recommended`, `none`, `low`, `medium`, `high`, `veryHigh`, `unsafeMax`.
+- `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE`
+  Jito tip-floor percentile selector for auto-fee mode. Supported values: `p25`, `p50`, `p75`, `p95`, `p99`.
+- `LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS`
+  Shared timeout for helper-backed launchpad scripts such as Bonk and Bags.
+- `LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY`
+  Shared concurrency cap for helper-backed launchpad scripts.
+
+Practical note:
+
+- the current recommended auto-fee default is `veryHigh` plus `p99`, then cap cost in the UI with a max auto-fee value if needed
 
 ### Wallet Import
 

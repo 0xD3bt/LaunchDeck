@@ -12,12 +12,15 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::Semaphore,
-    time::{Duration, sleep, timeout},
+    time::{Duration, timeout},
 };
 
 use crate::{
     config::{NormalizedConfig, NormalizedExecution, validate_launchpad_support},
-    report::{FeeSettings, InstructionSummary, TransactionSummary, build_report, render_report},
+    report::{
+        BonkUsd1LaunchSummary, FeeSettings, InstructionSummary, TransactionSummary, build_report,
+        render_report,
+    },
     rpc::CompiledTransaction,
     transport::TransportPlan,
 };
@@ -54,6 +57,8 @@ fn helper_semaphore() -> Arc<Semaphore> {
 #[derive(Debug, Clone)]
 pub struct NativeBonkArtifacts {
     pub compiled_transactions: Vec<CompiledTransaction>,
+    pub creation_transactions: Vec<CompiledTransaction>,
+    pub deferred_setup_transactions: Vec<CompiledTransaction>,
     pub report: Value,
     pub text: String,
     pub compile_timings: NativeCompileTimings,
@@ -119,15 +124,63 @@ struct HelperCompiledTransaction {
     inlineTipAccount: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct HelperUsd1QuoteMetrics {
+    #[serde(default)]
+    quoteCalls: u64,
+    #[serde(default)]
+    quoteTotalMs: u64,
+    #[serde(default)]
+    averageQuoteMs: f64,
+    #[serde(default)]
+    quoteCacheHits: u64,
+    #[serde(default)]
+    routeSetupLocalHits: u64,
+    #[serde(default)]
+    routeSetupCacheHits: u64,
+    #[serde(default)]
+    routeSetupCacheMisses: u64,
+    #[serde(default)]
+    routeSetupFetchMs: u64,
+    #[serde(default)]
+    expansionQuoteCalls: u64,
+    #[serde(default)]
+    binarySearchQuoteCalls: u64,
+    #[serde(default)]
+    bufferQuoteCalls: u64,
+    #[serde(default)]
+    searchIterations: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct HelperLaunchResponse {
     mint: String,
     launchCreator: String,
     compiledTransactions: Vec<HelperCompiledTransaction>,
     #[serde(default)]
+    predictedDevBuyTokenAmountRaw: Option<String>,
+    #[serde(default)]
     atomicCombined: bool,
     #[serde(default)]
     atomicFallbackReason: Option<String>,
+    #[serde(default)]
+    usd1LaunchDetails: Option<HelperUsd1LaunchDetails>,
+    #[serde(default)]
+    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperUsd1LaunchDetails {
+    compilePath: String,
+    requiredQuoteAmount: String,
+    currentQuoteAmount: String,
+    shortfallQuoteAmount: String,
+    #[serde(default)]
+    inputSol: Option<String>,
+    #[serde(default)]
+    expectedQuoteOut: Option<String>,
+    #[serde(default)]
+    minQuoteOut: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,8 +194,42 @@ struct HelperFollowSellResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct HelperPredictDevBuyResponse {
+    #[serde(default)]
+    predictedDevBuyTokenAmountRaw: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperDerivePoolIdResponse {
+    poolId: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct HelperUsd1TopupResponse {
     compiledTransaction: Option<HelperCompiledTransaction>,
+    #[serde(default)]
+    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperWarmLaunchDefault {
+    mode: String,
+    quoteAsset: String,
+    platformId: String,
+    configId: String,
+    quoteMint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperWarmStateResponse {
+    #[serde(default)]
+    warmedLaunchDefaults: Vec<HelperWarmLaunchDefault>,
+    #[serde(default)]
+    usd1RoutePoolId: String,
+    #[serde(default)]
+    usd1RouteConfigId: String,
+    #[serde(default)]
+    usd1QuoteMetrics: Option<HelperUsd1QuoteMetrics>,
 }
 
 fn project_root() -> Result<PathBuf, String> {
@@ -156,6 +243,31 @@ fn project_root() -> Result<PathBuf, String> {
 
 fn helper_script_path() -> Result<PathBuf, String> {
     Ok(project_root()?.join("scripts/bonk-launchpad.js"))
+}
+
+fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<String> {
+    if metrics.quoteCalls == 0
+        && metrics.routeSetupLocalHits == 0
+        && metrics.routeSetupCacheHits == 0
+        && metrics.routeSetupCacheMisses == 0
+    {
+        return None;
+    }
+    Some(format!(
+        "USD1 quote metrics: calls={} total={}ms avg={:.1}ms quote-cache-hits={} route-setup(local/ttl/miss)={}/{}/{} route-setup-fetch={}ms search(expansion/binary/buffer iters)={}/{}/{}/{}",
+        metrics.quoteCalls,
+        metrics.quoteTotalMs,
+        metrics.averageQuoteMs,
+        metrics.quoteCacheHits,
+        metrics.routeSetupLocalHits,
+        metrics.routeSetupCacheHits,
+        metrics.routeSetupCacheMisses,
+        metrics.routeSetupFetchMs,
+        metrics.expansionQuoteCalls,
+        metrics.binarySearchQuoteCalls,
+        metrics.bufferQuoteCalls,
+        metrics.searchIterations,
+    ))
 }
 
 fn parse_helper_output<R: for<'de> Deserialize<'de>>(
@@ -357,12 +469,16 @@ fn build_transaction_summaries(
                 .decode(transaction.serializedBase64.as_bytes())
                 .ok()
                 .map(|bytes| bytes.len());
+            let encoded_len = Some(transaction.serializedBase64.len());
             let mut summary = TransactionSummary {
                 label: transaction.label.clone(),
                 instructionSummary: Vec::<InstructionSummary>::new(),
                 legacyLength: None,
+                legacyBase64Length: None,
                 v0Length: None,
+                v0Base64Length: None,
                 v0AltLength: None,
+                v0AltBase64Length: None,
                 legacyError: None,
                 v0Error: None,
                 v0AltError: None,
@@ -389,8 +505,14 @@ fn build_transaction_summaries(
                 warnings: vec![],
             };
             match transaction.format.as_str() {
-                "legacy" => summary.legacyLength = serialized_len,
-                _ => summary.v0Length = serialized_len,
+                "legacy" => {
+                    summary.legacyLength = serialized_len;
+                    summary.legacyBase64Length = encoded_len;
+                }
+                _ => {
+                    summary.v0Length = serialized_len;
+                    summary.v0Base64Length = encoded_len;
+                }
             }
             summary
         })
@@ -442,6 +564,7 @@ pub async fn compile_sol_to_usd1_topup_transaction(
         "action": "compile-sol-to-usd1-topup",
         "rpcUrl": rpc_url,
         "quoteAsset": "usd1",
+        "allowAtaCreation": true,
         "commitment": execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
         "requiredQuoteAmount": required_quote_amount,
@@ -530,14 +653,33 @@ pub async fn try_compile_native_bonk(
             "USD1 dev buy was assembled atomically with the launch transaction.".to_string(),
         );
     } else if let Some(reason) = response.atomicFallbackReason.as_ref() {
-        report.execution.warnings.push(format!(
-            "USD1 dev buy atomic assembly fell back to split transactions: {reason}"
+        report.execution.notes.push(format!(
+            "USD1 dev buy uses split launch transactions: {reason}"
         ));
+    }
+    if let Some(details) = response.usd1LaunchDetails.as_ref() {
+        report.bonkUsd1Launch = Some(BonkUsd1LaunchSummary {
+            compilePath: details.compilePath.clone(),
+            currentQuoteAmount: details.currentQuoteAmount.clone(),
+            requiredQuoteAmount: details.requiredQuoteAmount.clone(),
+            shortfallQuoteAmount: details.shortfallQuoteAmount.clone(),
+            inputSol: details.inputSol.clone(),
+            expectedQuoteOut: details.expectedQuoteOut.clone(),
+            minQuoteOut: details.minQuoteOut.clone(),
+            atomicFallbackReason: response.atomicFallbackReason.clone(),
+        });
+    }
+    if let Some(metrics) = response.usd1QuoteMetrics.as_ref() {
+        if let Some(note) = render_usd1_quote_metrics_note(metrics) {
+            report.execution.notes.push(note);
+        }
     }
     report.transactions = build_transaction_summaries(&compiled_transactions, config.tx.dumpBase64);
     let text = render_report(&report);
     let report = serde_json::to_value(report).map_err(|error| error.to_string())?;
     Ok(Some(NativeBonkArtifacts {
+        creation_transactions: compiled_transactions.clone(),
+        deferred_setup_transactions: vec![],
         compiled_transactions,
         report,
         text,
@@ -622,6 +764,7 @@ pub async fn compile_atomic_follow_buy_transaction(
 
 pub async fn compile_follow_sell_transaction(
     rpc_url: &str,
+    quote_asset: &str,
     execution: &NormalizedExecution,
     _token_mayhem_mode: bool,
     jito_tip_account: &str,
@@ -631,6 +774,35 @@ pub async fn compile_follow_sell_transaction(
     sell_percent: u8,
     _prefer_post_setup_creator_vault: bool,
 ) -> Result<Option<CompiledTransaction>, String> {
+    compile_follow_sell_transaction_with_token_amount(
+        rpc_url,
+        quote_asset,
+        execution,
+        jito_tip_account,
+        wallet_secret,
+        mint,
+        sell_percent,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn compile_follow_sell_transaction_with_token_amount(
+    rpc_url: &str,
+    quote_asset: &str,
+    execution: &NormalizedExecution,
+    jito_tip_account: &str,
+    wallet_secret: &[u8],
+    mint: &str,
+    sell_percent: u8,
+    token_amount_override: Option<u64>,
+    pool_id_override: Option<&str>,
+    launch_mode_override: Option<&str>,
+    launch_creator_override: Option<&str>,
+) -> Result<Option<CompiledTransaction>, String> {
     let tip_lamports = parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?;
     let response: HelperFollowSellResponse = run_helper(&json!({
         "action": "compile-follow-sell",
@@ -638,7 +810,12 @@ pub async fn compile_follow_sell_transaction(
         "commitment": execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
         "mint": mint,
+        "quoteAsset": quote_asset,
         "sellPercent": sell_percent,
+        "exactTokenAmountRaw": token_amount_override.map(|value| value.to_string()),
+        "poolId": pool_id_override,
+        "mode": launch_mode_override,
+        "launchCreator": launch_creator_override,
         "txFormat": execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&execution.sellSlippagePercent)?,
         "txConfig": helper_tx_config(
@@ -652,6 +829,43 @@ pub async fn compile_follow_sell_transaction(
     Ok(response
         .compiledTransaction
         .map(convert_compiled_transaction))
+}
+
+pub async fn predict_dev_buy_token_amount(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+) -> Result<Option<u64>, String> {
+    let response: HelperPredictDevBuyResponse = run_helper(&json!({
+        "action": "predict-dev-buy-token-amount",
+        "mode": config.mode,
+        "quoteAsset": config.quoteAsset,
+        "rpcUrl": rpc_url,
+        "commitment": config.execution.commitment,
+        "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
+        "devBuy": config.devBuy.as_ref().map(|dev_buy| json!({
+            "mode": dev_buy.mode,
+            "amount": dev_buy.amount,
+            "quoteAsset": config.quoteAsset,
+        })),
+    }))
+    .await?;
+    response
+        .predictedDevBuyTokenAmountRaw
+        .map(|value| value.parse::<u64>().map_err(|error| format!("Invalid Bonk predicted dev buy token amount: {error}")))
+        .transpose()
+}
+
+pub async fn derive_canonical_pool_id(
+    quote_asset: &str,
+    mint: &str,
+) -> Result<String, String> {
+    let response: HelperDerivePoolIdResponse = run_helper(&json!({
+        "action": "derive-pool-id",
+        "quoteAsset": quote_asset,
+        "mint": mint,
+    }))
+    .await?;
+    Ok(response.poolId)
 }
 
 pub async fn fetch_bonk_market_snapshot(
@@ -695,6 +909,34 @@ pub async fn poll_bonk_market_cap_lamports(
     Ok(Some(value))
 }
 
-pub async fn warm_bonk_state() {
-    let _ = sleep(Duration::from_millis(1)).await;
+pub async fn warm_bonk_state(rpc_url: &str) -> Result<Value, String> {
+    let response: HelperWarmStateResponse = run_helper(&json!({
+        "action": "warm-state",
+        "rpcUrl": rpc_url,
+        "commitment": "processed",
+    }))
+    .await?;
+    let launch_defaults = response
+        .warmedLaunchDefaults
+        .iter()
+        .map(|entry| {
+            json!({
+                "mode": entry.mode,
+                "quoteAsset": entry.quoteAsset,
+                "platformId": entry.platformId,
+                "configId": entry.configId,
+                "quoteMint": entry.quoteMint,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = json!({
+        "ok": true,
+        "launchDefaults": launch_defaults,
+        "usd1RoutePoolId": response.usd1RoutePoolId,
+        "usd1RouteConfigId": response.usd1RouteConfigId,
+    });
+    if let Some(metrics) = response.usd1QuoteMetrics.as_ref() {
+        payload["usd1QuoteMetrics"] = serde_json::to_value(metrics).unwrap_or(Value::Null);
+    }
+    Ok(payload)
 }

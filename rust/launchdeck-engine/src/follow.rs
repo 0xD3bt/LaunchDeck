@@ -3,6 +3,8 @@
 use crate::{
     config::{NormalizedExecution, NormalizedFollowLaunch},
     fs_utils::{atomic_write, quarantine_corrupt_file},
+    report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
+    rpc::CompiledTransaction,
     transport::TransportPlan,
 };
 use reqwest::Client;
@@ -11,7 +13,7 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -88,6 +90,32 @@ pub struct FollowMarketCapTrigger {
     pub timeoutAction: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeferredSetupState {
+    Queued,
+    Running,
+    Sent,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredSetupRecord {
+    pub transactions: Vec<CompiledTransaction>,
+    pub state: DeferredSetupState,
+    #[serde(default)]
+    pub attemptCount: u32,
+    #[serde(default)]
+    pub signatures: Vec<String>,
+    #[serde(default)]
+    pub submittedAtMs: Option<u128>,
+    #[serde(default)]
+    pub confirmedAtMs: Option<u128>,
+    #[serde(default)]
+    pub lastError: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowActionRecord {
     pub actionId: String,
@@ -132,6 +160,16 @@ pub struct FollowActionRecord {
     pub endpoint: Option<String>,
     pub bundleId: Option<String>,
     pub lastError: Option<String>,
+    #[serde(default)]
+    pub triggerKey: Option<String>,
+    #[serde(default)]
+    pub orderIndex: u32,
+    #[serde(default)]
+    pub preSignedTransactions: Vec<CompiledTransaction>,
+    #[serde(default)]
+    pub poolId: Option<String>,
+    #[serde(default)]
+    pub timings: FollowActionTimings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +183,8 @@ pub struct FollowJobRecord {
     pub updatedAtMs: u128,
     pub launchpad: String,
     pub quoteAsset: String,
+    #[serde(default)]
+    pub launchMode: String,
     pub selectedWalletKey: String,
     pub execution: NormalizedExecution,
     pub tokenMayhemMode: bool,
@@ -162,8 +202,19 @@ pub struct FollowJobRecord {
     pub transportPlan: Option<TransportPlan>,
     pub followLaunch: NormalizedFollowLaunch,
     pub actions: Vec<FollowActionRecord>,
+    #[serde(default)]
+    pub deferredSetup: Option<DeferredSetupRecord>,
     pub cancelRequested: bool,
     pub lastError: Option<String>,
+    #[serde(default)]
+    pub timings: FollowJobTimings,
+}
+
+pub fn should_use_post_setup_creator_vault_for_sell(
+    job_prefers_post_setup_creator_vault: bool,
+    action: &FollowActionRecord,
+) -> bool {
+    job_prefers_post_setup_creator_vault && action.targetBlockOffset.unwrap_or_default() > 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +259,8 @@ pub struct FollowReserveRequest {
     pub traceId: String,
     pub launchpad: String,
     pub quoteAsset: String,
+    #[serde(default)]
+    pub launchMode: String,
     pub selectedWalletKey: String,
     pub followLaunch: NormalizedFollowLaunch,
     pub execution: NormalizedExecution,
@@ -215,6 +268,10 @@ pub struct FollowReserveRequest {
     pub jitoTipAccount: String,
     #[serde(default)]
     pub preferPostSetupCreatorVaultForSell: bool,
+    #[serde(default)]
+    pub prebuiltActions: Vec<FollowActionRecord>,
+    #[serde(default)]
+    pub deferredSetupTransactions: Vec<CompiledTransaction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +349,28 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn trigger_key_for_action(action: &FollowActionRecord) -> String {
+    if let Some(trigger) = &action.marketCap {
+        return format!(
+            "market:{}:{}:{}:{}",
+            trigger.direction, trigger.threshold, trigger.scanTimeoutSeconds, trigger.timeoutAction
+        );
+    }
+    if let Some(offset) = action.targetBlockOffset {
+        return format!("block:{offset}");
+    }
+    if action.requireConfirmation {
+        return "confirm".to_string();
+    }
+    if let Some(delay_ms) = action.delayMs {
+        return format!("delay:{delay_ms}");
+    }
+    if let Some(delay_ms) = action.submitDelayMs {
+        return format!("submit:{delay_ms}");
+    }
+    "submit:0".to_string()
+}
+
 fn is_retryable_persist_error(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(5 | 32 | 33 | 1224))
         || matches!(
@@ -313,51 +392,61 @@ fn configured_follow_daemon_auth_token() -> Option<String> {
     }
 }
 
-fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionRecord> {
+pub fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionRecord> {
     let mut actions = follow
         .snipes
         .iter()
-        .filter(|snipe| snipe.enabled)
-        .map(|snipe| FollowActionRecord {
-            actionId: snipe.actionId.clone(),
-            kind: FollowActionKind::SniperBuy,
-            walletEnvKey: snipe.walletEnvKey.clone(),
-            state: FollowActionState::Queued,
-            buyAmountSol: Some(snipe.buyAmountSol.clone()),
-            sellPercent: None,
-            submitDelayMs: Some(snipe.submitDelayMs),
-            targetBlockOffset: snipe.targetBlockOffset,
-            delayMs: None,
-            marketCap: None,
-            jitterMs: Some(snipe.jitterMs),
-            feeJitterBps: Some(snipe.feeJitterBps),
-            precheckRequired: follow.constraints.blockOnRequiredPrechecks,
-            requireConfirmation: false,
-            skipIfTokenBalancePositive: snipe.skipIfTokenBalancePositive,
-            attemptCount: 0,
-            scheduledForMs: None,
-            submitStartedAtMs: None,
-            submittedAtMs: None,
-            confirmedAtMs: None,
-            provider: None,
-            endpointProfile: None,
-            transportType: None,
-            watcherMode: None,
-            watcherFallbackReason: None,
-            sendObservedBlockHeight: None,
-            confirmedObservedBlockHeight: None,
-            blocksToConfirm: None,
-            signature: None,
-            explorerUrl: None,
-            endpoint: None,
-            bundleId: None,
-            lastError: None,
+        .enumerate()
+        .filter(|(_, snipe)| snipe.enabled)
+        .map(|(index, snipe)| {
+            let mut action = FollowActionRecord {
+                actionId: snipe.actionId.clone(),
+                kind: FollowActionKind::SniperBuy,
+                walletEnvKey: snipe.walletEnvKey.clone(),
+                state: FollowActionState::Queued,
+                buyAmountSol: Some(snipe.buyAmountSol.clone()),
+                sellPercent: None,
+                submitDelayMs: Some(snipe.submitDelayMs),
+                targetBlockOffset: snipe.targetBlockOffset,
+                delayMs: None,
+                marketCap: None,
+                jitterMs: Some(snipe.jitterMs),
+                feeJitterBps: Some(snipe.feeJitterBps),
+                precheckRequired: follow.constraints.blockOnRequiredPrechecks,
+                requireConfirmation: false,
+                skipIfTokenBalancePositive: snipe.skipIfTokenBalancePositive,
+                attemptCount: 0,
+                scheduledForMs: None,
+                submitStartedAtMs: None,
+                submittedAtMs: None,
+                confirmedAtMs: None,
+                provider: None,
+                endpointProfile: None,
+                transportType: None,
+                watcherMode: None,
+                watcherFallbackReason: None,
+                sendObservedBlockHeight: None,
+                confirmedObservedBlockHeight: None,
+                blocksToConfirm: None,
+                signature: None,
+                explorerUrl: None,
+                endpoint: None,
+                bundleId: None,
+                lastError: None,
+                triggerKey: None,
+                orderIndex: index as u32,
+                preSignedTransactions: vec![],
+                poolId: None,
+                timings: FollowActionTimings::default(),
+            };
+            action.triggerKey = Some(trigger_key_for_action(&action));
+            action
         })
         .collect::<Vec<_>>();
     if let Some(dev_auto_sell) = &follow.devAutoSell
         && dev_auto_sell.enabled
     {
-        actions.push(FollowActionRecord {
+        let mut action = FollowActionRecord {
             actionId: dev_auto_sell.actionId.clone(),
             kind: FollowActionKind::DevAutoSell,
             walletEnvKey: dev_auto_sell.walletEnvKey.clone(),
@@ -399,16 +488,23 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
             endpoint: None,
             bundleId: None,
             lastError: None,
-        });
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        action.triggerKey = Some(trigger_key_for_action(&action));
+        actions.push(action);
     }
-    for snipe in &follow.snipes {
+    for (index, snipe) in follow.snipes.iter().enumerate() {
         if !snipe.enabled {
             continue;
         }
         if let Some(sell) = &snipe.postBuySell
             && sell.enabled
         {
-            actions.push(FollowActionRecord {
+            let mut action = FollowActionRecord {
                 actionId: sell.actionId.clone(),
                 kind: FollowActionKind::SniperSell,
                 walletEnvKey: sell.walletEnvKey.clone(),
@@ -450,7 +546,14 @@ fn build_action_records(follow: &NormalizedFollowLaunch) -> Vec<FollowActionReco
                 endpoint: None,
                 bundleId: None,
                 lastError: None,
-            });
+                triggerKey: None,
+                orderIndex: index as u32,
+                preSignedTransactions: vec![],
+                poolId: None,
+                timings: FollowActionTimings::default(),
+            };
+            action.triggerKey = Some(trigger_key_for_action(&action));
+            actions.push(action);
         }
     }
     actions
@@ -525,8 +628,12 @@ impl FollowDaemonStore {
             return;
         }
         state.health.slotWatcher = FollowWatcherHealth::Healthy;
+        state.health.slotWatcherMode = None;
         state.health.signatureWatcher = FollowWatcherHealth::Healthy;
+        state.health.signatureWatcherMode = None;
         state.health.marketWatcher = FollowWatcherHealth::Healthy;
+        state.health.marketWatcherMode = None;
+        state.health.watchEndpoint = None;
         state.health.lastError = None;
     }
 
@@ -582,6 +689,7 @@ impl FollowDaemonStore {
             .find(|job| job.traceId == request.traceId)
         {
             if existing.launchpad != request.launchpad
+                || existing.launchMode != request.launchMode
                 || existing.selectedWalletKey != request.selectedWalletKey
                 || existing.execution.provider != request.execution.provider
                 || existing.execution.endpointProfile != request.execution.endpointProfile
@@ -590,6 +698,8 @@ impl FollowDaemonStore {
                 || existing.followLaunch.snipes.len() != request.followLaunch.snipes.len()
                 || existing.followLaunch.devAutoSell.is_some()
                     != request.followLaunch.devAutoSell.is_some()
+                || existing.deferredSetup.as_ref().map(|value| value.transactions.len()).unwrap_or(0)
+                    != request.deferredSetupTransactions.len()
             {
                 return Err(format!(
                     "Conflicting follow reserve request for traceId {}. Reused traceIds must keep the same follow-launch payload.",
@@ -611,7 +721,11 @@ impl FollowDaemonStore {
                 .cloned()
                 .expect("reserved job should exist"));
         }
-        let actions = build_action_records(&request.followLaunch);
+        let actions = if request.prebuiltActions.is_empty() {
+            build_action_records(&request.followLaunch)
+        } else {
+            request.prebuiltActions.clone()
+        };
         let job = FollowJobRecord {
             schemaVersion: FOLLOW_JOB_SCHEMA_VERSION,
             traceId: request.traceId.clone(),
@@ -621,6 +735,7 @@ impl FollowDaemonStore {
             updatedAtMs: now,
             launchpad: request.launchpad,
             quoteAsset: request.quoteAsset,
+            launchMode: request.launchMode,
             selectedWalletKey: request.selectedWalletKey,
             execution: request.execution,
             tokenMayhemMode: request.tokenMayhemMode,
@@ -636,8 +751,25 @@ impl FollowDaemonStore {
             transportPlan: None,
             followLaunch: request.followLaunch,
             actions,
+            deferredSetup: if request.deferredSetupTransactions.is_empty() {
+                None
+            } else {
+                Some(DeferredSetupRecord {
+                    transactions: request.deferredSetupTransactions,
+                    state: DeferredSetupState::Queued,
+                    attemptCount: 0,
+                    signatures: vec![],
+                    submittedAtMs: None,
+                    confirmedAtMs: None,
+                    lastError: None,
+                })
+            },
             cancelRequested: false,
             lastError: None,
+            timings: FollowJobTimings {
+                benchmarkMode: Some(configured_benchmark_mode().as_str().to_string()),
+                ..FollowJobTimings::default()
+            },
         };
         state.jobs.push(job.clone());
         state.health.updatedAtMs = now;
@@ -951,6 +1083,28 @@ impl FollowDaemonStore {
         Ok(snapshot)
     }
 
+    pub async fn update_job(
+        &self,
+        trace_id: &str,
+        mutator: impl FnOnce(&mut FollowJobRecord),
+    ) -> Result<FollowJobRecord, String> {
+        let mut state = self.inner.write().await;
+        let now = now_ms();
+        state.health.updatedAtMs = now;
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.traceId == trace_id)
+            .ok_or_else(|| format!("Unknown follow job traceId: {trace_id}"))?;
+        mutator(job);
+        job.updatedAtMs = now;
+        let snapshot = job.clone();
+        Self::refresh_counts(&mut state);
+        drop(state);
+        self.persist().await?;
+        Ok(snapshot)
+    }
+
     pub async fn finalize_job_state(
         &self,
         trace_id: &str,
@@ -978,9 +1132,10 @@ impl FollowDaemonStore {
 
 impl FollowDaemonClient {
     pub fn new(base_url: &str) -> Self {
+        static CLIENT: OnceLock<Client> = OnceLock::new();
         Self {
             baseUrl: base_url.trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: CLIENT.get_or_init(Client::new).clone(),
             authToken: configured_follow_daemon_auth_token(),
         }
     }
@@ -1102,4 +1257,211 @@ pub fn follow_ready_response(
 
 pub fn path_exists(path: &Path) -> bool {
     path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        NormalizedFollowLaunchConstraints, NormalizedFollowLaunchSell, NormalizedFollowLaunchSnipe,
+    };
+
+    fn sample_follow_launch() -> NormalizedFollowLaunch {
+        NormalizedFollowLaunch {
+            enabled: true,
+            source: "test".to_string(),
+            schemaVersion: 1,
+            snipes: vec![NormalizedFollowLaunchSnipe {
+                actionId: "snipe-a".to_string(),
+                enabled: true,
+                walletEnvKey: "WALLET_A".to_string(),
+                buyAmountSol: "0.1".to_string(),
+                submitWithLaunch: false,
+                retryOnFailure: false,
+                submitDelayMs: 0,
+                targetBlockOffset: Some(0),
+                jitterMs: 0,
+                feeJitterBps: 0,
+                skipIfTokenBalancePositive: false,
+                postBuySell: None,
+            }],
+            devAutoSell: Some(NormalizedFollowLaunchSell {
+                actionId: "dev-sell".to_string(),
+                enabled: true,
+                walletEnvKey: "WALLET_A".to_string(),
+                percent: 100,
+                delayMs: None,
+                targetBlockOffset: Some(0),
+                marketCap: None,
+                precheckRequired: false,
+                requireConfirmation: false,
+            }),
+            constraints: NormalizedFollowLaunchConstraints {
+                pumpOnly: false,
+                retryBudget: 1,
+                requireDaemonReadiness: false,
+                blockOnRequiredPrechecks: true,
+            },
+        }
+    }
+
+    #[test]
+    fn build_action_records_sets_trigger_keys_and_order() {
+        let actions = build_action_records(&sample_follow_launch());
+        let snipe = actions
+            .iter()
+            .find(|action| action.actionId == "snipe-a")
+            .expect("snipe action");
+        let dev_sell = actions
+            .iter()
+            .find(|action| action.actionId == "dev-sell")
+            .expect("dev sell action");
+        assert_eq!(snipe.triggerKey.as_deref(), Some("block:0"));
+        assert_eq!(dev_sell.triggerKey.as_deref(), Some("block:0"));
+        assert_eq!(snipe.orderIndex, 0);
+        assert!(snipe.preSignedTransactions.is_empty());
+    }
+
+    #[test]
+    fn trigger_key_uses_market_cap_shape_when_present() {
+        let action = FollowActionRecord {
+            actionId: "sell-a".to_string(),
+            kind: FollowActionKind::SniperSell,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: None,
+            sellPercent: Some(50),
+            submitDelayMs: None,
+            targetBlockOffset: None,
+            delayMs: None,
+            marketCap: Some(FollowMarketCapTrigger {
+                direction: "above".to_string(),
+                threshold: "100".to_string(),
+                scanTimeoutSeconds: 30,
+                timeoutAction: "cancel".to_string(),
+            }),
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: false,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert_eq!(
+            trigger_key_for_action(&action),
+            "market:above:100:30:cancel".to_string()
+        );
+    }
+
+    #[test]
+    fn creator_vault_rule_keeps_confirmation_zero_on_deployer_path() {
+        let action = FollowActionRecord {
+            actionId: "sell-a".to_string(),
+            kind: FollowActionKind::DevAutoSell,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(!should_use_post_setup_creator_vault_for_sell(true, &action));
+    }
+
+    #[test]
+    fn creator_vault_rule_allows_post_setup_path_after_confirmation_zero() {
+        let action = FollowActionRecord {
+            actionId: "sell-b".to_string(),
+            kind: FollowActionKind::DevAutoSell,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(1),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(should_use_post_setup_creator_vault_for_sell(true, &action));
+    }
 }

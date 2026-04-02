@@ -69,6 +69,7 @@ Recommended operator stack:
 
 - use Helius for `SOLANA_RPC_URL`
 - use Helius for `SOLANA_WS_URL`
+- use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `helius-sender` for creation, buy, and sell provider routing
 - if you have Helius dev tier and websocket support for it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
@@ -104,6 +105,7 @@ Practical note:
 - if `SOLANA_RPC_URL` is not configured, LaunchDeck can still use the default Sender endpoint, but you should set a dedicated confirmation RPC for real operation
 - in normal average-latency setups this is the provider we recommend first
 - pairing Helius Sender with Helius RPC + Helius WS is currently the strongest overall default setup in LaunchDeck
+- Helius dev tier is strongly recommended if you care about the best watcher quality and execution performance
 
 ### Helius Enhanced Realtime Watchers
 

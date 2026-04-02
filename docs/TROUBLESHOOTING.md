@@ -69,6 +69,7 @@ What to do:
 2. set `USER_REGION` to your closest region
 3. prefer region fanout over pinning one explicit sender or bundle endpoint
 4. if needed, use provider-specific region overrides
+5. if you are on Helius dev tier and your websocket supports it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
 ## Helius Sender Rejection
 
@@ -90,6 +91,13 @@ Current Sender requirements:
 - `tx.jitoTipLamports >= 200000`
 
 If you do not want Sender rules, switch to `Standard RPC`.
+
+For the best current Sender path:
+
+1. use Helius for `SOLANA_RPC_URL`
+2. use the matching Helius websocket for `SOLANA_WS_URL`
+3. use a Shyft RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
+4. use Helius dev tier if you want the strongest performance and watcher behavior
 
 ## Standard RPC Not Using Tip
 

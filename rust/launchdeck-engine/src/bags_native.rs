@@ -483,12 +483,16 @@ fn build_transaction_summaries(
                 .decode(transaction.serializedBase64.as_bytes())
                 .ok()
                 .map(|bytes| bytes.len());
+            let encoded_len = Some(transaction.serializedBase64.len());
             let mut summary = TransactionSummary {
                 label: transaction.label.clone(),
                 instructionSummary: Vec::<InstructionSummary>::new(),
                 legacyLength: None,
+                legacyBase64Length: None,
                 v0Length: None,
+                v0Base64Length: None,
                 v0AltLength: None,
+                v0AltBase64Length: None,
                 legacyError: None,
                 v0Error: None,
                 v0AltError: None,
@@ -515,8 +519,14 @@ fn build_transaction_summaries(
                 warnings: vec![],
             };
             match transaction.format.as_str() {
-                "legacy" => summary.legacyLength = serialized_len,
-                _ => summary.v0Length = serialized_len,
+                "legacy" => {
+                    summary.legacyLength = serialized_len;
+                    summary.legacyBase64Length = encoded_len;
+                }
+                _ => {
+                    summary.v0Length = serialized_len;
+                    summary.v0Base64Length = encoded_len;
+                }
             }
             summary
         })
@@ -860,7 +870,7 @@ pub async fn compile_follow_buy_transaction(
     rpc_url: &str,
     execution: &NormalizedExecution,
     _token_mayhem_mode: bool,
-    _jito_tip_account: &str,
+    jito_tip_account: &str,
     wallet_secret: &[u8],
     mint: &str,
     _launch_creator: &str,
@@ -878,8 +888,8 @@ pub async fn compile_follow_buy_transaction(
         "txConfig": helper_tx_config(
             Some(FIXED_COMPUTE_UNIT_LIMIT),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
-            0,
-            "",
+            parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?,
+            jito_tip_account,
         ),
     }))
     .await?;
@@ -915,7 +925,7 @@ pub async fn compile_follow_sell_transaction(
     rpc_url: &str,
     execution: &NormalizedExecution,
     _token_mayhem_mode: bool,
-    _jito_tip_account: &str,
+    jito_tip_account: &str,
     wallet_secret: &[u8],
     mint: &str,
     _launch_creator: &str,
@@ -934,8 +944,8 @@ pub async fn compile_follow_sell_transaction(
         "txConfig": helper_tx_config(
             Some(FIXED_COMPUTE_UNIT_LIMIT),
             priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
-            0,
-            "",
+            parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?,
+            jito_tip_account,
         ),
     }))
     .await?;

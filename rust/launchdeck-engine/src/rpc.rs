@@ -1,15 +1,16 @@
 #![allow(non_snake_case, dead_code)]
 
-use futures_util::{SinkExt, StreamExt, future::join_all};
+use futures_util::{SinkExt, StreamExt, future::join_all, stream::FuturesUnordered};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_sdk::transaction::VersionedTransaction;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Mutex, OnceLock},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
@@ -57,6 +58,12 @@ pub struct SentResult {
     pub skipPreflight: bool,
     pub maxRetries: u32,
     pub confirmationStatus: Option<String>,
+    pub confirmationSource: Option<String>,
+    pub submittedAtMs: Option<u128>,
+    pub firstObservedStatus: Option<String>,
+    pub firstObservedSlot: Option<u64>,
+    pub firstObservedAtMs: Option<u128>,
+    pub confirmedAtMs: Option<u128>,
     pub sendObservedBlockHeight: Option<u64>,
     pub confirmedObservedBlockHeight: Option<u64>,
     pub confirmedSlot: Option<u64>,
@@ -78,10 +85,17 @@ struct ConfirmationDetails {
     status: Value,
     confirmed_observed_block_height: Option<u64>,
     confirmed_slot: Option<u64>,
+    confirmation_source: &'static str,
+    first_observed_status: Option<String>,
+    first_observed_slot: Option<u64>,
+    first_observed_at_ms: Option<u128>,
+    confirmed_at_ms: Option<u128>,
 }
 
-const BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const BLOCKHASH_MAX_AGE: Duration = Duration::from_secs(45);
+const BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const BLOCKHASH_MAX_AGE: Duration = Duration::from_secs(20);
+const DEFAULT_BLOCK_HEIGHT_CACHE_TTL_MS: u64 = 200;
+const DEFAULT_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS: u64 = 1_000;
 
 #[derive(Clone)]
 struct CachedBlockhash {
@@ -90,13 +104,137 @@ struct CachedBlockhash {
     fetched_at: Instant,
 }
 
+#[derive(Clone)]
+struct CachedBlockHeight {
+    value: u64,
+    fetched_at: Instant,
+}
+
 fn blockhash_cache() -> &'static Mutex<HashMap<String, CachedBlockhash>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedBlockhash>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn block_height_cache() -> &'static AsyncMutex<HashMap<String, CachedBlockHeight>> {
+    static CACHE: OnceLock<AsyncMutex<HashMap<String, CachedBlockHeight>>> = OnceLock::new();
+    CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+fn block_height_refresh_inflight() -> &'static AsyncMutex<HashSet<String>> {
+    static INFLIGHT: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| AsyncMutex::new(HashSet::new()))
+}
+
+fn current_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
 fn blockhash_cache_key(rpc_url: &str, commitment: &str) -> String {
     format!("{rpc_url}|{commitment}")
+}
+
+pub fn configured_warm_rpc_url(primary_rpc_url: &str) -> String {
+    std::env::var("LAUNCHDECK_WARM_RPC_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| primary_rpc_url.to_string())
+}
+
+fn configured_block_height_cache_ttl() -> Duration {
+    std::env::var("LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_BLOCK_HEIGHT_CACHE_TTL_MS))
+}
+
+fn configured_block_height_sample_max_age() -> Duration {
+    std::env::var("LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS))
+}
+
+fn block_height_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
+    blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
+}
+
+async fn refresh_block_height_sample(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<u64, String> {
+    let block_height_rpc_url = configured_warm_rpc_url(rpc_url);
+    let cache_key = blockhash_cache_key(&block_height_rpc_url, commitment);
+    let result = rpc_request(
+        &block_height_rpc_url,
+        "getBlockHeight",
+        json!([
+            {
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    let value = result
+        .as_u64()
+        .ok_or_else(|| "RPC getBlockHeight did not return a block height.".to_string())?;
+    let mut cache = block_height_cache().lock().await;
+    cache.insert(
+        cache_key,
+        CachedBlockHeight {
+            value,
+            fetched_at: Instant::now(),
+        },
+    );
+    Ok(value)
+}
+
+async fn spawn_block_height_sample_refresh_if_needed(rpc_url: &str, commitment: &str) {
+    let cache_key = block_height_cache_lookup_key(rpc_url, commitment);
+    {
+        let mut inflight = block_height_refresh_inflight().lock().await;
+        if inflight.contains(&cache_key) {
+            return;
+        }
+        inflight.insert(cache_key.clone());
+    }
+    let task_rpc_url = rpc_url.to_string();
+    let task_commitment = commitment.to_string();
+    tokio::spawn(async move {
+        let _ = refresh_block_height_sample(&task_rpc_url, &task_commitment).await;
+        let mut inflight = block_height_refresh_inflight().lock().await;
+        inflight.remove(&cache_key);
+    });
+}
+
+async fn fetch_sampled_block_height_snapshot(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<u64, String> {
+    let cache_key = block_height_cache_lookup_key(rpc_url, commitment);
+    let ttl = configured_block_height_cache_ttl();
+    let sample_max_age = configured_block_height_sample_max_age();
+    let cached = {
+        let cache = block_height_cache().lock().await;
+        cache
+            .get(&cache_key)
+            .map(|entry| (entry.value, entry.fetched_at.elapsed()))
+    };
+    if let Some((value, age)) = cached {
+        if age <= ttl {
+            return Ok(value);
+        }
+        if age <= sample_max_age {
+            spawn_block_height_sample_refresh_if_needed(rpc_url, commitment).await;
+            return Ok(value);
+        }
+    }
+    refresh_block_height_sample(rpc_url, commitment).await
 }
 
 fn get_cached_blockhash(rpc_url: &str, commitment: &str) -> Option<(String, u64)> {
@@ -139,6 +277,27 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
         .await
         .map_err(|error| error.to_string())?;
     let status = response.status();
+    let header_names = [
+        "x-request-id",
+        "x-amzn-requestid",
+        "cf-ray",
+        "server",
+        "content-type",
+        "content-length",
+        "date",
+        "via",
+    ];
+    let response_headers = response.headers().clone();
+    let header_summary = header_names
+        .iter()
+        .filter_map(|name| {
+            response_headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("{name}={value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let body = response.text().await.map_err(|error| error.to_string())?;
     let payload: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
     if !status.is_success() {
@@ -146,11 +305,26 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
             .get("error")
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
-            .or_else(|| payload.get("raw").and_then(Value::as_str))
-            .unwrap_or("No response body.");
+            .map(str::to_string)
+            .or_else(|| {
+                payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(|message| match payload.get("code").and_then(Value::as_i64) {
+                        Some(code) => format!("code={code}, message={message}"),
+                        None => message.to_string(),
+                    })
+            })
+            .or_else(|| payload.get("raw").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| payload.to_string());
+        let header_detail = if header_summary.is_empty() {
+            String::new()
+        } else {
+            format!(" | headers: {header_summary}")
+        };
         return Err(format!(
-            "RPC {} failed with status {}: {}",
-            method, status, detail
+            "RPC {} failed with status {}: {}{}",
+            method, status, detail, header_detail
         ));
     }
     if let Some(error) = payload.get("error") {
@@ -161,6 +335,19 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
             .to_string());
     }
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
+}
+
+pub async fn prewarm_rpc_endpoint(rpc_url: &str) -> Result<(), String> {
+    rpc_request(rpc_url, "getVersion", json!([]))
+        .await
+        .map(|_| ())
+}
+
+pub async fn fetch_current_block_height_fresh(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<u64, String> {
+    refresh_block_height_sample(rpc_url, commitment).await
 }
 
 pub async fn fetch_latest_blockhash(
@@ -278,19 +465,16 @@ pub async fn fetch_account_exists(
 }
 
 pub async fn fetch_current_block_height(rpc_url: &str, commitment: &str) -> Result<u64, String> {
-    let result = rpc_request(
-        rpc_url,
-        "getBlockHeight",
-        json!([
-            {
-                "commitment": commitment,
-            }
-        ]),
-    )
-    .await?;
-    result
-        .as_u64()
-        .ok_or_else(|| "RPC getBlockHeight did not return a block height.".to_string())
+    let cache_key = block_height_cache_lookup_key(rpc_url, commitment);
+    let ttl = configured_block_height_cache_ttl();
+    let cache = block_height_cache().lock().await;
+    if let Some(entry) = cache.get(&cache_key)
+        && entry.fetched_at.elapsed() <= ttl
+    {
+        return Ok(entry.value);
+    }
+    drop(cache);
+    refresh_block_height_sample(rpc_url, commitment).await
 }
 
 pub async fn simulate_transactions(
@@ -408,6 +592,9 @@ async fn wait_for_confirmation_polling(
     poll_interval_ms: u64,
     track_confirmed_block_height: bool,
 ) -> Result<ConfirmationDetails, String> {
+    let mut first_observed_status = None;
+    let mut first_observed_slot = None;
+    let mut first_observed_at_ms = None;
     for _ in 0..max_attempts {
         let result = rpc_request(
             rpc_url,
@@ -432,6 +619,11 @@ async fn wait_for_confirmation_polling(
                 .get("confirmationStatus")
                 .and_then(Value::as_str)
                 .unwrap_or("processed");
+            if first_observed_status.is_none() {
+                first_observed_status = Some(actual_commitment.to_string());
+                first_observed_slot = status.get("slot").and_then(Value::as_u64);
+                first_observed_at_ms = Some(current_time_ms());
+            }
             if status.get("err").is_some() && !status.get("err").unwrap_or(&Value::Null).is_null() {
                 return Err(format!(
                     "Transaction {} failed on-chain: {}",
@@ -441,7 +633,9 @@ async fn wait_for_confirmation_polling(
             }
             if commitment_satisfied(actual_commitment, commitment) {
                 let confirmed_observed_block_height = if track_confirmed_block_height {
-                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                        .await
+                        .ok()
                 } else {
                     None
                 };
@@ -450,6 +644,11 @@ async fn wait_for_confirmation_polling(
                     status,
                     confirmed_observed_block_height,
                     confirmed_slot,
+                    confirmation_source: "rpc-polling",
+                    first_observed_status,
+                    first_observed_slot,
+                    first_observed_at_ms,
+                    confirmed_at_ms: Some(current_time_ms()),
                 });
             }
         }
@@ -565,10 +764,13 @@ async fn wait_for_confirmation_websocket(
                     ));
                 }
                 let confirmed_observed_block_height = if track_confirmed_block_height {
-                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                        .await
+                        .ok()
                 } else {
                     None
                 };
+                let observed_at_ms = current_time_ms();
                 return Ok(ConfirmationDetails {
                     status: json!({
                         "confirmationStatus": commitment,
@@ -576,6 +778,11 @@ async fn wait_for_confirmation_websocket(
                     }),
                     confirmed_observed_block_height,
                     confirmed_slot: context_slot,
+                    confirmation_source: "websocket",
+                    first_observed_status: Some(commitment.to_string()),
+                    first_observed_slot: context_slot,
+                    first_observed_at_ms: Some(observed_at_ms),
+                    confirmed_at_ms: Some(observed_at_ms),
                 });
             }
         }
@@ -671,7 +878,9 @@ pub async fn confirm_transactions_with_websocket_fallback(
         confirmations.push((index, confirmation));
     }
     let confirmed_observed_block_height = if track_send_block_height {
-        fetch_current_block_height(rpc_url, commitment).await.ok()
+        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok()
     } else {
         None
     };
@@ -682,6 +891,11 @@ pub async fn confirm_transactions_with_websocket_fallback(
             .get("confirmationStatus")
             .and_then(Value::as_str)
             .map(str::to_string);
+        result.confirmationSource = Some(confirmation.confirmation_source.to_string());
+        result.firstObservedStatus = confirmation.first_observed_status;
+        result.firstObservedSlot = confirmation.first_observed_slot;
+        result.firstObservedAtMs = confirmation.first_observed_at_ms;
+        result.confirmedAtMs = confirmation.confirmed_at_ms;
         result.confirmedObservedBlockHeight =
             confirmed_observed_block_height.or(confirmation.confirmed_observed_block_height);
         result.confirmedSlot = confirmation.confirmed_slot;
@@ -721,7 +935,9 @@ pub async fn submit_transactions_sequential(
         .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
         let send_observed_block_height = if track_send_block_height {
-            fetch_current_block_height(rpc_url, commitment).await.ok()
+            fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                .await
+                .ok()
         } else {
             None
         };
@@ -736,6 +952,12 @@ pub async fn submit_transactions_sequential(
             skipPreflight: skip_preflight,
             maxRetries: max_retries,
             confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: Some(current_time_ms()),
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
             sendObservedBlockHeight: send_observed_block_height,
             confirmedObservedBlockHeight: None,
             confirmedSlot: None,
@@ -778,7 +1000,9 @@ async fn submit_single_transaction_rpc(
     .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
     .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
     let send_observed_block_height = if track_send_block_height {
-        fetch_current_block_height(rpc_url, commitment).await.ok()
+        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok()
     } else {
         None
     };
@@ -793,6 +1017,12 @@ async fn submit_single_transaction_rpc(
         skipPreflight: skip_preflight,
         maxRetries: max_retries,
         confirmationStatus: None,
+        confirmationSource: None,
+        submittedAtMs: Some(current_time_ms()),
+        firstObservedStatus: None,
+        firstObservedSlot: None,
+        firstObservedAtMs: None,
+        confirmedAtMs: None,
         sendObservedBlockHeight: send_observed_block_height,
         confirmedObservedBlockHeight: None,
         confirmedSlot: None,
@@ -872,6 +1102,11 @@ pub async fn confirm_transactions_sequential_with_attempts(
             .get("confirmationStatus")
             .and_then(Value::as_str)
             .map(str::to_string);
+        result.confirmationSource = Some(confirmation.confirmation_source.to_string());
+        result.firstObservedStatus = confirmation.first_observed_status;
+        result.firstObservedSlot = confirmation.first_observed_slot;
+        result.firstObservedAtMs = confirmation.first_observed_at_ms;
+        result.confirmedAtMs = confirmation.confirmed_at_ms;
         result.confirmedObservedBlockHeight = confirmation.confirmed_observed_block_height;
         result.confirmedSlot = confirmation.confirmed_slot;
     }
@@ -898,7 +1133,10 @@ pub async fn submit_transactions_helius_sender(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_current_block_height(rpc_url, commitment).await.ok();
+        let send_observed_block_height =
+            fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                .await
+                .ok();
         for result in &mut results {
             result.sendObservedBlockHeight = send_observed_block_height;
         }
@@ -911,31 +1149,41 @@ async fn submit_single_transaction_helius_sender(
     transaction: &CompiledTransaction,
 ) -> Result<(SentResult, Vec<String>), String> {
     validate_helius_sender_transaction(transaction)?;
-    let endpoint_results = join_all(endpoints.iter().map(|endpoint| async move {
-        (
-            endpoint.clone(),
-            rpc_request(
-                endpoint,
-                "sendTransaction",
-                json!([
-                    transaction.serializedBase64,
-                    {
-                        "encoding": "base64",
-                        "skipPreflight": true,
-                        "maxRetries": 0,
-                    }
-                ]),
-            )
-            .await,
-        )
-    }))
-    .await;
+    let mut endpoint_results = endpoints
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let serialized = transaction.serializedBase64.clone();
+            async move {
+                (
+                    endpoint.clone(),
+                    rpc_request(
+                        &endpoint,
+                        "sendTransaction",
+                        json!([
+                            serialized,
+                            {
+                                "encoding": "base64",
+                                "skipPreflight": true,
+                                "maxRetries": 0,
+                            }
+                        ]),
+                    )
+                    .await,
+                )
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut first_successful_endpoint = None;
     let mut successful_endpoints = Vec::new();
     let mut returned_signatures = Vec::new();
     let mut errors = Vec::new();
-    for (endpoint, result) in endpoint_results {
+    while let Some((endpoint, result)) = endpoint_results.next().await {
         match result {
             Ok(value) => {
+                if first_successful_endpoint.is_none() {
+                    first_successful_endpoint = Some(endpoint.clone());
+                }
                 if let Some(signature) = value.as_str() {
                     returned_signatures.push(signature.to_string());
                 }
@@ -978,11 +1226,17 @@ async fn submit_single_transaction_helius_sender(
             signature: Some(signature.clone()),
             explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
             transportType: "helius-sender".to_string(),
-            endpoint: successful_endpoints.first().cloned(),
+            endpoint: first_successful_endpoint,
             attemptedEndpoints: endpoints.to_vec(),
             skipPreflight: true,
             maxRetries: 0,
             confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: Some(current_time_ms()),
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
             sendObservedBlockHeight: None,
             confirmedObservedBlockHeight: None,
             confirmedSlot: None,
@@ -1020,7 +1274,10 @@ pub async fn submit_transactions_helius_sender_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_current_block_height(rpc_url, commitment).await.ok();
+        let send_observed_block_height =
+            fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                .await
+                .ok();
         for result in &mut sent {
             result.sendObservedBlockHeight = send_observed_block_height;
         }
@@ -1111,7 +1368,9 @@ pub async fn submit_transactions_bundle(
         .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
         .collect::<Vec<_>>();
     let send_observed_block_height = if track_send_block_height {
-        fetch_current_block_height(rpc_url, commitment).await.ok()
+        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok()
     } else {
         None
     };
@@ -1132,6 +1391,12 @@ pub async fn submit_transactions_bundle(
             skipPreflight: true,
             maxRetries: 0,
             confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: Some(current_time_ms()),
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
             sendObservedBlockHeight: send_observed_block_height,
             confirmedObservedBlockHeight: None,
             confirmedSlot: None,
@@ -1235,7 +1500,9 @@ pub async fn confirm_transactions_bundle(
                     .cloned()
                     .unwrap_or_default();
                 let confirmed_observed_block_height = if track_send_block_height {
-                    fetch_current_block_height(rpc_url, commitment).await.ok()
+                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                        .await
+                        .ok()
                 } else {
                     None
                 };
@@ -1251,6 +1518,11 @@ pub async fn confirm_transactions_bundle(
                         .as_ref()
                         .map(|value| format!("https://solscan.io/tx/{value}"));
                     result.confirmationStatus = Some(actual.to_string());
+                    result.confirmationSource = Some("jito-bundle-status".to_string());
+                    result.firstObservedStatus = Some(actual.to_string());
+                    result.firstObservedSlot = confirmed_slot;
+                    result.firstObservedAtMs = Some(current_time_ms());
+                    result.confirmedAtMs = result.firstObservedAtMs;
                     result.confirmedObservedBlockHeight = confirmed_observed_block_height;
                     result.confirmedSlot = confirmed_slot;
                     result.bundleId = Some(bundle_id.clone());
@@ -1364,7 +1636,9 @@ pub async fn send_transactions_helius_sender(
                 submit_single_transaction_helius_sender(endpoints, transaction).await?;
             if track_send_block_height {
                 sent.sendObservedBlockHeight =
-                    fetch_current_block_height(rpc_url, commitment).await.ok();
+                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                        .await
+                        .ok();
             }
             submit_ms += submit_started.elapsed().as_millis();
             warnings.extend(entry_warnings);

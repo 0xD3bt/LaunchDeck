@@ -1,3 +1,4 @@
+const bootOverlay = document.getElementById("boot-overlay");
 const form = document.getElementById("launch-form");
 const output = document.getElementById("output");
 const statusNode = document.getElementById("status");
@@ -8,6 +9,10 @@ const reportsTerminalList = document.getElementById("reports-terminal-list");
 const reportsTerminalOutput = document.getElementById("reports-terminal-output");
 const reportsTerminalMeta = document.getElementById("reports-terminal-meta");
 const reportsTerminalResizeHandle = document.getElementById("reports-terminal-resize-handle");
+const benchmarksPopoutModal = document.getElementById("benchmarks-popout-modal");
+const benchmarksPopoutTitle = document.getElementById("benchmarks-popout-title");
+const benchmarksPopoutClose = document.getElementById("benchmarks-popout-close");
+const benchmarksPopoutBody = document.getElementById("benchmarks-popout-body");
 const buttons = Array.from(document.querySelectorAll("[data-action]"));
 const shellMain = document.querySelector(".shell");
 const workspaceShell = document.querySelector(".workspace-shell");
@@ -326,6 +331,14 @@ let appBootstrapState = {
   walletsLoaded: false,
   runtimeLoaded: false,
 };
+let startupWarmState = {
+  started: false,
+  ready: false,
+  promise: null,
+  enabled: true,
+};
+const STARTUP_WARM_REQUEST_TIMEOUT_MS = 4000;
+const STARTUP_WARM_WAIT_TIMEOUT_MS = 1500;
 let quoteTimer = null;
 let defaultsApplied = false;
 const requestStates = {
@@ -390,11 +403,14 @@ let reportsTerminalState = {
   launchMetadataByUri: {},
   activeId: "",
   activePayload: null,
+  activeBenchmarkReportId: "",
+  activeBenchmarkSnapshot: null,
   activeText: "",
   activeTab: "overview",
   view: "transactions",
   sort: "newest",
 };
+let reportsTerminalLoadSerial = 0;
 let reportsTerminalResizeState = null;
 let followJobsState = {
   configured: false,
@@ -1001,6 +1017,12 @@ reportsFeature.bindEvents();
 
 if (reportsTerminalOutput) {
   reportsTerminalOutput.addEventListener("click", async (event) => {
+    const benchmarkPopoutButton = event.target.closest("[data-benchmark-popout]");
+    if (benchmarkPopoutButton) {
+      if (benchmarkPopoutButton.disabled) return;
+      showBenchmarksPopoutModal();
+      return;
+    }
     const cancelAllButton = event.target.closest("[data-follow-cancel-all]");
     if (cancelAllButton) {
       if (cancelAllButton.disabled) return;
@@ -1626,6 +1648,15 @@ function getConfig() {
     : createFallbackConfig();
 }
 
+function isTrackSendBlockHeightEnabled(config = getConfig()) {
+  return Boolean(
+    config
+    && config.defaults
+    && config.defaults.misc
+    && config.defaults.misc.trackSendBlockHeight,
+  );
+}
+
 function getPresetItems(config = getConfig()) {
   return config && config.presets && Array.isArray(config.presets.items)
     ? config.presets.items
@@ -1924,21 +1955,29 @@ function renderProvisionalDevBuyPreview(shape) {
   quoteOutput.textContent = `Estimating ${getQuoteAssetLabel(shape.quoteAsset)} curve position...`;
 }
 
-function warmDevBuyQuoteCache() {
+function warmDevBuyQuoteCache(signal) {
+  if (!startupWarmState.enabled) return Promise.resolve();
   const baseShape = getDevBuyQuoteRequestShape("sol", "");
+  const baseShapes = [
+    baseShape,
+    { ...baseShape, launchpad: "bonk", launchMode: "regular", quoteAsset: "sol", mode: "sol" },
+    { ...baseShape, launchpad: "bonk", launchMode: "regular", quoteAsset: "usd1", mode: "sol" },
+    { ...baseShape, launchpad: "bonk", launchMode: "bonkers", quoteAsset: "sol", mode: "sol" },
+    { ...baseShape, launchpad: "bonk", launchMode: "bonkers", quoteAsset: "usd1", mode: "sol" },
+  ];
   const amounts = Array.from(new Set(
     getQuickDevBuyPresetAmounts()
       .map((value) => normalizeDecimalInput(value, 9))
       .filter(Boolean),
   ));
-  amounts.forEach((amount) => {
-    const shape = { ...baseShape, amount };
-    if (getCachedDevBuyQuote(shape)) return;
+  const warmRequests = baseShapes.flatMap((base) => amounts.map((amount) => {
+    const shape = { ...base, amount };
+    if (getCachedDevBuyQuote(shape)) return Promise.resolve();
     const key = getDevBuyQuoteCacheKey(shape);
-    if (devBuyQuoteWarmInFlight.has(key)) return;
+    if (devBuyQuoteWarmInFlight.has(key)) return Promise.resolve();
     devBuyQuoteWarmInFlight.add(key);
     const url = `/api/quote?launchpad=${encodeURIComponent(shape.launchpad)}&quoteAsset=${encodeURIComponent(shape.quoteAsset)}&launchMode=${encodeURIComponent(shape.launchMode)}&mode=${encodeURIComponent(shape.mode)}&amount=${encodeURIComponent(shape.amount)}`;
-    fetch(url)
+    return fetch(url, signal ? { signal } : undefined)
       .then((response) => response.json().then((payload) => ({ response, payload })))
       .then(({ response, payload }) => {
         if (response.ok && payload && payload.ok && payload.quote) {
@@ -1949,7 +1988,48 @@ function warmDevBuyQuoteCache() {
       .finally(() => {
         devBuyQuoteWarmInFlight.delete(key);
       });
+  }));
+  return Promise.allSettled(warmRequests);
+}
+
+function beginStartupWarmup() {
+  if (!startupWarmState.enabled) {
+    startupWarmState.started = true;
+    startupWarmState.ready = true;
+    startupWarmState.promise = Promise.resolve();
+    return startupWarmState.promise;
+  }
+  if (startupWarmState.started) {
+    return startupWarmState.promise || Promise.resolve();
+  }
+  startupWarmState.started = true;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timeoutId = setTimeout(() => {
+    if (controller) controller.abort();
+  }, STARTUP_WARM_REQUEST_TIMEOUT_MS);
+  const backendWarm = fetch("/api/startup-warm", controller ? { method: "POST", signal: controller.signal } : { method: "POST" })
+    .then((response) => response.json().catch(() => ({})).then((payload) => ({ response, payload })))
+    .catch(() => ({ response: null, payload: null }));
+  const quoteWarm = Promise.resolve(warmDevBuyQuoteCache(controller ? controller.signal : undefined)).catch(() => {});
+  startupWarmState.promise = Promise.allSettled([backendWarm, quoteWarm]).finally(() => {
+    clearTimeout(timeoutId);
+    startupWarmState.ready = true;
   });
+  return startupWarmState.promise;
+}
+
+async function ensureStartupWarmReady() {
+  if (!startupWarmState.enabled) {
+    startupWarmState.ready = true;
+    return;
+  }
+  const warmPromise = beginStartupWarmup();
+  if (startupWarmState.ready) return;
+  metaNode.textContent = "Finalizing startup warmup so the first launch uses hot caches.";
+  await Promise.race([
+    warmPromise.catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, STARTUP_WARM_WAIT_TIMEOUT_MS)),
+  ]);
 }
 
 function applyDevBuyQuotePayload(quote, mode) {
@@ -3980,7 +4060,7 @@ function readForm() {
     enableJito: getProvider() === "jito-bundle" || Number(getNamedValue("creationTipSol") || 0) > 0,
     jitoTipSol: creationCapabilities.tip ? (getNamedValue("creationTipSol") || "") : "",
     skipPreflight: getNamedValue("skipPreflight") === "true",
-    trackSendBlockHeight: true,
+    trackSendBlockHeight: isTrackSendBlockHeightEnabled(),
     feeSplitEnabled: meaningfulFeeSplitEnabled,
     feeSplitRecipients: mode === "regular"
       ? (meaningfulFeeSplitEnabled ? collectFeeSplitRecipients() : [])
@@ -4308,6 +4388,9 @@ async function refreshWalletStatus(preserveSelection = true, force = false) {
 }
 
 function applyBootstrapFastPayload(payload) {
+  startupWarmState.enabled = payload && payload.startupWarm
+    ? payload.startupWarm.enabled !== false
+    : true;
   latestWalletStatus = {
     ...(latestWalletStatus || {}),
     selectedWalletKey: payload.selectedWalletKey || "",
@@ -4604,11 +4687,15 @@ async function bootstrapApp() {
     throw new Error(payload.error || "Failed to load app bootstrap.");
   }
   applyBootstrapFastPayload(payload);
-  refreshWalletStatus(true).catch(() => {});
+  const startupWarmPromise = beginStartupWarmup().catch(() => {});
+  const walletHydrationPromise = refreshWalletStatus(true).catch(() => {});
+  const runtimeHydrationPromise = refreshRuntimeStatus().catch(() => {});
   refreshBagsIdentityStatus().catch(() => {});
-  refreshRuntimeStatus().catch(() => {});
-  fetch("/api/lookup-tables/warm", { method: "POST" }).catch(() => {});
-  fetch("/api/pump-global/warm", { method: "POST" }).catch(() => {});
+  await Promise.allSettled([
+    startupWarmPromise,
+    walletHydrationPromise,
+    runtimeHydrationPromise,
+  ]);
 }
 
 async function refreshRuntimeStatus() {
@@ -5235,7 +5322,8 @@ function updateReportsTerminalSummaryEntry(entry) {
 
 function applyLiveReportSnapshotToOutput(payload) {
   const entryId = payload && payload.entry && payload.entry.id ? payload.entry.id : "";
-  const bundle = payload && payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  const rawBundle = payload && payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  const bundle = applyFrozenBenchmarkSnapshot(entryId, rawBundle);
   const report = bundle && bundle.report && typeof bundle.report === "object" ? bundle.report : null;
   if (payload && payload.entry && typeof payload.entry === "object") {
     updateReportsTerminalSummaryEntry(payload.entry);
@@ -5245,6 +5333,9 @@ function applyLiveReportSnapshotToOutput(payload) {
   }
   if (report) {
     metaNode.textContent = buildOutputMetaTextFromReport(report);
+  }
+  if (entryId && outputFollowRefreshState.reportId === entryId) {
+    reportsTerminalState.activeId = entryId;
   }
   if (entryId && reportsTerminalState.activeId === entryId && normalizeReportsTerminalView(reportsTerminalState.view) === "transactions") {
     reportsTerminalState.activePayload = bundle;
@@ -5302,15 +5393,18 @@ async function run(action) {
   if (!ensureInteractiveBootstrapReady()) return;
   const actualAction = action === "deploy" ? "send" : action;
   const label = action === "deploy" ? "Deploying..." : action === "simulate" ? "Simulating..." : "Building...";
-  const clientActionStartedAt = performance.now();
   setBusy(true, label);
   output.textContent = "Working...";
   stopOutputFollowRefresh();
 
   try {
     await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    await ensureStartupWarmReady();
+    const clientActionStartedAt = performance.now();
     await ensureMetadataReadyForAction(actualAction);
+    const requestPayloadStartedAt = performance.now();
     const formPayload = readForm();
+    const prepareRequestPayloadMs = Math.max(0, Math.round(performance.now() - requestPayloadStartedAt));
     const clientPreRequestMs = Math.max(0, Math.round(performance.now() - clientActionStartedAt));
     const response = await fetch("/api/run", {
       method: "POST",
@@ -5319,6 +5413,7 @@ async function run(action) {
         action: actualAction,
         form: formPayload,
         clientPreRequestMs,
+        prepareRequestPayloadMs,
       }),
     });
     const payload = await response.json();
@@ -5336,6 +5431,13 @@ async function run(action) {
     setBusy(false, currentStatusLabel());
     if (payload.sendLogPath) {
       const reportId = extractReportIdFromPath(payload.sendLogPath);
+      if (reportId && normalizeReportsTerminalView(reportsTerminalState.view) === "transactions") {
+        reportsTerminalState.activeId = reportId;
+        reportsTerminalState.activePayload = null;
+        reportsTerminalState.activeText = "Loading latest report...";
+        renderReportsTerminalOutput();
+        renderReportsTerminalList();
+      }
       refreshReportsTerminal({
         preserveSelection: false,
         preferId: reportId,
@@ -5796,6 +5898,68 @@ function describeReportEntry(entry) {
   return parts.join(" | ");
 }
 
+function cloneReportValue(value) {
+  if (value == null) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_error) {
+    return value;
+  }
+}
+
+function hasReportObjectFields(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length);
+}
+
+function captureFrozenBenchmarkSnapshot(reportId, payload) {
+  const normalizedId = String(reportId || "").trim();
+  if (!normalizedId || !payload || typeof payload !== "object") return;
+  const report = payload.report && typeof payload.report === "object" ? payload.report : null;
+  if (!report) return;
+  const benchmark = report.benchmark && typeof report.benchmark === "object" ? report.benchmark : null;
+  const executionTimings = report.execution && report.execution.timings && typeof report.execution.timings === "object"
+    ? report.execution.timings
+    : null;
+  const hasBenchmark = hasReportObjectFields(benchmark);
+  const hasExecutionTimings = hasReportObjectFields(executionTimings);
+  if (!hasBenchmark && !hasExecutionTimings) return;
+  const previous = reportsTerminalState.activeBenchmarkReportId === normalizedId
+    ? reportsTerminalState.activeBenchmarkSnapshot
+    : null;
+  reportsTerminalState.activeBenchmarkReportId = normalizedId;
+  reportsTerminalState.activeBenchmarkSnapshot = {
+    benchmark: hasBenchmark ? cloneReportValue(benchmark) : cloneReportValue(previous && previous.benchmark),
+    executionTimings: hasExecutionTimings
+      ? cloneReportValue(executionTimings)
+      : cloneReportValue(previous && previous.executionTimings),
+  };
+}
+
+function applyFrozenBenchmarkSnapshot(reportId, payload) {
+  const normalizedId = String(reportId || "").trim();
+  if (!normalizedId || !payload || typeof payload !== "object") return payload;
+  if (reportsTerminalState.activeBenchmarkReportId !== normalizedId) return payload;
+  const snapshot = reportsTerminalState.activeBenchmarkSnapshot;
+  if (!snapshot) return payload;
+  const report = payload.report && typeof payload.report === "object" ? payload.report : null;
+  if (!report) return payload;
+  const nextPayload = cloneReportValue(payload);
+  const nextReport = nextPayload.report && typeof nextPayload.report === "object" ? nextPayload.report : null;
+  if (!nextReport) return payload;
+  if (!hasReportObjectFields(nextReport.benchmark) && hasReportObjectFields(snapshot.benchmark)) {
+    nextReport.benchmark = cloneReportValue(snapshot.benchmark);
+  }
+  if (nextReport.execution && typeof nextReport.execution === "object") {
+    if (
+      !hasReportObjectFields(nextReport.execution.timings)
+      && hasReportObjectFields(snapshot.executionTimings)
+    ) {
+      nextReport.execution.timings = cloneReportValue(snapshot.executionTimings);
+    }
+  }
+  return nextPayload;
+}
+
 function normalizeReportsTerminalTab(tab) {
   const normalized = String(tab || "").trim().toLowerCase();
   return ["overview", "actions", "benchmarks", "raw"].includes(normalized) ? normalized : "overview";
@@ -5849,13 +6013,14 @@ function parseReportMetricNumber(value) {
   return Number.isFinite(numeric) ? numeric : null;
 }
 
-function buildTimingMetricItem(label, value, detail = "", { hideZero = false } = {}) {
+function buildTimingMetricItem(label, value, detail = "", { hideZero = false, tone = "" } = {}) {
   const numeric = parseReportMetricNumber(value);
   if (numeric == null || (hideZero && numeric === 0)) return null;
   return {
     label,
     value: formatReportMetric(numeric, "ms"),
     detail,
+    tone,
   };
 }
 
@@ -5873,7 +6038,7 @@ function deriveRemainingTiming(totalValue, childValues = []) {
   return Math.max(0, total - consumed);
 }
 
-function buildBenchmarkTimingSections(timings = {}) {
+function buildLegacyBenchmarkTimingSections(timings = {}) {
   const compileTotal = parseReportMetricNumber(timings.compileTransactionsMs);
   const compileAltLoad = parseReportMetricNumber(timings.compileAltLoadMs);
   const compileBlockhash = parseReportMetricNumber(timings.compileBlockhashFetchMs);
@@ -5930,6 +6095,179 @@ function buildBenchmarkTimingSections(timings = {}) {
       buildTimingMetricItem("Launch confirm", launchConfirm, "launch tx only", { hideZero: true }),
       buildTimingMetricItem("Setup confirm", timings.bagsSetupConfirmMs, "setup tx confirm", { hideZero: true }),
       buildTimingMetricItem("Send other", sendOther, "remaining transport overhead", { hideZero: true }),
+    ],
+  };
+}
+
+function benchmarkModeLabel(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "off") return "Off";
+  if (normalized === "basic") return "Basic";
+  if (normalized === "full") return "Full";
+  return String(mode || "").trim();
+}
+
+function benchmarkMetricCardFromGroupItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const numeric = parseReportMetricNumber(item.valueMs != null ? item.valueMs : item.value);
+  if (numeric == null) return null;
+  const detailParts = [];
+  if (item.detail) detailParts.push(String(item.detail));
+  if (item.inclusive) detailParts.push("Inclusive total");
+  if (item.remainder) detailParts.push("Remainder");
+  return {
+    label: String(item.label || item.key || "--"),
+    value: formatReportMetric(numeric, "ms"),
+    detail: detailParts.join(" | "),
+  };
+}
+
+function benchmarkTimingGroupsFromPayload(benchmark = {}, execution = {}) {
+  const groups = Array.isArray(benchmark.timingGroups) ? benchmark.timingGroups : [];
+  if (groups.length) {
+    return groups.map((group) => ({
+      key: String(group.key || ""),
+      label: String(group.label || group.key || "Timings"),
+      items: Array.isArray(group.items) ? group.items.map(benchmarkMetricCardFromGroupItem).filter(Boolean) : [],
+    }));
+  }
+  const timings = benchmark.timings || execution.timings || {};
+  const legacy = buildLegacyBenchmarkTimingSections(timings);
+  return [
+    { key: "topLevel", label: "Top-Level Timings", items: legacy.topLevel },
+    { key: "prep", label: "Preparation", items: legacy.prep },
+    { key: "compile", label: "Compile Breakdown", items: legacy.compile },
+    { key: "send", label: "Send Breakdown", items: legacy.send },
+  ];
+}
+
+function benchmarkTimingGroupByKey(groups, key) {
+  return Array.isArray(groups) ? groups.find((group) => group && group.key === key) : null;
+}
+
+function sumMetricNumbers(values = []) {
+  let total = 0;
+  let hasAny = false;
+  values.forEach((value) => {
+    const numeric = parseReportMetricNumber(value);
+    if (numeric == null) return;
+    total += numeric;
+    hasAny = true;
+  });
+  return hasAny ? total : null;
+}
+
+function deriveBenchmarkRollup(timings = {}) {
+  const totalElapsed = parseReportMetricNumber(timings.totalElapsedMs);
+  const clientPreRequest = parseReportMetricNumber(timings.clientPreRequestMs);
+  const prepareRequestPayload = parseReportMetricNumber(timings.prepareRequestPayloadMs);
+  const backendTotal = parseReportMetricNumber(timings.backendTotalElapsedMs);
+  const backendPrep = sumMetricNumbers([
+    timings.formToRawConfigMs,
+    timings.normalizeConfigMs,
+    timings.walletLoadMs,
+    timings.reportBuildMs,
+  ]);
+  const backendOrchestration = sumMetricNumbers([
+    timings.transportPlanBuildMs,
+    timings.autoFeeResolveMs,
+    timings.sameTimeFeeGuardMs,
+    timings.followDaemonReadyMs,
+    timings.followDaemonReserveMs,
+    timings.followDaemonArmMs,
+    timings.followDaemonStatusRefreshMs,
+  ]);
+  const compileTotal = parseReportMetricNumber(timings.compileTransactionsMs);
+  const simulateTotal = parseReportMetricNumber(timings.simulateMs);
+  const sendTotal = parseReportMetricNumber(timings.sendMs);
+  const reportingOverhead = sumMetricNumbers([
+    timings.reportingOverheadMs,
+  ]) ?? sumMetricNumbers([
+    timings.persistInitialSnapshotMs,
+    timings.persistFinalReportUpdateMs,
+    timings.followSnapshotFlushMs,
+    timings.reportRenderMs,
+    timings.reportListRefreshMs,
+  ]);
+  const clientRemainder = deriveRemainingTiming(clientPreRequest, [prepareRequestPayload]);
+  const backendMeasured = sumMetricNumbers([
+    backendPrep,
+    backendOrchestration,
+    compileTotal,
+    simulateTotal,
+    sendTotal,
+    reportingOverhead,
+  ]);
+  const backendRemainder = deriveRemainingTiming(backendTotal, [backendMeasured]);
+  const executionDerived = backendTotal != null
+    ? Math.max(0, backendTotal - (reportingOverhead || 0))
+    : parseReportMetricNumber(timings.executionTotalMs);
+  const endToEndRemainder = deriveRemainingTiming(totalElapsed, [clientPreRequest, backendTotal]);
+  return {
+    totalElapsed,
+    clientPreRequest,
+    prepareRequestPayload,
+    clientRemainder,
+    backendTotal,
+    backendPrep,
+    backendOrchestration,
+    compileTotal,
+    simulateTotal,
+    sendTotal,
+    reportingOverhead,
+    backendRemainder,
+    executionDerived,
+    endToEndRemainder,
+  };
+}
+
+function buildBenchmarkHeadlineCards(timings = {}) {
+  const rollup = deriveBenchmarkRollup(timings);
+  const submitTotal = parseReportMetricNumber(timings.sendSubmitMs);
+  const confirmWait = parseReportMetricNumber(timings.sendConfirmMs);
+  const submittedTotal = sumMetricNumbers([
+    rollup.clientPreRequest,
+    rollup.backendPrep,
+    rollup.backendOrchestration,
+    rollup.compileTotal,
+    rollup.simulateTotal,
+    submitTotal,
+  ]);
+  return [
+    buildTimingMetricItem("Submitted", submittedTotal, "client + backend through provider acceptance", { tone: "primary" }),
+    buildTimingMetricItem("Confirmed", rollup.totalElapsed, "full path including confirmation"),
+    buildTimingMetricItem("Confirm wait", confirmWait, "provider/RPC confirmation latency", { tone: "muted" }),
+  ].filter(Boolean);
+}
+
+function buildBenchmarkReconciliationSections(timings = {}, benchmarkMode = "") {
+  const rollup = deriveBenchmarkRollup(timings);
+  const modeLabel = benchmarkModeLabel(benchmarkMode || timings.benchmarkMode);
+  return {
+    topLevel: [
+      buildTimingMetricItem("End-to-end", rollup.totalElapsed, "top-level wall time for this report"),
+      buildTimingMetricItem("Client overhead", rollup.clientPreRequest, "before backend work starts"),
+      buildTimingMetricItem("Backend total", rollup.backendTotal, "all backend-observed work"),
+      buildTimingMetricItem("End-to-end remainder", rollup.endToEndRemainder, "time not explained by client + backend totals", { hideZero: true }),
+    ],
+    client: [
+      buildTimingMetricItem("Client overhead", rollup.clientPreRequest, "inclusive client-side total"),
+      buildTimingMetricItem("Prepare request payload", rollup.prepareRequestPayload, "form serialization before the POST"),
+      buildTimingMetricItem("Client remainder", rollup.clientRemainder, "client time not broken into smaller steps yet", { hideZero: true }),
+    ],
+    backend: [
+      buildTimingMetricItem("Backend total", rollup.backendTotal, "inclusive backend total"),
+      buildTimingMetricItem("Execution total", rollup.executionDerived, "backend total minus reporting overhead"),
+      buildTimingMetricItem("Prep subtotal", rollup.backendPrep, "normalize + wallet + routing + fee/follow setup + initial report"),
+      buildTimingMetricItem("Orchestration subtotal", rollup.backendOrchestration, "transport planning, auto-fee work, and follow daemon control calls"),
+      buildTimingMetricItem("Compile total", rollup.compileTotal, "inclusive compile stage"),
+      buildTimingMetricItem("Simulate total", rollup.simulateTotal, "inclusive simulate stage"),
+      buildTimingMetricItem("Send total", rollup.sendTotal, "inclusive send stage"),
+      buildTimingMetricItem("Reporting overhead", rollup.reportingOverhead, "persist/render/report-sync work kept out of core execution"),
+      buildTimingMetricItem("Backend remainder", rollup.backendRemainder, modeLabel === "Basic"
+        ? "backend time not broken into smaller steps in basic mode"
+        : "backend time not yet broken into smaller steps", { hideZero: true }),
     ],
   };
 }
@@ -6021,6 +6359,51 @@ function formatLaunchTransactionLabel(label) {
   return normalized;
 }
 
+function formatTransportLabel(transportType) {
+  const normalized = String(transportType || "").trim().toLowerCase();
+  if (!normalized) return "--";
+  if (normalized === "helius-sender") return "Helius Sender";
+  if (normalized.startsWith("standard-rpc")) return "Standard RPC";
+  if (normalized === "jito-bundle") return "Jito Bundle";
+  return String(transportType || "").trim();
+}
+
+function buildBagsLaunchPhaseSummary(report, execution = {}) {
+  const launchpad = String(report && report.launchpad || "").trim().toLowerCase();
+  if (launchpad !== "bagsapp") return null;
+  const sent = Array.isArray(execution.sent) ? execution.sent : [];
+  const launchItems = sent.filter((item) => String(item && item.label || "").trim().toLowerCase() === "launch");
+  const setupItems = sent.filter((item) => !launchItems.includes(item));
+  const uniqueSetupTransports = Array.from(new Set(
+    setupItems.map((item) => formatTransportLabel(item && item.transportType)).filter((value) => value && value !== "--"),
+  ));
+  const uniqueLaunchTransports = Array.from(new Set(
+    launchItems.map((item) => formatTransportLabel(item && item.transportType)).filter((value) => value && value !== "--"),
+  ));
+  return {
+    cards: [
+      {
+        label: "Launch Phases",
+        value: setupItems.length ? "Setup + launch" : "Launch only",
+        detail: setupItems.length
+          ? `${setupItems.length} setup tx before final token creation`
+          : "Single tracked launch phase",
+      },
+      {
+        label: "Setup Phase",
+        value: setupItems.length ? `${setupItems.length} tx` : "--",
+        detail: uniqueSetupTransports.length ? uniqueSetupTransports.join(" | ") : "No setup transactions recorded",
+      },
+      {
+        label: "Final Launch",
+        value: launchItems.length ? `${launchItems.length} tx` : "--",
+        detail: uniqueLaunchTransports.length ? uniqueLaunchTransports.join(" | ") : "Final launch transport unavailable",
+      },
+    ],
+    note: "Bags launches are slower because they first submit and confirm setup/config transactions before the final token creation transaction. Those extra setup transactions are intentionally included in the report and benchmark path.",
+  };
+}
+
 function followActionRouteDetails(action, followJob) {
   const kind = String(action && action.kind || "").trim().toLowerCase();
   const execution = followJob && followJob.execution && typeof followJob.execution === "object"
@@ -6095,6 +6478,43 @@ function buildWatcherDetail(mode, fallbackReason) {
   return parts.join(" | ");
 }
 
+function buildCombinedFollowWatcherCard(actions = [], health = null) {
+  const relevantActions = actions.filter((action) => {
+    const kind = String(action && action.kind || "").trim().toLowerCase();
+    return ["sniper-buy", "sniper-sell", "dev-auto-sell"].includes(kind);
+  });
+  const actionModes = Array.from(new Set(
+    relevantActions
+      .map((action) => formatWatcherModeLabel(action && action.watcherMode))
+      .filter(Boolean),
+  ));
+  const healthModes = Array.from(new Set(
+    [
+      health && health.slotWatcherMode,
+      health && health.signatureWatcherMode,
+      health && health.marketWatcherMode,
+    ]
+      .map((mode) => formatWatcherModeLabel(mode))
+      .filter(Boolean),
+  ));
+  const modes = actionModes.length ? actionModes : healthModes;
+  const endpointLabel = shortenReportEndpoint(health && health.watchEndpoint);
+  if (!modes.length && (!endpointLabel || endpointLabel === "--")) return null;
+  const detailParts = [];
+  if (modes.length === 1) {
+    detailParts.push(`Mode: ${modes[0]}`);
+  } else if (modes.length > 1) {
+    detailParts.push(`Modes: ${modes.join(" | ")}`);
+  }
+  return {
+    label: "Follow Watcher WS",
+    value: endpointLabel && endpointLabel !== "--"
+      ? endpointLabel
+      : (modes.length === 1 ? modes[0] : "Mixed"),
+    detail: detailParts.join(" | "),
+  };
+}
+
 function renderCopyableHash(value, label = "Copy hash") {
   const raw = String(value || "").trim();
   if (!raw) return "--";
@@ -6158,7 +6578,7 @@ function renderReportMetricGrid(items = []) {
   return `
     <div class="reports-metric-grid">
       ${visible.map((item) => `
-        <div class="reports-metric-card">
+        <div class="reports-metric-card${item.tone ? ` is-${escapeHTML(String(item.tone))}` : ""}">
           <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
           <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
           ${item.detail ? `<span class="reports-metric-note">${escapeHTML(String(item.detail))}</span>` : ""}
@@ -6175,14 +6595,19 @@ function buildReportsOverviewMarkup() {
   const execution = currentReportsTerminalExecution() || {};
   const benchmark = currentReportsTerminalBenchmark() || {};
   const timings = benchmark.timings || execution.timings || {};
-  const benchmarkSections = buildBenchmarkTimingSections(timings);
+  const benchmarkGroups = benchmarkTimingGroupsFromPayload(benchmark, execution);
+  const topLevelGroup = benchmarkTimingGroupByKey(benchmarkGroups, "topLevel") || benchmarkGroups[0] || { items: [] };
   const health = report && report.followDaemon && report.followDaemon.health ? report.followDaemon.health : null;
   const job = currentReportsTerminalFollowJob();
   const actions = currentReportsTerminalFollowActions();
+  const benchmarkMode = benchmarkModeLabel(benchmark.mode || (timings && timings.benchmarkMode));
+  const launchSpeedCards = buildBenchmarkHeadlineCards(timings);
+  const bagsLaunchPhaseSummary = buildBagsLaunchPhaseSummary(report, execution);
   const providerCardLabel = job ? "Launch Provider" : "Provider";
   const transportCardLabel = job ? "Launch Transport" : "Transport";
   const problemCount = actions.filter((action) => ["failed", "cancelled", "expired"].includes(String(action.state || "").toLowerCase())).length;
   const runningCount = actions.filter((action) => ["running", "eligible", "armed", "queued", "sent"].includes(String(action.state || "").toLowerCase())).length;
+  const combinedWatcherCard = buildCombinedFollowWatcherCard(actions, health);
   const overviewCards = [
     { label: "Action", value: entry && entry.action ? entry.action : payload && payload.action ? payload.action : "--" },
     { label: "Mint", value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--" },
@@ -6194,9 +6619,7 @@ function buildReportsOverviewMarkup() {
     { label: "Follow Actions", value: actions.length ? `${actions.length} total` : "0" },
     { label: "Problems", value: String(problemCount) },
     { label: "Running", value: String(runningCount) },
-    buildTimingMetricItem("Submit total", timings.sendSubmitMs, "child of send total"),
-    buildTimingMetricItem("Confirm total", timings.sendConfirmMs, "child of send total"),
-  ];
+  ].concat(combinedWatcherCard ? [combinedWatcherCard] : []);
   const watcherCards = health
     ? [
       { label: "Slot Watcher", value: health.slotWatcher || "--", detail: buildWatcherDetail(health.slotWatcherMode) },
@@ -6213,10 +6636,34 @@ function buildReportsOverviewMarkup() {
         <div class="reports-panel-title">Overview</div>
         ${renderReportMetricGrid(overviewCards)}
       </section>
+      ${bagsLaunchPhaseSummary ? `
+        <section class="reports-panel-section">
+          <div class="reports-panel-title">Bags Launch Phases</div>
+          ${renderReportMetricGrid(bagsLaunchPhaseSummary.cards)}
+          <div class="reports-callout is-bad">${escapeHTML(bagsLaunchPhaseSummary.note)}</div>
+        </section>
+      ` : ""}
+      ${launchSpeedCards.length ? `
+        <section class="reports-panel-section reports-panel-section-launch-speed">
+          <div class="reports-panel-title">Launch Speed</div>
+          <div class="reports-panel-note">Submission is the steadier execution metric. Confirmation varies more between runs because it depends on provider/RPC observation latency.</div>
+          <div class="reports-metric-grid reports-metric-grid-launch-speed">
+            ${launchSpeedCards.map((item) => `
+              <div class="reports-metric-card${item.tone ? ` is-${escapeHTML(String(item.tone))}` : ""}">
+                <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
+                <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
+                ${item.detail ? `<span class="reports-metric-note">${escapeHTML(String(item.detail))}</span>` : ""}
+              </div>
+            `).join("")}
+          </div>
+        </section>
+      ` : ""}
       <section class="reports-panel-section">
         <div class="reports-panel-title">Stage Totals</div>
-        <div class="reports-panel-note">Totals are inclusive. Child timings are broken out on the Benchmarks tab.</div>
-        ${renderReportMetricGrid(benchmarkSections.topLevel)}
+        <div class="reports-panel-note">
+          ${benchmarkMode ? `Benchmark mode: ${escapeHTML(benchmarkMode)}. ` : ""}Totals are inclusive. Child timings and remainders are broken out on the Benchmarks tab.
+        </div>
+        ${renderReportMetricGrid(topLevelGroup.items || [])}
       </section>
       ${watcherCards.length ? `
         <section class="reports-panel-section">
@@ -6230,15 +6677,23 @@ function buildReportsOverviewMarkup() {
 }
 
 function buildReportsActionsMarkup() {
+  const report = currentReportsTerminalReport();
   const execution = currentReportsTerminalExecution() || {};
   const followJob = currentReportsTerminalFollowJob();
   const actions = currentReportsTerminalFollowActions();
   const launchSends = Array.isArray(execution.sent) ? execution.sent : [];
+  const bagsLaunchPhaseSummary = buildBagsLaunchPhaseSummary(report, execution);
   if (!launchSends.length && !actions.length) {
     return '<div class="reports-terminal-empty">No action data available in this report.</div>';
   }
   return `
     <div class="reports-panel-stack">
+      ${bagsLaunchPhaseSummary ? `
+        <section class="reports-panel-section">
+          <div class="reports-panel-title">Bags Launch Phases</div>
+          <div class="reports-callout is-bad">${escapeHTML(bagsLaunchPhaseSummary.note)}</div>
+        </section>
+      ` : ""}
       ${launchSends.length ? `
         <section class="reports-panel-section">
           <div class="reports-panel-title">Launch Send</div>
@@ -6303,27 +6758,55 @@ function buildReportsBenchmarksMarkup() {
   const benchmark = currentReportsTerminalBenchmark() || {};
   const execution = currentReportsTerminalExecution() || {};
   const timings = benchmark.timings || execution.timings || {};
-  const benchmarkSections = buildBenchmarkTimingSections(timings);
+  const benchmarkGroups = benchmarkTimingGroupsFromPayload(benchmark, execution);
   const sent = Array.isArray(benchmark.sent) && benchmark.sent.length ? benchmark.sent : (Array.isArray(execution.sent) ? execution.sent : []);
+  const benchmarkMode = benchmarkModeLabel(benchmark.mode || (timings && timings.benchmarkMode));
+  const launchSpeedCards = buildBenchmarkHeadlineCards(timings);
+  const reconciliation = buildBenchmarkReconciliationSections(timings, benchmark.mode || (timings && timings.benchmarkMode));
+  const timingSectionsMarkup = benchmarkGroups.length
+    ? benchmarkGroups.map((group) => `
+      <section class="reports-panel-section">
+        <div class="reports-panel-title">${escapeHTML(group.label || "Timings")}</div>
+        ${group.key === "topLevel"
+          ? '<div class="reports-panel-note">Inclusive totals and remainder buckets are separated so the path can be audited.</div>'
+          : ""}
+        ${renderReportMetricGrid(group.items || [])}
+      </section>
+    `).join("")
+    : '<section class="reports-panel-section"><div class="reports-terminal-empty">No benchmark timing groups are available for this report.</div></section>';
   return `
     <div class="reports-panel-stack">
+      ${benchmarkMode ? `<section class="reports-panel-section"><div class="reports-panel-title">Benchmark Mode</div><div class="reports-panel-note">${escapeHTML(benchmarkMode)} benchmark collection is active for this report.</div></section>` : ""}
+      ${launchSpeedCards.length ? `
+        <section class="reports-panel-section reports-panel-section-launch-speed">
+          <div class="reports-panel-title">Launch Speed</div>
+          <div class="reports-panel-note">Submitted is the steadier execution metric. Confirmed includes the variable provider/RPC confirmation wait.</div>
+          <div class="reports-metric-grid reports-metric-grid-launch-speed">
+            ${launchSpeedCards.map((item) => `
+              <div class="reports-metric-card${item.tone ? ` is-${escapeHTML(String(item.tone))}` : ""}">
+                <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
+                <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
+                ${item.detail ? `<span class="reports-metric-note">${escapeHTML(String(item.detail))}</span>` : ""}
+              </div>
+            `).join("")}
+          </div>
+        </section>
+      ` : ""}
       <section class="reports-panel-section">
-        <div class="reports-panel-title">Top-Level Timings</div>
-        <div class="reports-panel-note">Inclusive totals are shown separately from the nested work they contain.</div>
-        ${renderReportMetricGrid(benchmarkSections.topLevel)}
+        <div class="reports-panel-title">End-to-End Composition</div>
+        <div class="reports-panel-note">This section shows exactly what the top-line benchmark consists of before you scroll into the lower-level groups.</div>
+        ${renderReportMetricGrid(reconciliation.topLevel)}
       </section>
       <section class="reports-panel-section">
-        <div class="reports-panel-title">Preparation</div>
-        ${renderReportMetricGrid(benchmarkSections.prep)}
+        <div class="reports-panel-title">Client Composition</div>
+        ${renderReportMetricGrid(reconciliation.client)}
       </section>
       <section class="reports-panel-section">
-        <div class="reports-panel-title">Compile Breakdown</div>
-        ${renderReportMetricGrid(benchmarkSections.compile)}
+        <div class="reports-panel-title">Backend Composition</div>
+        <div class="reports-panel-note">If a remainder is non-zero, that is measured time inside the parent total that this report or benchmark mode has not broken into smaller named steps yet.</div>
+        ${renderReportMetricGrid(reconciliation.backend)}
       </section>
-      <section class="reports-panel-section">
-        <div class="reports-panel-title">Send Breakdown</div>
-        ${renderReportMetricGrid(benchmarkSections.send)}
-      </section>
+      ${timingSectionsMarkup}
       <section class="reports-panel-section">
         <div class="reports-panel-title">Chain Benchmark</div>
         ${sent.length ? `
@@ -6350,6 +6833,32 @@ function buildReportsBenchmarksMarkup() {
       </section>
     </div>
   `;
+}
+
+function buildBenchmarksPopoutTitle() {
+  return "Benchmark Popout";
+}
+
+function renderBenchmarksPopoutModal() {
+  if (!benchmarksPopoutModal || benchmarksPopoutModal.hidden || !benchmarksPopoutBody) return;
+  if (benchmarksPopoutTitle) {
+    benchmarksPopoutTitle.textContent = buildBenchmarksPopoutTitle();
+  }
+  const payload = currentReportsTerminalPayload();
+  benchmarksPopoutBody.innerHTML = payload
+    ? `<div class="benchmarks-popout-content">${buildReportsBenchmarksMarkup()}</div>`
+    : '<div class="reports-callout">Structured benchmark data is unavailable for this report.</div>';
+}
+
+function showBenchmarksPopoutModal() {
+  if (!benchmarksPopoutModal || !benchmarksPopoutBody) return;
+  benchmarksPopoutModal.hidden = false;
+  renderBenchmarksPopoutModal();
+}
+
+function hideBenchmarksPopoutModal() {
+  if (!benchmarksPopoutModal) return;
+  benchmarksPopoutModal.hidden = true;
 }
 
 function buildReportsRawMarkup() {
@@ -6870,6 +7379,15 @@ function buildReportsTerminalOutputMarkup() {
           ${escapeHTML(item.label)}
         </button>
       `).join("")}
+      <span class="reports-terminal-tabs-spacer"></span>
+      <button
+        type="button"
+        class="reports-terminal-tab reports-terminal-tab-icon"
+        data-benchmark-popout="1"
+        title="Open benchmark popout"
+        aria-label="Open benchmark popout"
+        ${payload ? "" : "disabled"}
+      >&#x29C9;</button>
     </div>
     <div class="reports-terminal-content">${content}</div>
   `;
@@ -6884,6 +7402,7 @@ function renderReportsTerminalOutput() {
   } else {
     reportsTerminalOutput.innerHTML = markup;
   }
+  renderBenchmarksPopoutModal();
 }
 
 function renderReportsTerminalList() {
@@ -6927,22 +7446,30 @@ function renderReportsTerminalList() {
 async function loadReportsTerminalEntry(id, { syncMainOutput = false } = {}) {
   if (!id || !reportsTerminalOutput) return;
   if (normalizeReportsTerminalView(reportsTerminalState.view) !== "transactions") return;
+  const loadSerial = ++reportsTerminalLoadSerial;
+  reportsTerminalState.activeId = id;
   reportsTerminalState.activePayload = null;
   reportsTerminalState.activeText = "Loading report...";
+  renderReportsTerminalList();
   renderReportsTerminalOutput();
   const url = `/api/reports/view?id=${encodeURIComponent(id)}`;
   const result = RequestUtils.fetchJsonLatest
     ? await RequestUtils.fetchJsonLatest("report-view", url, {}, requestStates.reportView)
     : null;
+  if (loadSerial !== reportsTerminalLoadSerial) return;
   if (result && result.aborted) return;
   const response = result ? result.response : await fetch(url);
   const payload = result ? result.payload : await response.json();
+  if (loadSerial !== reportsTerminalLoadSerial) return;
   if (result && !result.isLatest) return;
   if (!response.ok || !payload.ok) {
     throw new Error(payload.error || "Failed to load report.");
   }
-  reportsTerminalState.activeId = payload.entry && payload.entry.id ? payload.entry.id : id;
-  reportsTerminalState.activePayload = payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  const nextId = payload.entry && payload.entry.id ? payload.entry.id : id;
+  const rawActivePayload = payload.payload && typeof payload.payload === "object" ? payload.payload : null;
+  reportsTerminalState.activeId = nextId;
+  captureFrozenBenchmarkSnapshot(nextId, rawActivePayload);
+  reportsTerminalState.activePayload = applyFrozenBenchmarkSnapshot(nextId, rawActivePayload);
   reportsTerminalState.activeText = payload.text || "Report is empty.";
   if (syncMainOutput) {
     output.textContent = reportsTerminalState.activeText;
@@ -6991,6 +7518,8 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   if (normalizeReportsTerminalView(reportsTerminalState.view) === "launches") {
     await loadReportsTerminalLaunches();
     reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeBenchmarkReportId = "";
+    reportsTerminalState.activeBenchmarkSnapshot = null;
     reportsTerminalState.activeText = "";
     renderReportsTerminalList();
     renderReportsTerminalOutput();
@@ -6998,6 +7527,8 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   }
   if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-jobs") {
     reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeBenchmarkReportId = "";
+    reportsTerminalState.activeBenchmarkSnapshot = null;
     reportsTerminalState.activeText = "";
     renderReportsTerminalList();
     renderReportsTerminalOutput();
@@ -7006,6 +7537,8 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
   renderReportsTerminalList();
   if (!nextId) {
     reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeBenchmarkReportId = "";
+    reportsTerminalState.activeBenchmarkSnapshot = null;
     reportsTerminalState.activeText = "Run Build, Simulate, or Deploy to create persisted reports.";
     renderReportsTerminalOutput();
     return;
@@ -7874,6 +8407,14 @@ modalConfirm.addEventListener("click", () => {
   hideDeployModal();
   run("deploy");
 });
+if (benchmarksPopoutClose) benchmarksPopoutClose.addEventListener("click", hideBenchmarksPopoutModal);
+if (benchmarksPopoutModal) {
+  benchmarksPopoutModal.addEventListener("click", (event) => {
+    if (event.target === benchmarksPopoutModal) {
+      hideBenchmarksPopoutModal();
+    }
+  });
+}
 if (settingsCancel) settingsCancel.addEventListener("click", () => hideSettingsModal("cancel"));
 if (topPresetChipBar) {
   topPresetChipBar.addEventListener("click", (event) => {
@@ -8047,8 +8588,17 @@ setSettingsLoadingState(true);
 renderBackendRegionSummary(null);
 renderSniperUI();
 renderReportsTerminalOutput();
-completeInitialBoot();
-Promise.resolve(bootstrapApp()).catch((error) => {
-  if (walletBalance) walletBalance.textContent = "-";
-  metaNode.textContent = error.message;
-});
+Promise.resolve(bootstrapApp())
+  .then(() => {
+    completeInitialBoot();
+  })
+  .catch((error) => {
+    if (walletBalance) walletBalance.textContent = "-";
+    metaNode.textContent = error.message;
+    if (bootOverlay) {
+      const titleNode = bootOverlay.querySelector(".boot-overlay-title");
+      const noteNode = bootOverlay.querySelector(".boot-overlay-note");
+      if (titleNode) titleNode.textContent = "LaunchDeck failed to load";
+      if (noteNode) noteNode.textContent = error.message || "Refresh the page and check the backend runtime.";
+    }
+  });

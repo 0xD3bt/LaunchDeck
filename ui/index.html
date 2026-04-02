@@ -14,22 +14,24 @@
           document.documentElement.classList.add("output-hidden");
         }
         window.__launchdeckBootFallback = window.setTimeout(() => {
-          document.documentElement.classList.remove("boot-pending");
+          document.documentElement.classList.add("boot-stalled");
         }, 4000);
       } catch (_error) {
         // Ignore storage access failures before app boot.
       }
     </script>
-    <style>
-      html.boot-pending body {
-        visibility: hidden;
-      }
-    </style>
     <link rel="preload" as="image" href="/solana-mark.png">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <main class="shell">
+      <div id="boot-overlay" class="boot-overlay" aria-live="polite">
+        <div class="boot-overlay-card">
+          <div class="boot-spinner" aria-hidden="true"></div>
+          <div class="boot-overlay-title">Loading LaunchDeck</div>
+          <div class="boot-overlay-note">Preparing wallets, settings, caches, and runtime status.</div>
+        </div>
+      </div>
       <div class="workspace-shell">
       <form id="launch-form" class="flow">
         <section class="card launch-surface">
@@ -1136,6 +1138,19 @@
           <button type="button" id="modal-cancel" class="button">Cancel</button>
           <button type="button" id="modal-confirm" class="button deploy">Deploy to Mainnet</button>
         </div>
+      </div>
+    </div>
+
+    <div id="benchmarks-popout-modal" class="modal-overlay" hidden>
+      <div class="modal benchmarks-popout-modal">
+        <div class="modal-header">
+          <div class="settings-modal-heading">
+            <h3 id="benchmarks-popout-title">Benchmarks Popout</h3>
+            <div class="settings-modal-subtitle">Expanded benchmark view sized for clean screenshots.</div>
+          </div>
+          <button type="button" id="benchmarks-popout-close" class="modal-close">&times;</button>
+        </div>
+        <div id="benchmarks-popout-body" class="modal-body benchmarks-popout-body"></div>
       </div>
     </div>
 

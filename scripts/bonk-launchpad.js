@@ -38,12 +38,19 @@ const {
 const FIXED_COMPUTE_UNIT_LIMIT = 1_000_000;
 const TOKEN_DECIMALS = 6;
 const PACKET_LIMIT = 1232;
+const BASE64_PACKET_LIMIT = Math.ceil(PACKET_LIMIT / 3) * 4;
+const BONK_USD1_SUPER_LOOKUP_TABLE = "GHVFasDr4sFtF2fMNBLnaRUKeSxX77DgK5SsThB3Ro7U";
 const LETSBONK_PLATFORM = new PublicKey("FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1");
 const BONKERS_PLATFORM = new PublicKey("82NMHVCKwehXgbXMyzL41mvv3sdkypaMCtTxvJ4CtTzm");
 const USD1_MINT = new PublicKey("USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB");
 const RAYDIUM_ROUTE_PROGRAM = new PublicKey("routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS");
 const PINNED_USD1_ROUTE_POOL_ID = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS";
 const PREFERRED_USD1_ROUTE_CONFIG = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp";
+const USD1_ROUTE_SETUP_CACHE = new Map();
+const BONK_LAUNCH_DEFAULTS_CACHE = new Map();
+const BONK_LAUNCH_DEFAULTS_IN_FLIGHT = new Map();
+const RAYDIUM_LAUNCH_CONFIGS_CACHE = new Map();
+const RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT = new Map();
 
 function resolveQuoteAssetConfig(asset) {
   return String(asset || "").trim().toLowerCase() === "usd1"
@@ -61,12 +68,101 @@ function envInt(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function bonkLaunchDefaultsCacheTtlMs() {
+  return envInt("BONK_LAUNCH_DEFAULTS_CACHE_TTL_MS", 5000);
+}
+
 function getUsd1TopupPolicy() {
   return {
     maxPriceImpactPct: envFloat("BONK_USD1_MAX_PRICE_IMPACT_PCT", 5),
     minPoolTvlUsd: envFloat("BONK_USD1_MIN_POOL_TVL_USD", 100000),
     minRemainingSol: envFloat("BONK_USD1_MIN_REMAINING_SOL", 0.02),
-    maxSearchIterations: envInt("BONK_USD1_MAX_INPUT_SEARCH_ITERATIONS", 24),
+    maxSearchIterations: envInt("BONK_USD1_MAX_INPUT_SEARCH_ITERATIONS", 10),
+    routeSetupCacheTtlMs: envInt("BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS", 5000),
+    searchToleranceBps: envInt("BONK_USD1_SEARCH_TOLERANCE_BPS", 50),
+    searchMinLamports: envInt("BONK_USD1_SEARCH_MIN_LAMPORTS", 50000),
+    searchBufferBps: envInt("BONK_USD1_SEARCH_BUFFER_BPS", 25),
+    searchBufferMinLamports: envInt("BONK_USD1_SEARCH_BUFFER_MIN_LAMPORTS", 25000),
+  };
+}
+
+function createUsd1QuoteMetrics() {
+  return {
+    quoteCalls: 0,
+    quoteTotalMs: 0,
+    quoteCacheHits: 0,
+    routeSetupLocalHits: 0,
+    routeSetupCacheHits: 0,
+    routeSetupCacheMisses: 0,
+    routeSetupFetchMs: 0,
+    expansionQuoteCalls: 0,
+    binarySearchQuoteCalls: 0,
+    bufferQuoteCalls: 0,
+    searchIterations: 0,
+  };
+}
+
+function createUsd1QuoteRequestContext() {
+  return {
+    localCache: new Map(),
+    metrics: createUsd1QuoteMetrics(),
+  };
+}
+
+function ensureUsd1QuoteRequestContext(context) {
+  return context || createUsd1QuoteRequestContext();
+}
+
+function readTimedCache(map, key, ttlMs) {
+  const cached = map.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (Date.now() - cached.storedAtMs > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function writeTimedCache(map, key, value) {
+  map.set(key, {
+    storedAtMs: Date.now(),
+    value,
+  });
+}
+
+function readUsd1RouteSetupCache(key, ttlMs) {
+  return readTimedCache(USD1_ROUTE_SETUP_CACHE, key, ttlMs);
+}
+
+function writeUsd1RouteSetupCache(key, value) {
+  writeTimedCache(USD1_ROUTE_SETUP_CACHE, key, value);
+}
+
+function addUsd1QuoteMetric(metrics, key, amount = 1) {
+  if (metrics && Object.prototype.hasOwnProperty.call(metrics, key)) {
+    metrics[key] += amount;
+  }
+}
+
+function formatUsd1QuoteMetrics(metrics) {
+  if (!metrics || (!metrics.quoteCalls && !metrics.routeSetupCacheHits && !metrics.routeSetupLocalHits)) {
+    return null;
+  }
+  return {
+    quoteCalls: metrics.quoteCalls,
+    quoteTotalMs: metrics.quoteTotalMs,
+    averageQuoteMs: metrics.quoteCalls ? Number((metrics.quoteTotalMs / metrics.quoteCalls).toFixed(1)) : 0,
+    quoteCacheHits: metrics.quoteCacheHits,
+    routeSetupLocalHits: metrics.routeSetupLocalHits,
+    routeSetupCacheHits: metrics.routeSetupCacheHits,
+    routeSetupCacheMisses: metrics.routeSetupCacheMisses,
+    routeSetupFetchMs: metrics.routeSetupFetchMs,
+    expansionQuoteCalls: metrics.expansionQuoteCalls,
+    binarySearchQuoteCalls: metrics.binarySearchQuoteCalls,
+    bufferQuoteCalls: metrics.bufferQuoteCalls,
+    searchIterations: metrics.searchIterations,
   };
 }
 
@@ -144,6 +240,12 @@ function txVersionFromFormat(format) {
     : TxVersion.V0;
 }
 
+function atomicUsd1TxVersion(request) {
+  return resolveQuoteAssetConfig(request && request.quoteAsset).asset === "usd1"
+    ? TxVersion.V0
+    : txVersionFromFormat(request && request.txFormat);
+}
+
 function readTransactionBlockhash(transaction) {
   if (transaction instanceof VersionedTransaction) {
     return transaction.message.recentBlockhash;
@@ -156,6 +258,15 @@ function serializeTransaction(transaction) {
     return Buffer.from(transaction.serialize()).toString("base64");
   }
   return Buffer.from(transaction.serialize()).toString("base64");
+}
+
+function lookupTablesUsedOnTransaction(transaction) {
+  if (!(transaction instanceof VersionedTransaction)) {
+    return [];
+  }
+  return (transaction.message.addressTableLookups || []).map((lookup) => (
+    lookup.accountKey.toBase58()
+  ));
 }
 
 function extractTransactions(result) {
@@ -176,7 +287,7 @@ function normalizeTransactions(result, { labelPrefix, computeUnitLimit, computeU
       blockhash: readTransactionBlockhash(transaction),
       lastValidBlockHeight,
       serializedBase64: serializeTransaction(transaction),
-      lookupTablesUsed: [],
+      lookupTablesUsed: lookupTablesUsedOnTransaction(transaction),
       computeUnitLimit: computeUnitLimit || null,
       computeUnitPriceMicroLamports: computeUnitPriceMicroLamports || null,
       inlineTipLamports: inlineTipLamports || null,
@@ -290,6 +401,18 @@ async function ensureAssociatedTokenAccountExists(connection, owner, mint, reque
   return ata;
 }
 
+async function ensureQuoteTokenAccountReady(connection, owner, request, raydium, mintOverride) {
+  if (!allowAtaCreation(request)) {
+    return null;
+  }
+  const quote = resolveQuoteAssetConfig(request && request.quoteAsset);
+  if (quote.asset === "sol") {
+    return null;
+  }
+  const mint = mintOverride || quote.mint;
+  return ensureAssociatedTokenAccountExists(connection, owner, mint, request, raydium);
+}
+
 function allowAtaCreation(request) {
   return Boolean(request && request.allowAtaCreation);
 }
@@ -334,6 +457,58 @@ function mergeLookupTableAccounts(...lists) {
   return Array.from(merged.values());
 }
 
+async function resolveLookupTableAccountsForAddresses(connection, addresses) {
+  const resolved = await Promise.all(addresses.map(async (address) => {
+    const key = new PublicKey(address);
+    const response = await connection.getAddressLookupTable(key);
+    if (!response || !response.value) {
+      throw new Error(`Address lookup table not found: ${key.toBase58()}`);
+    }
+    return response.value;
+  }));
+  return resolved;
+}
+
+async function resolveBonkUsd1AtomicLookupTables(connection, request) {
+  if (resolveQuoteAssetConfig(request && request.quoteAsset).asset !== "usd1") {
+    return [];
+  }
+  return resolveLookupTableAccountsForAddresses(connection, [BONK_USD1_SUPER_LOOKUP_TABLE]);
+}
+
+function estimatedAccountKeyCount(ownerPubkey, instructions) {
+  const keys = new Set([ownerPubkey.toBase58()]);
+  for (const instruction of instructions || []) {
+    if (instruction.programId) {
+      keys.add(instruction.programId.toBase58());
+    }
+    for (const key of instruction.keys || []) {
+      if (key && key.pubkey) {
+        keys.add(key.pubkey.toBase58());
+      }
+    }
+  }
+  return keys.size;
+}
+
+function lookupTableAddressCount(lookupTables) {
+  return (lookupTables || []).reduce((total, table) => (
+    total + (((table && table.state && table.state.addresses) || []).length)
+  ), 0);
+}
+
+function printAtomicUsd1Diagnostics(label, diagnostics) {
+  console.error(`[bonk-usd1-atomic] ${label}: ${JSON.stringify(diagnostics)}`);
+}
+
+function versionedMessageSerializedLength(message) {
+  try {
+    return Buffer.from(message.serialize()).length;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function isComputeBudgetInstruction(instruction) {
   return instruction.programId && instruction.programId.equals(ComputeBudgetProgram.programId);
 }
@@ -363,6 +538,25 @@ function buildInlineTipInstruction(ownerPubkey, tipAccount, tipLamports) {
     toPubkey: new PublicKey(tipAccount),
     lamports: Number(tipLamports),
   });
+}
+
+function buildAtomicEnvelopeInstructions(txConfig) {
+  const instructions = [];
+  if (txConfig && txConfig.computeUnitPriceMicroLamports) {
+    instructions.push(
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: Number(txConfig.computeUnitPriceMicroLamports),
+      }),
+    );
+  }
+  if (txConfig && txConfig.computeUnitLimit) {
+    instructions.push(
+      ComputeBudgetProgram.setComputeUnitLimit({
+        units: Number(txConfig.computeUnitLimit),
+      }),
+    );
+  }
+  return instructions;
 }
 
 function isAtomicMessageOverflowError(error) {
@@ -437,11 +631,91 @@ async function ensureInlineTipOnSwapResult(connection, owner, result, txConfig) 
     : { transactions: rebuiltTransactions };
 }
 
+async function buildBonkUsd1LookupTableCandidates(connection, request, baseLookupTables) {
+  const customLookupTables = await resolveBonkUsd1AtomicLookupTables(connection, request);
+  const mergedLookupTables = mergeLookupTableAccounts(customLookupTables, baseLookupTables);
+  const candidates = [];
+  if (customLookupTables.length) {
+    candidates.push({
+      label: "custom-only",
+      lookupTables: customLookupTables,
+    });
+  }
+  candidates.push({
+    label: customLookupTables.length ? "custom+merged" : "sdk-merged",
+    lookupTables: mergedLookupTables,
+  });
+  return { customLookupTables, candidates };
+}
+
+function compileVersionedTransactionWithLookupTables(owner, recentBlockhash, instructions, lookupTables, extraSigners = []) {
+  const message = new TransactionMessage({
+    payerKey: owner.publicKey,
+    recentBlockhash,
+    instructions,
+  }).compileToV0Message(lookupTables);
+  const transaction = new VersionedTransaction(message);
+  transaction.sign([owner, ...extraSigners]);
+  return { message, transaction };
+}
+
+async function preferBonkUsd1LookupTableOnTransaction(connection, owner, request, transaction, extraSigners = []) {
+  if (!(transaction instanceof VersionedTransaction)) {
+    return transaction;
+  }
+  if (resolveQuoteAssetConfig(request && request.quoteAsset).asset !== "usd1") {
+    return transaction;
+  }
+  const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction);
+  const { candidates } = await buildBonkUsd1LookupTableCandidates(connection, request, addressLookupTableAccounts);
+  const originalLookupCount = lookupTablesUsedOnTransaction(transaction).length;
+  let bestTransaction = transaction;
+  let bestLookupCount = originalLookupCount;
+  for (const candidate of candidates) {
+    try {
+      const rebuilt = compileVersionedTransactionWithLookupTables(
+        owner,
+        readTransactionBlockhash(transaction),
+        instructions,
+        candidate.lookupTables,
+        extraSigners,
+      ).transaction;
+      const rebuiltLookupCount = lookupTablesUsedOnTransaction(rebuilt).length;
+      if (
+        rebuiltLookupCount < bestLookupCount
+        || (
+          rebuiltLookupCount === bestLookupCount
+          && candidate.label === "custom-only"
+          && rebuiltLookupCount <= 1
+        )
+      ) {
+        bestTransaction = rebuilt;
+        bestLookupCount = rebuiltLookupCount;
+      }
+      if (bestLookupCount <= 1) {
+        return bestTransaction;
+      }
+    } catch (_error) {
+      // Preserve the SDK-built transaction if the custom remap cannot compile cleanly.
+    }
+  }
+  return bestTransaction;
+}
+
 async function combineAtomicUsd1ActionTransaction(connection, owner, request, swapTransaction, actionTransaction, extraSigners = []) {
   const [swapBundle, actionBundle] = await Promise.all([
     decompileTransactionInstructions(connection, swapTransaction),
     decompileTransactionInstructions(connection, actionTransaction),
   ]);
+  const swapInstructions = swapBundle.instructions.filter((instruction) => (
+    !isComputeBudgetInstruction(instruction)
+    && !isInlineTipInstruction(
+      instruction,
+      owner.publicKey,
+      request.txConfig && request.txConfig.tipAccount,
+      request.txConfig && request.txConfig.tipLamports,
+    )
+  ));
   const actionInstructions = actionBundle.instructions.filter((instruction) => (
     !isComputeBudgetInstruction(instruction)
     && !isInlineTipInstruction(
@@ -451,115 +725,278 @@ async function combineAtomicUsd1ActionTransaction(connection, owner, request, sw
       request.txConfig && request.txConfig.tipLamports,
     )
   ));
-  const instructions = [...swapBundle.instructions, ...actionInstructions];
+  const instructions = [
+    ...buildAtomicEnvelopeInstructions(request.txConfig),
+    ...swapInstructions,
+    ...actionInstructions,
+  ];
+  const tipInstruction = buildInlineTipInstruction(
+    owner.publicKey,
+    request.txConfig && request.txConfig.tipAccount,
+    request.txConfig && request.txConfig.tipLamports,
+  );
+  if (tipInstruction) {
+    instructions.push(tipInstruction);
+  }
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
-  const txVersion = txVersionFromFormat(request.txFormat);
+  const txVersion = atomicUsd1TxVersion(request);
+  const baseLookupTables = mergeLookupTableAccounts(
+    swapBundle.addressLookupTableAccounts,
+    actionBundle.addressLookupTableAccounts,
+  );
+  const { customLookupTables, candidates } = await buildBonkUsd1LookupTableCandidates(
+    connection,
+    request,
+    baseLookupTables,
+  );
+  const precompileDiagnostics = {
+    txVersion: txVersion === TxVersion.LEGACY ? "legacy" : "v0",
+    swapInstructionCount: swapInstructions.length,
+    actionInstructionCount: actionInstructions.length,
+    mergedInstructionCount: instructions.length,
+    estimatedAccountKeyCount: estimatedAccountKeyCount(owner.publicKey, instructions),
+    lookupTableCount: baseLookupTables.length,
+    lookupTableAddressCount: lookupTableAddressCount(baseLookupTables),
+    customLookupTableCount: customLookupTables.length,
+    customLookupTables: customLookupTables.map((table) => table.key.toBase58()),
+  };
+  printAtomicUsd1Diagnostics("precompile", precompileDiagnostics);
   if (txVersion === TxVersion.LEGACY) {
     const transaction = new Transaction();
     transaction.feePayer = owner.publicKey;
     transaction.recentBlockhash = blockhash;
     instructions.forEach((instruction) => transaction.add(instruction));
     transaction.sign(owner, ...extraSigners);
+    const serialized = transaction.serialize();
+    printAtomicUsd1Diagnostics("compiled", {
+      ...precompileDiagnostics,
+      serializedBytes: serialized.length,
+      serializedBase64Length: Buffer.from(serialized).toString("base64").length,
+      packetLimit: PACKET_LIMIT,
+    });
+    if (serialized.length > PACKET_LIMIT) {
+      throw new Error(
+        `Atomic USD1 action exceeded packet limits after serialize: raw ${serialized.length} > ${PACKET_LIMIT} bytes`,
+      );
+    }
     return { transaction, lastValidBlockHeight };
   }
-  const lookupTables = mergeLookupTableAccounts(
-    swapBundle.addressLookupTableAccounts,
-    actionBundle.addressLookupTableAccounts,
-  );
-  const message = new TransactionMessage({
-    payerKey: owner.publicKey,
-    recentBlockhash: blockhash,
-    instructions,
-  }).compileToV0Message(lookupTables);
-  const transaction = new VersionedTransaction(message);
-  transaction.sign([owner, ...extraSigners]);
-  return { transaction, lastValidBlockHeight };
+  let lastError = null;
+  for (const candidate of candidates) {
+    let message;
+    try {
+      message = new TransactionMessage({
+        payerKey: owner.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+      }).compileToV0Message(candidate.lookupTables);
+    } catch (error) {
+      lastError = error;
+      printAtomicUsd1Diagnostics("overflow", {
+        ...precompileDiagnostics,
+        lookupStrategy: candidate.label,
+        lookupTableCount: candidate.lookupTables.length,
+        lookupTableAddressCount: lookupTableAddressCount(candidate.lookupTables),
+        error: error && error.message ? error.message : String(error),
+      });
+      continue;
+    }
+    const compiledDiagnostics = {
+      ...precompileDiagnostics,
+      lookupStrategy: candidate.label,
+      lookupTableCount: candidate.lookupTables.length,
+      lookupTableAddressCount: lookupTableAddressCount(candidate.lookupTables),
+      staticAccountKeyCount: message.staticAccountKeys.length,
+      staticAccountKeys: message.staticAccountKeys.map((key) => key.toBase58()),
+      mergedLookupTables: candidate.lookupTables.map((table) => table.key.toBase58()),
+      lookupReferenceCount: (message.addressTableLookups || []).reduce(
+        (total, lookup) => total + lookup.readonlyIndexes.length + lookup.writableIndexes.length,
+        0,
+      ),
+      lookupTableLookups: (message.addressTableLookups || []).map((lookup) => ({
+        table: lookup.accountKey.toBase58(),
+        writableIndexes: lookup.writableIndexes.length,
+        readonlyIndexes: lookup.readonlyIndexes.length,
+      })),
+      messageSerializedBytes: versionedMessageSerializedLength(message),
+      packetLimit: PACKET_LIMIT,
+    };
+    let transaction;
+    try {
+      transaction = new VersionedTransaction(message);
+      transaction.sign([owner, ...extraSigners]);
+    } catch (error) {
+      lastError = error;
+      printAtomicUsd1Diagnostics("sign-overflow", {
+        ...compiledDiagnostics,
+        error: error && error.message ? error.message : String(error),
+      });
+      continue;
+    }
+    try {
+      const serialized = transaction.serialize();
+      compiledDiagnostics.serializedBytes = serialized.length;
+      compiledDiagnostics.serializedBase64Length = Buffer.from(serialized).toString("base64").length;
+      printAtomicUsd1Diagnostics("compiled", compiledDiagnostics);
+      if (
+        compiledDiagnostics.serializedBytes > PACKET_LIMIT
+        || compiledDiagnostics.serializedBase64Length > BASE64_PACKET_LIMIT
+      ) {
+        lastError = new Error(
+          `Atomic USD1 action exceeded packet limits after serialize: raw ${compiledDiagnostics.serializedBytes} > ${PACKET_LIMIT} bytes or base64 ${compiledDiagnostics.serializedBase64Length} > ${BASE64_PACKET_LIMIT}`,
+        );
+        printAtomicUsd1Diagnostics("packet-limit", {
+          ...compiledDiagnostics,
+          error: lastError.message,
+        });
+        continue;
+      }
+      return { transaction, lastValidBlockHeight };
+    } catch (error) {
+      lastError = error;
+      printAtomicUsd1Diagnostics("serialize-overflow", {
+        ...compiledDiagnostics,
+        error: error && error.message ? error.message : String(error),
+      });
+    }
+  }
+  throw lastError || new Error("Atomic USD1 action assembly failed.");
 }
 
 async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regular", quoteAsset = "sol") {
-  const { platformId } = resolveBonkPlatform(mode);
+  const launchMode = normalizeBonkLaunchMode(mode);
   const quote = resolveQuoteAssetConfig(quoteAsset);
-  const configId = getPdaLaunchpadConfigId(LAUNCHPAD_PROGRAM, quote.mint, 0, 0).publicKey;
-  const [configAccount, platformAccount, launchConfigs] = await Promise.all([
-    connection.getAccountInfo(configId),
-    connection.getAccountInfo(platformId),
-    raydium.api.fetchLaunchConfigs(),
-  ]);
-  if (!configAccount) {
-    throw new Error(`Launch config account not found: ${configId.toBase58()}`);
-  }
-  if (!platformAccount) {
-    throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
-  }
-  const apiConfig = launchConfigs.find((entry) => entry.key.pubKey === configId.toBase58());
-  if (!apiConfig) {
-    throw new Error(`Raydium launch config defaults not found for ${configId.toBase58()}`);
-  }
-  const configInfo = LaunchpadConfig.decode(configAccount.data);
-  const platformInfo = PlatformConfig.decode(platformAccount.data);
-  const supply = new BN(apiConfig.defaultParams.supplyInit);
-  const totalSellA = new BN(apiConfig.defaultParams.totalSellA);
-  const totalFundRaisingB = new BN(apiConfig.defaultParams.totalFundRaisingB);
-  const totalLockedAmount = new BN(0);
-  const init = Curve.getCurve(configInfo.curveType).getInitParam({
-    supply,
-    totalFundRaising: totalFundRaisingB,
-    totalSell: totalSellA,
-    totalLockedAmount,
-    migrateFee: configInfo.migrateFee,
-  });
-  const dummyMint = Keypair.generate().publicKey;
-  const poolInfo = {
-    epoch: new BN(0),
-    bump: 0,
-    status: 0,
-    mintDecimalsA: TOKEN_DECIMALS,
-    mintDecimalsB: quote.decimals,
-    supply,
-    totalSellA,
-    mintA: dummyMint,
-    mintB: quote.mint,
-    virtualA: init.a,
-    virtualB: init.b,
-    realA: new BN(0),
-    realB: new BN(0),
-    migrateFee: configInfo.migrateFee,
-    migrateType: 1,
-    protocolFee: new BN(0),
-    platformFee: platformInfo.feeRate,
-    platformId,
-    configId,
-    vaultA: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, dummyMint, quote.mint).publicKey, dummyMint).publicKey,
-    vaultB: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, dummyMint, quote.mint).publicKey, quote.mint).publicKey,
-    creator: ownerPubkey || PublicKey.default,
-    totalFundRaisingB,
-    vestingSchedule: {
-      totalLockedAmount,
-      cliffPeriod: new BN(0),
-      unlockPeriod: new BN(0),
-      startTime: new BN(0),
-      totalAllocatedShare: new BN(0),
-    },
-    mintProgramFlag: 0,
-    cpmmCreatorFeeOn: 0,
-    platformVestingShare: platformInfo.platformVestingScale || new BN(0),
-    configInfo,
-    quoteAsset: quote.asset,
-    quoteAssetLabel: quote.label,
-    quoteMint: quote.mint,
-    quoteDecimals: quote.decimals,
-  };
+  const cacheKey = `${launchMode}:${quote.asset}`;
+  const ttlMs = bonkLaunchDefaultsCacheTtlMs();
+  const cached = readTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, cacheKey, ttlMs);
+  const staticDefaults = cached || await (async () => {
+    if (BONK_LAUNCH_DEFAULTS_IN_FLIGHT.has(cacheKey)) {
+      return BONK_LAUNCH_DEFAULTS_IN_FLIGHT.get(cacheKey);
+    }
+    const loader = (async () => {
+      const { platformId } = resolveBonkPlatform(launchMode);
+      const configId = getPdaLaunchpadConfigId(LAUNCHPAD_PROGRAM, quote.mint, 0, 0).publicKey;
+      const launchConfigsKey = "launch-configs";
+      const launchConfigsCached = readTimedCache(
+        RAYDIUM_LAUNCH_CONFIGS_CACHE,
+        launchConfigsKey,
+        ttlMs,
+      );
+      const launchConfigsPromise = launchConfigsCached
+        ? Promise.resolve(launchConfigsCached)
+        : (() => {
+          if (RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT.has(launchConfigsKey)) {
+            return RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT.get(launchConfigsKey);
+          }
+          const promise = raydium.api.fetchLaunchConfigs()
+            .then((value) => {
+              writeTimedCache(RAYDIUM_LAUNCH_CONFIGS_CACHE, launchConfigsKey, value);
+              return value;
+            })
+            .finally(() => {
+              RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT.delete(launchConfigsKey);
+            });
+          RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT.set(launchConfigsKey, promise);
+          return promise;
+        })();
+      const [configAccount, platformAccount, launchConfigs] = await Promise.all([
+        connection.getAccountInfo(configId),
+        connection.getAccountInfo(platformId),
+        launchConfigsPromise,
+      ]);
+      if (!configAccount) {
+        throw new Error(`Launch config account not found: ${configId.toBase58()}`);
+      }
+      if (!platformAccount) {
+        throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
+      }
+      const apiConfig = launchConfigs.find((entry) => entry.key.pubKey === configId.toBase58());
+      if (!apiConfig) {
+        throw new Error(`Raydium launch config defaults not found for ${configId.toBase58()}`);
+      }
+      const configInfo = LaunchpadConfig.decode(configAccount.data);
+      const platformInfo = PlatformConfig.decode(platformAccount.data);
+      const supply = new BN(apiConfig.defaultParams.supplyInit);
+      const totalSellA = new BN(apiConfig.defaultParams.totalSellA);
+      const totalFundRaisingB = new BN(apiConfig.defaultParams.totalFundRaisingB);
+      const totalLockedAmount = new BN(0);
+      const init = Curve.getCurve(configInfo.curveType).getInitParam({
+        supply,
+        totalFundRaising: totalFundRaisingB,
+        totalSell: totalSellA,
+        totalLockedAmount,
+        migrateFee: configInfo.migrateFee,
+      });
+      const dummyMint = Keypair.generate().publicKey;
+      const dummyPoolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, dummyMint, quote.mint).publicKey;
+      const defaults = {
+        mode: launchMode,
+        configId,
+        configInfo,
+        platformInfo,
+        platformId,
+        supply,
+        totalFundRaisingB,
+        quoteAsset: quote.asset,
+        quoteAssetLabel: quote.label,
+        quoteMint: quote.mint,
+        quoteDecimals: quote.decimals,
+        poolInfoTemplate: {
+          epoch: new BN(0),
+          bump: 0,
+          status: 0,
+          mintDecimalsA: TOKEN_DECIMALS,
+          mintDecimalsB: quote.decimals,
+          supply,
+          totalSellA,
+          mintA: dummyMint,
+          mintB: quote.mint,
+          virtualA: init.a,
+          virtualB: init.b,
+          realA: new BN(0),
+          realB: new BN(0),
+          migrateFee: configInfo.migrateFee,
+          migrateType: 1,
+          protocolFee: new BN(0),
+          platformFee: platformInfo.feeRate,
+          platformId,
+          configId,
+          vaultA: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, dummyPoolId, dummyMint).publicKey,
+          vaultB: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, dummyPoolId, quote.mint).publicKey,
+          creator: PublicKey.default,
+          totalFundRaisingB,
+          vestingSchedule: {
+            totalLockedAmount,
+            cliffPeriod: new BN(0),
+            unlockPeriod: new BN(0),
+            startTime: new BN(0),
+            totalAllocatedShare: new BN(0),
+          },
+          mintProgramFlag: 0,
+          cpmmCreatorFeeOn: 0,
+          platformVestingShare: platformInfo.platformVestingScale || new BN(0),
+          configInfo,
+          quoteAsset: quote.asset,
+          quoteAssetLabel: quote.label,
+          quoteMint: quote.mint,
+          quoteDecimals: quote.decimals,
+        },
+      };
+      writeTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, cacheKey, defaults);
+      return defaults;
+    })().finally(() => {
+      BONK_LAUNCH_DEFAULTS_IN_FLIGHT.delete(cacheKey);
+    });
+    BONK_LAUNCH_DEFAULTS_IN_FLIGHT.set(cacheKey, loader);
+    return loader;
+  })();
+  const creator = ownerPubkey || PublicKey.default;
   return {
-    configId,
-    configInfo,
-    platformInfo,
-    platformId,
-    poolInfo,
-    supply,
-    quoteAsset: quote.asset,
-    quoteAssetLabel: quote.label,
-    quoteMint: quote.mint,
-    quoteDecimals: quote.decimals,
+    ...staticDefaults,
+    poolInfo: {
+      ...staticDefaults.poolInfoTemplate,
+      creator,
+    },
   };
 }
 
@@ -567,6 +1004,7 @@ function buildPrelaunchPoolInfo(defaults, mint, creator) {
   const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, defaults.quoteMint).publicKey;
   return {
     ...defaults.poolInfo,
+    poolId,
     mintA: mint,
     vaultA: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, poolId, mint).publicKey,
     vaultB: getPdaLaunchpadVaultId(LAUNCHPAD_PROGRAM, poolId, defaults.quoteMint).publicKey,
@@ -628,6 +1066,58 @@ async function loadLivePoolContext(raydium, connection, mint, quoteAsset) {
   throw new Error(`Unable to resolve Bonk live pool context. Attempts: ${errors.join(" | ")}`);
 }
 
+async function loadPoolContextByPoolId(raydium, connection, poolIdInput, quoteAsset) {
+  const poolId = new PublicKey(poolIdInput);
+  const poolInfo = await raydium.launchpad.getRpcPoolInfo({ poolId });
+  const configId = poolInfo.configId && poolInfo.configId.toBase58
+    ? poolInfo.configId
+    : new PublicKey(String(poolInfo.configId || ""));
+  const platformId = poolInfo.platformId && poolInfo.platformId.toBase58
+    ? poolInfo.platformId
+    : new PublicKey(String(poolInfo.platformId || ""));
+  const [configAccount, platformAccount] = await Promise.all([
+    connection.getAccountInfo(configId),
+    connection.getAccountInfo(platformId),
+  ]);
+  if (!configAccount) {
+    throw new Error(`Launch config account not found: ${configId.toBase58()}`);
+  }
+  if (!platformAccount) {
+    throw new Error(`Launch platform account not found: ${platformId.toBase58()}`);
+  }
+  const quote = resolveQuoteAssetConfig(quoteAsset);
+  return {
+    poolId,
+    poolInfo,
+    configId,
+    platformId,
+    configInfo: LaunchpadConfig.decode(configAccount.data),
+    platformInfo: PlatformConfig.decode(platformAccount.data),
+    quoteAsset: quote.asset,
+    quoteAssetLabel: quote.label,
+    quoteMint: quote.mint,
+    quoteDecimals: quote.decimals,
+  };
+}
+
+async function buildPrelaunchPoolContext(raydium, connection, mint, launchCreator, mode, quoteAsset) {
+  const creator = new PublicKey(launchCreator);
+  const defaults = await loadLaunchDefaults(raydium, connection, creator, mode, quoteAsset);
+  const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, defaults.quoteMint).publicKey;
+  return {
+    poolId,
+    poolInfo: buildPrelaunchPoolInfo(defaults, mint, creator),
+    configId: defaults.configId,
+    platformId: defaults.platformId,
+    configInfo: defaults.configInfo,
+    platformInfo: defaults.platformInfo,
+    quoteAsset: defaults.quoteAsset,
+    quoteAssetLabel: defaults.quoteAssetLabel,
+    quoteMint: defaults.quoteMint,
+    quoteDecimals: defaults.quoteDecimals,
+  };
+}
+
 function buildQuote(defaults, mode, amount) {
   const common = {
     poolInfo: defaults.poolInfo,
@@ -673,33 +1163,253 @@ function buildQuote(defaults, mode, amount) {
   };
 }
 
-async function quoteUsd1OutputFromSolInput(raydium, connection, inputLamports, slippageBps) {
-  const pool = await loadPinnedUsd1RoutePool(raydium);
-  const quote = await computeDirectRouteSwap(raydium, connection, pool, inputLamports, slippageBps);
+function buildCurveQuoteCommon(defaults) {
   return {
-    inputLamports,
-    expectedOut: new BN(quote.expectedOut.toString()),
-    minOut: new BN(quote.minOut.toString()),
+    poolInfo: defaults.poolInfo,
+    protocolFeeRate: defaults.configInfo.tradeFeeRate,
+    platformFeeRate: defaults.platformInfo.feeRate,
+    curveType: defaults.configInfo.curveType,
+    shareFeeRate: new BN(0),
+    creatorFeeRate: defaults.platformInfo.creatorFeeRate,
+    transferFeeConfigA: undefined,
+    slot: 0,
   };
 }
 
-async function quoteSolInputForUsd1Output(raydium, connection, requiredQuoteAmount, slippageBps) {
+async function estimateDevBuyTokenAmount(raydium, connection, defaults, devBuy, slippageBps, requestContext = null) {
+  if (!devBuy || !devBuy.mode || !devBuy.amount) {
+    return null;
+  }
+  if (devBuy.mode === "tokens") {
+    const requested = parseDecimalToBn(devBuy.amount, TOKEN_DECIMALS, "dev buy tokens");
+    return buildMinAmountFromBps(requested, slippageBps);
+  }
+  if (defaults.quoteAsset === "usd1") {
+    const solInput = parseDecimalToBn(devBuy.amount, 9, "dev buy SOL");
+    const usd1RouteQuote = await quoteUsd1OutputFromSolInput(
+      raydium,
+      connection,
+      solInput,
+      slippageBps,
+      requestContext,
+    );
+    const curveQuote = Curve.buyExactIn({
+      ...buildCurveQuoteCommon(defaults),
+      amountB: usd1RouteQuote.minOut,
+    });
+    return new BN(curveQuote.amountA.amount.toString());
+  }
+  const buyAmount = parseDecimalToBn(
+    devBuy.amount,
+    defaults.quoteDecimals,
+    `dev buy ${defaults.quoteAssetLabel}`,
+  );
+  const curveQuote = Curve.buyExactIn({
+    ...buildCurveQuoteCommon(defaults),
+    amountB: buyAmount,
+  });
+  return new BN(curveQuote.amountA.amount.toString());
+}
+
+function buildUsd1RouteSetupCacheKey() {
+  return `usd1-route-setup:${PINNED_USD1_ROUTE_POOL_ID}:${PREFERRED_USD1_ROUTE_CONFIG}`;
+}
+
+function toBasicPoolInfo(pool) {
+  const version = pool.type === "Concentrated" ? 6 : pool.type === "Standard" ? 4 : 7;
+  return {
+    id: new PublicKey(pool.id),
+    version,
+    mintA: new PublicKey(pool.mintA.address || pool.mintA),
+    mintB: new PublicKey(pool.mintB.address || pool.mintB),
+  };
+}
+
+async function loadUsd1RouteSetup(raydium, connection, requestContext = null) {
+  const context = ensureUsd1QuoteRequestContext(requestContext);
   const policy = getUsd1TopupPolicy();
+  const cacheKey = buildUsd1RouteSetupCacheKey();
+  if (context.localCache.has(cacheKey)) {
+    addUsd1QuoteMetric(context.metrics, "routeSetupLocalHits");
+    return context.localCache.get(cacheKey);
+  }
+  const cached = readUsd1RouteSetupCache(cacheKey, policy.routeSetupCacheTtlMs);
+  if (cached) {
+    addUsd1QuoteMetric(context.metrics, "routeSetupCacheHits");
+    context.localCache.set(cacheKey, cached);
+    return cached;
+  }
+  addUsd1QuoteMetric(context.metrics, "routeSetupCacheMisses");
+  const startedAt = Date.now();
   const pool = await loadPinnedUsd1RoutePool(raydium);
-  const referencePrice = Number(pool.price || 0);
+  const inputMint = NATIVE_MINT;
+  const outputMint = USD1_MINT;
+  const basicPool = toBasicPoolInfo(pool);
+  const routes = raydium.tradeV2.getAllRoute({
+    inputMint,
+    outputMint,
+    clmmPools: basicPool.version === 6 ? [basicPool] : [],
+    ammPools: basicPool.version === 4 ? [basicPool] : [],
+    cpmmPools: basicPool.version === 7 ? [basicPool] : [],
+  });
+  const [routeData, swapPoolKeys, epochInfo] = await Promise.all([
+    raydium.tradeV2.fetchSwapRoutesData({
+      routes,
+      inputMint,
+      outputMint,
+    }),
+    raydium.api.fetchPoolKeysById({ idList: [pool.id] }),
+    connection.getEpochInfo(),
+  ]);
+  if (!swapPoolKeys.length) {
+    throw new Error(`Raydium pool keys not found for ${pool.id}.`);
+  }
+  const inputTokenInfo = routeData.mintInfos[inputMint.toBase58()];
+  const outputTokenInfo = routeData.mintInfos[outputMint.toBase58()];
+  const directPath = routes.directPath
+    .map((entry) =>
+      routeData.computeClmmPoolInfo[entry.id.toBase58()]
+      || routeData.ammSimulateCache[entry.id.toBase58()]
+      || routeData.computeCpmmData[entry.id.toBase58()])
+    .filter(Boolean);
+  const setup = {
+    pool,
+    inputMint,
+    outputMint,
+    routeData,
+    swapPoolKeys,
+    epochInfo,
+    inputTokenInfo,
+    outputTokenInfo,
+    directPath,
+    simulateCache: {
+      ...routeData.ammSimulateCache,
+      ...routeData.computeClmmPoolInfo,
+      ...routeData.computeCpmmData,
+    },
+  };
+  context.metrics.routeSetupFetchMs += Date.now() - startedAt;
+  context.localCache.set(cacheKey, setup);
+  writeUsd1RouteSetupCache(cacheKey, setup);
+  return setup;
+}
+
+async function computeDirectRouteSwap(raydium, connection, pool, inputAmountBn, slippageBps, requestContext = null, phase = "general") {
+  const context = ensureUsd1QuoteRequestContext(requestContext);
+  const quoteCacheKey = `usd1-route-quote:${inputAmountBn.toString(10)}:${Number(slippageBps || 0)}`;
+  if (context.localCache.has(quoteCacheKey)) {
+    addUsd1QuoteMetric(context.metrics, "quoteCacheHits");
+    return context.localCache.get(quoteCacheKey);
+  }
+  const routeSetup = await loadUsd1RouteSetup(raydium, connection, context);
+  const inputTokenAmount = new TokenAmount(
+    new Token({
+      mint: routeSetup.inputMint,
+      decimals: routeSetup.inputTokenInfo.decimals,
+      symbol: routeSetup.inputTokenInfo.symbol,
+      name: routeSetup.inputTokenInfo.name,
+    }),
+    inputAmountBn.toString(10),
+    true,
+  );
+  addUsd1QuoteMetric(context.metrics, "quoteCalls");
+  if (phase === "expansion") addUsd1QuoteMetric(context.metrics, "expansionQuoteCalls");
+  if (phase === "binary") addUsd1QuoteMetric(context.metrics, "binarySearchQuoteCalls");
+  if (phase === "buffer") addUsd1QuoteMetric(context.metrics, "bufferQuoteCalls");
+  const startedAt = Date.now();
+  const swapCandidates = raydium.tradeV2.getAllRouteComputeAmountOut({
+    directPath: routeSetup.directPath,
+    routePathDict: routeSetup.routeData.routePathDict,
+    simulateCache: routeSetup.simulateCache,
+    tickCache: routeSetup.routeData.computePoolTickData,
+    mintInfos: routeSetup.routeData.mintInfos,
+    inputTokenAmount,
+    outputToken: routeSetup.outputTokenInfo,
+    slippage: Number(slippageBps || 0) / 10_000,
+    chainTime: Math.floor(Date.now() / 1000),
+    epochInfo: routeSetup.epochInfo,
+  });
+  context.metrics.quoteTotalMs += Date.now() - startedAt;
+  if (!swapCandidates.length) {
+    throw new Error(`No Raydium route quote found for pool ${(pool && pool.id) || routeSetup.pool.id}.`);
+  }
+  const swapInfo = swapCandidates[0];
+  const quote = {
+    swapInfo,
+    swapPoolKeys: routeSetup.swapPoolKeys,
+    expectedOut: new BN(swapInfo.amountOut.amount.raw.toString()),
+    minOut: new BN(swapInfo.minAmountOut.amount.raw.toString()),
+    priceImpactPct: Number(swapInfo.priceImpact.toString()) * 100,
+    pool: routeSetup.pool,
+  };
+  context.localCache.set(quoteCacheKey, quote);
+  return quote;
+}
+
+function buildUsd1SearchGuessLamports(requiredQuoteAmount, referencePrice, maxInputLamports) {
+  let guess = parseDecimalToBn(
+    String(requiredQuoteAmount.toNumber() / 1_000_000 / referencePrice * 1.05 || 0.01),
+    9,
+    "top-up search guess",
+  );
+  if (guess.lte(new BN(0))) {
+    guess = parseDecimalToBn("0.01", 9, "top-up search floor");
+  }
+  return guess.gt(maxInputLamports) ? maxInputLamports.clone() : guess;
+}
+
+function usd1SearchToleranceLamports(high, policy) {
+  const minLamports = new BN(String(policy.searchMinLamports));
+  const bpsLamports = high.mul(new BN(String(policy.searchToleranceBps))).div(new BN(10_000));
+  return minLamports.gte(bpsLamports) ? minLamports : bpsLamports;
+}
+
+function addUsd1SearchBufferLamports(high, maxInputLamports, policy) {
+  const minBufferLamports = new BN(String(policy.searchBufferMinLamports));
+  const bpsBufferLamports = high.mul(new BN(String(policy.searchBufferBps))).div(new BN(10_000));
+  const bufferLamports = minBufferLamports.gte(bpsBufferLamports) ? minBufferLamports : bpsBufferLamports;
+  return minBn(high.add(bufferLamports), maxInputLamports);
+}
+
+async function quoteSolInputForUsd1Output(
+  raydium,
+  connection,
+  requiredQuoteAmount,
+  slippageBps,
+  requestContext = null,
+  maxInputLamportsOverride = null,
+) {
+  const context = ensureUsd1QuoteRequestContext(requestContext);
+  const policy = getUsd1TopupPolicy();
+  const routeSetup = await loadUsd1RouteSetup(raydium, connection, context);
+  const referencePrice = Number(routeSetup.pool.price || 0);
   if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
     throw new Error(`Pinned USD1 route pool has invalid price metadata: ${PINNED_USD1_ROUTE_POOL_ID}`);
   }
-  const maxInputLamports = parseDecimalToBn("100000", 9, "maximum SOL quote search");
+  const maxInputLamports = maxInputLamportsOverride || parseDecimalToBn("100000", 9, "maximum SOL quote search");
   let low = new BN(1);
-  let high = parseDecimalToBn(String(requiredQuoteAmount.toNumber() / 1_000_000 / referencePrice * 1.1 || 0.01), 9, "top-up search guess");
-  if (high.lte(new BN(0))) high = parseDecimalToBn("0.01", 9, "top-up search floor");
-  if (high.gt(maxInputLamports)) high = maxInputLamports.clone();
-  let quote = await computeDirectRouteSwap(raydium, connection, pool, high, slippageBps);
+  let high = buildUsd1SearchGuessLamports(requiredQuoteAmount, referencePrice, maxInputLamports);
+  let quote = await computeDirectRouteSwap(
+    raydium,
+    connection,
+    routeSetup.pool,
+    high,
+    slippageBps,
+    context,
+    "expansion",
+  );
   while (quote.minOut.lt(requiredQuoteAmount) && high.lt(maxInputLamports)) {
     low = high.add(new BN(1));
     high = minBn(high.mul(new BN(2)), maxInputLamports);
-    quote = await computeDirectRouteSwap(raydium, connection, pool, high, slippageBps);
+    quote = await computeDirectRouteSwap(
+      raydium,
+      connection,
+      routeSetup.pool,
+      high,
+      slippageBps,
+      context,
+      "expansion",
+    );
     if (high.eq(maxInputLamports)) break;
   }
   if (quote.minOut.lt(requiredQuoteAmount)) {
@@ -713,8 +1423,20 @@ async function quoteSolInputForUsd1Output(raydium, connection, requiredQuoteAmou
     );
   }
   for (let index = 0; index < policy.maxSearchIterations && low.lt(high); index += 1) {
+    addUsd1QuoteMetric(context.metrics, "searchIterations");
+    if (high.sub(low).lte(usd1SearchToleranceLamports(high, policy))) {
+      break;
+    }
     const mid = low.add(high).div(new BN(2));
-    const midQuote = await computeDirectRouteSwap(raydium, connection, pool, mid, slippageBps);
+    const midQuote = await computeDirectRouteSwap(
+      raydium,
+      connection,
+      routeSetup.pool,
+      mid,
+      slippageBps,
+      context,
+      "binary",
+    );
     if (midQuote.minOut.gte(requiredQuoteAmount)) {
       high = mid;
       quote = midQuote;
@@ -722,8 +1444,42 @@ async function quoteSolInputForUsd1Output(raydium, connection, requiredQuoteAmou
       low = mid.add(new BN(1));
     }
   }
+  const bufferedInputLamports = addUsd1SearchBufferLamports(high, maxInputLamports, policy);
+  if (bufferedInputLamports.gt(high)) {
+    high = bufferedInputLamports;
+    quote = await computeDirectRouteSwap(
+      raydium,
+      connection,
+      routeSetup.pool,
+      high,
+      slippageBps,
+      context,
+      "buffer",
+    );
+  }
   return {
     inputLamports: high,
+    expectedOut: new BN(quote.expectedOut.toString()),
+    minOut: new BN(quote.minOut.toString()),
+    swapInfo: quote.swapInfo,
+    swapPoolKeys: quote.swapPoolKeys,
+    priceImpactPct: quote.priceImpactPct,
+    pool: routeSetup.pool,
+  };
+}
+
+async function quoteUsd1OutputFromSolInput(raydium, connection, inputLamports, slippageBps, requestContext = null) {
+  const routeSetup = await loadUsd1RouteSetup(raydium, connection, requestContext);
+  const quote = await computeDirectRouteSwap(
+    raydium,
+    connection,
+    routeSetup.pool,
+    inputLamports,
+    slippageBps,
+    requestContext,
+  );
+  return {
+    inputLamports,
     expectedOut: new BN(quote.expectedOut.toString()),
     minOut: new BN(quote.minOut.toString()),
   };
@@ -731,6 +1487,7 @@ async function quoteSolInputForUsd1Output(raydium, connection, requiredQuoteAmou
 
 async function quoteLaunch(request) {
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
     connection,
     owner: null,
@@ -752,6 +1509,7 @@ async function quoteLaunch(request) {
       connection,
       solInput,
       request.slippageBps,
+      usd1QuoteContext,
     );
     const curveQuote = Curve.buyExactIn({
       poolInfo: defaults.poolInfo,
@@ -793,6 +1551,7 @@ async function quoteLaunch(request) {
       connection,
       new BN(curveQuote.amountB.toString()),
       request.slippageBps,
+      usd1QuoteContext,
     );
     return {
       mode: buyMode,
@@ -803,6 +1562,7 @@ async function quoteLaunch(request) {
       quoteAsset: "sol",
       quoteAssetLabel: "SOL",
       estimatedSupplyPercent: estimateSupplyPercent(tokenAmount, defaults.supply),
+      usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
     };
   }
   return buildQuote(defaults, buyMode, request.amount);
@@ -843,83 +1603,6 @@ async function fetchWalletTokenBalance(connection, owner, mint) {
   }
 }
 
-function toBasicPoolInfo(pool) {
-  const version = pool.type === "Concentrated" ? 6 : pool.type === "Standard" ? 4 : 7;
-  return {
-    id: new PublicKey(pool.id),
-    version,
-    mintA: new PublicKey(pool.mintA.address || pool.mintA),
-    mintB: new PublicKey(pool.mintB.address || pool.mintB),
-  };
-}
-
-async function computeDirectRouteSwap(raydium, connection, pool, inputAmountBn, slippageBps) {
-  const inputMint = NATIVE_MINT;
-  const outputMint = USD1_MINT;
-  const basicPool = toBasicPoolInfo(pool);
-  const routes = raydium.tradeV2.getAllRoute({
-    inputMint,
-    outputMint,
-    clmmPools: basicPool.version === 6 ? [basicPool] : [],
-    ammPools: basicPool.version === 4 ? [basicPool] : [],
-    cpmmPools: basicPool.version === 7 ? [basicPool] : [],
-  });
-  const routeData = await raydium.tradeV2.fetchSwapRoutesData({
-    routes,
-    inputMint,
-    outputMint,
-  });
-  const inputTokenInfo = routeData.mintInfos[inputMint.toBase58()];
-  const outputTokenInfo = routeData.mintInfos[outputMint.toBase58()];
-  const inputTokenAmount = new TokenAmount(
-    new Token({
-      mint: inputMint,
-      decimals: inputTokenInfo.decimals,
-      symbol: inputTokenInfo.symbol,
-      name: inputTokenInfo.name,
-    }),
-    inputAmountBn.toString(10),
-    true,
-  );
-  const directPath = routes.directPath
-    .map((entry) =>
-      routeData.computeClmmPoolInfo[entry.id.toBase58()]
-      || routeData.ammSimulateCache[entry.id.toBase58()]
-      || routeData.computeCpmmData[entry.id.toBase58()])
-    .filter(Boolean);
-  const swapCandidates = raydium.tradeV2.getAllRouteComputeAmountOut({
-    directPath,
-    routePathDict: routeData.routePathDict,
-    simulateCache: {
-      ...routeData.ammSimulateCache,
-      ...routeData.computeClmmPoolInfo,
-      ...routeData.computeCpmmData,
-    },
-    tickCache: routeData.computePoolTickData,
-    mintInfos: routeData.mintInfos,
-    inputTokenAmount,
-    outputToken: outputTokenInfo,
-    slippage: Number(slippageBps || 0) / 100,
-    chainTime: Math.floor(Date.now() / 1000),
-    epochInfo: await connection.getEpochInfo(),
-  });
-  if (!swapCandidates.length) {
-    throw new Error(`No Raydium route quote found for pool ${pool.id}.`);
-  }
-  const swapInfo = swapCandidates[0];
-  const swapPoolKeys = await raydium.api.fetchPoolKeysById({ idList: [pool.id] });
-  if (!swapPoolKeys.length) {
-    throw new Error(`Raydium pool keys not found for ${pool.id}.`);
-  }
-  return {
-    swapInfo,
-    swapPoolKeys,
-    expectedOut: new BN(swapInfo.amountOut.amount.raw.toString()),
-    minOut: new BN(swapInfo.minAmountOut.amount.raw.toString()),
-    priceImpactPct: Number(swapInfo.priceImpact.toString()) * 100,
-  };
-}
-
 async function loadPinnedUsd1RoutePool(raydium) {
   const pools = await raydium.api.fetchPoolById({ ids: PINNED_USD1_ROUTE_POOL_ID });
   const pool = (pools || []).find((entry) => entry && entry.id === PINNED_USD1_ROUTE_POOL_ID);
@@ -939,10 +1622,11 @@ async function loadPinnedUsd1RoutePool(raydium) {
   return pool;
 }
 
-async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuoteAmountRaw) {
+async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuoteAmountRaw, requestContext = null) {
   if (resolveQuoteAssetConfig(request.quoteAsset).asset !== "usd1") {
     return null;
   }
+  const context = ensureUsd1QuoteRequestContext(requestContext);
   const policy = getUsd1TopupPolicy();
   const requiredQuoteAmount = parseDecimalToBn(requiredQuoteAmountRaw, 6, "required USD1 amount");
   if (requiredQuoteAmount.lte(new BN(0))) {
@@ -964,43 +1648,14 @@ async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuo
   if (maxSpendableLamports.lte(new BN(0))) {
     throw new Error(`Insufficient SOL headroom for USD1 top-up. Need at least ${policy.minRemainingSol} SOL reserved after swap.`);
   }
-
-  const pool = await loadPinnedUsd1RoutePool(raydium);
-  const referencePrice = Number(pool.price || 0);
-  if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
-    throw new Error(`Pinned USD1 route pool has invalid price metadata: ${PINNED_USD1_ROUTE_POOL_ID}`);
-  }
-  let low = new BN(1);
-  let high = parseDecimalToBn(String(shortfall.toNumber() / 1_000_000 / referencePrice * 1.1 || 0.01), 9, "top-up search guess");
-  if (high.lte(new BN(0))) high = parseDecimalToBn("0.01", 9, "top-up search floor");
-  if (high.gt(maxSpendableLamports)) high = maxSpendableLamports.clone();
-  let quote = await computeDirectRouteSwap(raydium, connection, pool, high, request.slippageBps);
-  while (quote.minOut.lt(shortfall) && high.lt(maxSpendableLamports)) {
-    low = high.add(new BN(1));
-    high = minBn(high.mul(new BN(2)), maxSpendableLamports);
-    quote = await computeDirectRouteSwap(raydium, connection, pool, high, request.slippageBps);
-    if (high.eq(maxSpendableLamports)) break;
-  }
-  if (quote.minOut.lt(shortfall)) {
-    throw new Error(
-      `Pinned USD1 route pool could not satisfy required USD1 output: ${PINNED_USD1_ROUTE_POOL_ID}. `
-      + `requiredUsd1=${formatBn(shortfall, 6, 6)} `
-      + `maxSpendableSol=${formatBn(maxSpendableLamports, 9, 6)} `
-      + `quotedUsd1=${formatBn(quote.expectedOut, 6, 6)} `
-      + `minUsd1=${formatBn(quote.minOut, 6, 6)} `
-      + `priceImpactPct=${quote.priceImpactPct}`
-    );
-  }
-  for (let index = 0; index < policy.maxSearchIterations && low.lt(high); index += 1) {
-    const mid = low.add(high).div(new BN(2));
-    const midQuote = await computeDirectRouteSwap(raydium, connection, pool, mid, request.slippageBps);
-    if (midQuote.minOut.gte(shortfall)) {
-      high = mid;
-      quote = midQuote;
-    } else {
-      low = mid.add(new BN(1));
-    }
-  }
+  const quote = await quoteSolInputForUsd1Output(
+    raydium,
+    connection,
+    shortfall,
+    request.slippageBps,
+    context,
+    maxSpendableLamports,
+  );
   const swapResult = await raydium.tradeV2.swap({
     txVersion: txVersionFromFormat(request.txFormat),
     swapInfo: quote.swapInfo,
@@ -1025,34 +1680,38 @@ async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuo
     requiredQuoteAmount: formatBn(requiredQuoteAmount, 6, 6),
     currentQuoteAmount: formatBn(currentUsd1Balance, 6, 6),
     shortfallQuoteAmount: formatBn(shortfall, 6, 6),
-    inputSol: formatBn(high, 9, 6),
+      inputSol: formatBn(quote.inputLamports, 9, 6),
     expectedQuoteOut: formatBn(quote.expectedOut, 6, 6),
     minQuoteOut: formatBn(quote.minOut, 6, 6),
     priceImpactPct: String(quote.priceImpactPct),
-    routePassedPolicy: Number(pool.tvl || 0) >= policy.minPoolTvlUsd
+      routePassedPolicy: Number(quote.pool.tvl || 0) >= policy.minPoolTvlUsd
       && quote.priceImpactPct <= policy.maxPriceImpactPct,
-    routePoolId: pool.id,
-    routeConfigId: pool.config && pool.config.id ? pool.config.id : "",
-    routePoolType: pool.type,
-    routePoolTvlUsd: String(pool.tvl || 0),
+      routePoolId: quote.pool.id,
+      routeConfigId: quote.pool.config && quote.pool.config.id ? quote.pool.config.id : "",
+      routePoolType: quote.pool.type,
+      routePoolTvlUsd: String(quote.pool.tvl || 0),
+      usd1QuoteMetrics: formatUsd1QuoteMetrics(context.metrics),
   };
 }
 
 async function buildUsd1Topup(request) {
   const owner = parseKeypair(request.ownerSecret);
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
     connection,
     owner,
     disableLoadToken: true,
     disableFeatureCheck: true,
   });
+  await ensureQuoteTokenAccountReady(connection, owner, request, raydium, USD1_MINT);
   const prepared = await prepareUsd1Topup(
     raydium,
     connection,
     owner,
     request,
     request.requiredQuoteAmount,
+    usd1QuoteContext,
   );
   if (!prepared || !prepared.swapResult) {
     return {
@@ -1060,6 +1719,7 @@ async function buildUsd1Topup(request) {
       requiredQuoteAmount: prepared && prepared.requiredQuoteAmount ? prepared.requiredQuoteAmount : undefined,
       currentQuoteAmount: prepared && prepared.currentQuoteAmount ? prepared.currentQuoteAmount : undefined,
       shortfallQuoteAmount: prepared && prepared.shortfallQuoteAmount ? prepared.shortfallQuoteAmount : undefined,
+      usd1QuoteMetrics: prepared && prepared.usd1QuoteMetrics ? prepared.usd1QuoteMetrics : undefined,
     };
   }
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
@@ -1083,12 +1743,14 @@ async function buildUsd1Topup(request) {
     routeConfigId: prepared.routeConfigId,
     routePoolType: prepared.routePoolType,
     routePoolTvlUsd: prepared.routePoolTvlUsd,
+    usd1QuoteMetrics: prepared.usd1QuoteMetrics,
   };
 }
 
 async function buildLaunch(request) {
   const owner = parseKeypair(request.ownerSecret);
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
     connection,
     owner,
@@ -1102,13 +1764,22 @@ async function buildLaunch(request) {
     request.mode,
     request.quoteAsset,
   );
+  await ensureQuoteTokenAccountReady(connection, owner, request, raydium, defaults.quoteMint);
   const mintKeypair = request.vanitySecret
     ? parseKeypair(request.vanitySecret)
     : Keypair.generate();
-  const txVersion = txVersionFromFormat(request.txFormat);
+  const txVersion = atomicUsd1TxVersion(request);
   let buyAmount;
   let minMintAAmount;
   let createOnly = true;
+  const predictedDevBuyTokenAmount = await estimateDevBuyTokenAmount(
+    raydium,
+    connection,
+    defaults,
+    request.devBuy,
+    request.slippageBps,
+    usd1QuoteContext,
+  );
   if (request.devBuy && request.devBuy.mode && request.devBuy.amount) {
     createOnly = false;
     if (request.devBuy.mode === "tokens") {
@@ -1127,6 +1798,7 @@ async function buildLaunch(request) {
         connection,
         solInput,
         request.slippageBps,
+        usd1QuoteContext,
       );
       buyAmount = usd1RouteQuote.minOut;
     } else {
@@ -1136,9 +1808,6 @@ async function buildLaunch(request) {
         `dev buy ${defaults.quoteAssetLabel}`,
       );
     }
-  }
-  if (allowAtaCreation(request) && !createOnly && defaults.quoteAsset !== "sol") {
-    await ensureAssociatedTokenAccountExists(connection, owner, defaults.quoteMint, request, raydium);
   }
   const usd1Topup = !createOnly && defaults.quoteAsset === "usd1" && buyAmount
     ? await prepareUsd1Topup(
@@ -1150,6 +1819,7 @@ async function buildLaunch(request) {
         requiredQuoteAmount: formatBn(buyAmount, defaults.quoteDecimals, 6),
       },
       formatBn(buyAmount, defaults.quoteDecimals, 6),
+      usd1QuoteContext,
     )
     : null;
   const buildResult = await raydium.launchpad.createLaunchpad({
@@ -1174,9 +1844,14 @@ async function buildLaunch(request) {
     checkCreateATAOwner: true,
   });
   const launchTransactions = extractTransactions(buildResult);
+  const topupTransactions = usd1Topup && usd1Topup.swapResult
+    ? extractTransactions(usd1Topup.swapResult)
+    : [];
+  const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  let compiledTransactions;
+  let atomicCombined = false;
   let atomicFallbackReason = null;
-  if (usd1Topup && usd1Topup.swapResult) {
-    const topupTransactions = extractTransactions(usd1Topup.swapResult);
+  if (topupTransactions.length) {
     if (topupTransactions.length === 1 && launchTransactions.length === 1) {
       try {
         const combined = await combineAtomicUsd1ActionTransaction(
@@ -1187,58 +1862,84 @@ async function buildLaunch(request) {
           launchTransactions[0],
           [mintKeypair],
         );
-        return {
-          mint: mintKeypair.publicKey.toBase58(),
-          launchCreator: owner.publicKey.toBase58(),
-          compiledTransactions: normalizeTransactions({ transactions: [combined.transaction] }, {
-            labelPrefix: "launch",
-            computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
-            computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
-            inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
-            inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
-            lastValidBlockHeight: combined.lastValidBlockHeight,
-          }),
-          atomicCombined: true,
-        };
+        atomicCombined = true;
+        compiledTransactions = normalizeTransactions({ transactions: [combined.transaction] }, {
+          labelPrefix: "launch",
+          computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
+          computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
+          inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
+          inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
+          lastValidBlockHeight: combined.lastValidBlockHeight,
+        });
       } catch (error) {
-        if (!isAtomicMessageOverflowError(error)) {
-          throw error;
-        }
-        atomicFallbackReason = error && error.message ? error.message : String(error);
+        atomicFallbackReason = `Atomic USD1 launch fallback: ${error && error.message ? error.message : String(error)}`;
       }
+    } else {
+      atomicFallbackReason = "Atomic USD1 launch requires exactly one top-up transaction and one launch transaction.";
     }
   }
-  const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
-  const compiledTransactions = normalizeTransactions(buildResult, {
-    labelPrefix: "launch",
-    computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
-    computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
-    inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
-    inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
-    lastValidBlockHeight,
-  });
-  if (usd1Topup && usd1Topup.swapResult) {
-    compiledTransactions.unshift(...normalizeTransactions(usd1Topup.swapResult, {
-      labelPrefix: request.labelPrefix || "launch-usd1-topup",
+  if (!compiledTransactions) {
+    const remappedLaunchTransactions = await Promise.all(launchTransactions.map((transaction, index) => (
+      preferBonkUsd1LookupTableOnTransaction(
+        connection,
+        owner,
+        request,
+        transaction,
+        index === 0 ? [mintKeypair] : [],
+      )
+    )));
+    compiledTransactions = normalizeTransactions({ transactions: remappedLaunchTransactions }, {
+      labelPrefix: "launch",
       computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
       computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
       inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
-    }));
+    });
+    if (topupTransactions.length) {
+      const remappedTopupTransactions = await Promise.all(topupTransactions.map((transaction) => (
+        preferBonkUsd1LookupTableOnTransaction(connection, owner, request, transaction)
+      )));
+      compiledTransactions.unshift(...normalizeTransactions({ transactions: remappedTopupTransactions }, {
+        labelPrefix: request.labelPrefix || "launch-usd1-topup",
+        computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
+        computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
+        inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
+        inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
+        lastValidBlockHeight,
+      }));
+      if (!atomicFallbackReason) {
+        atomicFallbackReason = "USD1 launch path is using split top-up plus launch transactions.";
+      }
+    }
   }
+  const usd1LaunchDetails = usd1Topup ? {
+    compilePath: topupTransactions.length
+      ? (atomicCombined ? "atomic-topup+launch" : "split-topup+launch")
+      : "launch-only",
+    requiredQuoteAmount: usd1Topup.requiredQuoteAmount,
+    currentQuoteAmount: usd1Topup.currentQuoteAmount,
+    shortfallQuoteAmount: usd1Topup.shortfallQuoteAmount,
+    inputSol: usd1Topup.inputSol,
+    expectedQuoteOut: usd1Topup.expectedQuoteOut,
+    minQuoteOut: usd1Topup.minQuoteOut,
+  } : null;
   return {
     mint: mintKeypair.publicKey.toBase58(),
     launchCreator: owner.publicKey.toBase58(),
+    predictedDevBuyTokenAmountRaw: predictedDevBuyTokenAmount ? predictedDevBuyTokenAmount.toString(10) : null,
     compiledTransactions,
-    atomicCombined: false,
+    atomicCombined,
     atomicFallbackReason,
+    usd1LaunchDetails,
+    usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
   };
 }
 
 async function compileFollowBuy(request, labelPrefix, atomic = false) {
   const owner = parseKeypair(request.ownerSecret);
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
     connection,
     owner,
@@ -1247,16 +1948,18 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
   });
   const mint = new PublicKey(request.mint);
   const quote = resolveQuoteAssetConfig(request.quoteAsset);
-  if (allowAtaCreation(request) && quote.asset !== "sol") {
-    await ensureAssociatedTokenAccountExists(connection, owner, quote.mint, request, raydium);
-  }
+  await ensureQuoteTokenAccountReady(connection, owner, request, raydium, quote.mint);
   const buyAmount = parseDecimalToBn(request.buyAmountSol, quote.decimals, `follow buy amount ${quote.label}`);
+  const txVersion = atomic && quote.asset === "usd1"
+    ? atomicUsd1TxVersion(request)
+    : txVersionFromFormat(request.txFormat);
   const options = {
     programId: LAUNCHPAD_PROGRAM,
     mintA: mint,
+    mintB: quote.mint,
     buyAmount,
     slippage: new BN(String(request.slippageBps || 0)),
-    txVersion: txVersionFromFormat(request.txFormat),
+    txVersion,
     computeBudgetConfig: buildComputeBudgetConfig(request.txConfig),
     txTipConfig: buildTipConfig(request.txConfig),
   };
@@ -1301,6 +2004,7 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
         requiredQuoteAmount: formatBn(buyAmount, quote.decimals, 6),
       },
       formatBn(buyAmount, quote.decimals, 6),
+      usd1QuoteContext,
     );
     if (usd1Topup && usd1Topup.swapResult) {
       const topupTransactions = extractTransactions(usd1Topup.swapResult);
@@ -1324,6 +2028,7 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
           inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
           lastValidBlockHeight: combined.lastValidBlockHeight,
         })[0],
+        usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
       };
     }
   }
@@ -1337,6 +2042,7 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
     })[0],
+    usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
   };
 }
 
@@ -1350,14 +2056,20 @@ async function compileFollowSell(request) {
     disableFeatureCheck: true,
   });
   const mint = new PublicKey(request.mint);
-  const tokenAccount = getAssociatedTokenAddressSync(mint, owner.publicKey, false, TOKEN_PROGRAM_ID);
-  let balanceInfo;
-  try {
-    balanceInfo = await connection.getTokenAccountBalance(tokenAccount, request.commitment || "processed");
-  } catch (_error) {
-    return { compiledTransaction: null };
+  await ensureQuoteTokenAccountReady(connection, owner, request, raydium);
+  let rawAmount;
+  if (request.exactTokenAmountRaw) {
+    rawAmount = new BN(String(request.exactTokenAmountRaw));
+  } else {
+    const tokenAccount = getAssociatedTokenAddressSync(mint, owner.publicKey, false, TOKEN_PROGRAM_ID);
+    let balanceInfo;
+    try {
+      balanceInfo = await connection.getTokenAccountBalance(tokenAccount, request.commitment || "processed");
+    } catch (_error) {
+      return { compiledTransaction: null };
+    }
+    rawAmount = new BN(balanceInfo.value.amount || "0");
   }
-  const rawAmount = new BN(balanceInfo.value.amount || "0");
   if (rawAmount.isZero()) {
     return { compiledTransaction: null };
   }
@@ -1365,10 +2077,22 @@ async function compileFollowSell(request) {
   if (sellAmount.isZero()) {
     return { compiledTransaction: null };
   }
-  const livePool = await loadLivePoolContext(raydium, connection, mint, request.quoteAsset);
+  const livePool = request.exactTokenAmountRaw && request.poolId && request.mode && request.launchCreator
+    ? await buildPrelaunchPoolContext(
+      raydium,
+      connection,
+      mint,
+      request.launchCreator,
+      request.mode,
+      request.quoteAsset,
+    )
+    : request.poolId
+      ? await loadPoolContextByPoolId(raydium, connection, request.poolId, request.quoteAsset)
+      : await loadLivePoolContext(raydium, connection, mint, request.quoteAsset);
   const buildResult = await raydium.launchpad.sellToken({
     programId: LAUNCHPAD_PROGRAM,
     mintA: mint,
+    mintB: livePool.quoteMint,
     sellAmount,
     poolInfo: livePool.poolInfo,
     configInfo: livePool.configInfo,
@@ -1377,6 +2101,8 @@ async function compileFollowSell(request) {
     txVersion: txVersionFromFormat(request.txFormat),
     computeBudgetConfig: buildComputeBudgetConfig(request.txConfig),
     txTipConfig: buildTipConfig(request.txConfig),
+    mintAProgram: TOKEN_PROGRAM_ID,
+    skipCheckMintA: true,
     associatedOnly: false,
     checkCreateATAOwner: true,
   });
@@ -1390,6 +2116,42 @@ async function compileFollowSell(request) {
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
     })[0],
+  };
+}
+
+async function deriveCanonicalPoolId(request) {
+  const mint = new PublicKey(request.mint);
+  const quote = resolveQuoteAssetConfig(request.quoteAsset);
+  const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote.mint).publicKey;
+  return {
+    poolId: poolId.toBase58(),
+  };
+}
+
+async function predictDevBuyTokenAmount(request) {
+  const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const raydium = await Raydium.load({
+    connection,
+    owner: null,
+    disableLoadToken: true,
+    disableFeatureCheck: true,
+  });
+  const defaults = await loadLaunchDefaults(
+    raydium,
+    connection,
+    null,
+    request.mode,
+    request.quoteAsset,
+  );
+  const predicted = await estimateDevBuyTokenAmount(
+    raydium,
+    connection,
+    defaults,
+    request.devBuy,
+    request.slippageBps,
+  );
+  return {
+    predictedDevBuyTokenAmountRaw: predicted ? predicted.toString(10) : null,
   };
 }
 
@@ -1481,6 +2243,37 @@ async function detectImportContext(request) {
   return candidates[0];
 }
 
+async function warmState(request) {
+  const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const usd1QuoteContext = createUsd1QuoteRequestContext();
+  const raydium = await Raydium.load({
+    connection,
+    owner: null,
+    disableLoadToken: true,
+    disableFeatureCheck: true,
+  });
+  const launchDefaultsPromise = Promise.all([
+    loadLaunchDefaults(raydium, connection, null, "regular", "sol"),
+    loadLaunchDefaults(raydium, connection, null, "regular", "usd1"),
+    loadLaunchDefaults(raydium, connection, null, "bonkers", "sol"),
+    loadLaunchDefaults(raydium, connection, null, "bonkers", "usd1"),
+  ]);
+  const routeSetupPromise = loadUsd1RouteSetup(raydium, connection, usd1QuoteContext);
+  const [launchDefaults, routeSetup] = await Promise.all([launchDefaultsPromise, routeSetupPromise]);
+  return {
+    warmedLaunchDefaults: launchDefaults.map((entry) => ({
+      mode: entry.mode,
+      quoteAsset: entry.quoteAsset,
+      platformId: entry.platformId.toBase58(),
+      configId: entry.configId.toBase58(),
+      quoteMint: entry.quoteMint.toBase58(),
+    })),
+    usd1RoutePoolId: routeSetup.pool.id,
+    usd1RouteConfigId: routeSetup.pool.config && routeSetup.pool.config.id ? routeSetup.pool.config.id : "",
+    usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
+  };
+}
+
 async function readRequest() {
   const chunks = [];
   for await (const chunk of process.stdin) {
@@ -1512,11 +2305,20 @@ async function main() {
     case "compile-follow-sell":
       response = await compileFollowSell(request);
       break;
+    case "predict-dev-buy-token-amount":
+      response = await predictDevBuyTokenAmount(request);
+      break;
+    case "derive-pool-id":
+      response = await deriveCanonicalPoolId(request);
+      break;
     case "fetch-market-snapshot":
       response = await fetchMarketSnapshot(request);
       break;
     case "detect-import-context":
       response = await detectImportContext(request);
+      break;
+    case "warm-state":
+      response = await warmState(request);
       break;
     default:
       throw new Error(`Unsupported bonk helper action: ${request.action || "(missing)"}`);

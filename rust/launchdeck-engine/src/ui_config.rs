@@ -5,7 +5,7 @@ use crate::{
     paths,
 };
 use serde_json::{Value, json};
-use std::fs;
+use std::{env, fs};
 
 const PRESET_IDS: [&str; 3] = ["preset1", "preset2", "preset3"];
 const DEFAULT_PROVIDER: &str = "helius-sender";
@@ -14,6 +14,17 @@ const DEFAULT_TRADE_PRIORITY_FEE_SOL: &str = "0.009";
 const DEFAULT_TRADE_TIP_SOL: &str = "0.01";
 const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "90";
 const DEFAULT_DEV_BUY_AMOUNTS: [&str; 3] = ["0.5", "1", "2"];
+
+fn configured_track_send_block_height_default() -> bool {
+    matches!(
+        env::var("LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 fn legacy_provider_alias(provider: &str) -> String {
     match provider {
@@ -138,7 +149,7 @@ pub fn create_default_persistent_config() -> Value {
             "activePresetId": "preset1",
             "presetEditing": false,
             "misc": {
-                "trackSendBlockHeight": false
+                "trackSendBlockHeight": configured_track_send_block_height_default()
             },
             "automaticDevSell": {
                 "enabled": false,
@@ -522,7 +533,7 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
             "activePresetId": active_preset_id,
             "presetEditing": bool_value(defaults.get("presetEditing"), false),
             "misc": {
-                "trackSendBlockHeight": false
+                "trackSendBlockHeight": configured_track_send_block_height_default()
             },
             "automaticDevSell": {
                 "enabled": bool_value(legacy_auto_sell.get("enabled"), false),
@@ -625,7 +636,7 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             "misc": {
                 "trackSendBlockHeight": bool_value(
                     merged_defaults.get("misc").and_then(|value| value.get("trackSendBlockHeight")),
-                    false
+                    configured_track_send_block_height_default()
                 )
             },
             "automaticDevSell": {

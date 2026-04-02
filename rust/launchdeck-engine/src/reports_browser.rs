@@ -186,6 +186,16 @@ pub fn build_report_summary_entry(file_name: &str) -> Result<ReportSummaryEntry,
 }
 
 pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
+    let cache = report_summary_cache();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+    {
+        return if sort == "oldest" {
+            cached.oldest.clone()
+        } else {
+            cached.newest.clone()
+        };
+    }
     let dir = paths::reports_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return vec![];
@@ -212,17 +222,6 @@ pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
         })
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-    let cache = report_summary_cache();
-    if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.as_ref()
-        && cached.files == files
-    {
-        return if sort == "oldest" {
-            cached.oldest.clone()
-        } else {
-            cached.newest.clone()
-        };
-    }
     let mut newest = files
         .iter()
         .filter_map(|entry| build_report_summary_entry(&entry.file_name).ok())
@@ -238,6 +237,45 @@ pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
         });
     }
     if sort == "oldest" { oldest } else { newest }
+}
+
+pub fn record_persisted_report_payload(file_name: &str, payload: &Value) {
+    let safe_file_name = std::path::Path::new(file_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if safe_file_name.is_empty() {
+        return;
+    }
+    let written_at_ms = payload
+        .get("writtenAtMs")
+        .and_then(Value::as_u64)
+        .map(u128::from)
+        .unwrap_or(0);
+    let summary = build_report_summary_entry_from_payload(&safe_file_name, payload, written_at_ms);
+    let mut cache = match report_summary_cache().lock() {
+        Ok(cache) => cache,
+        Err(_) => return,
+    };
+    let existing = cache.get_or_insert_with(|| ReportSummaryCache {
+        files: vec![],
+        newest: vec![],
+        oldest: vec![],
+    });
+    existing.files.retain(|entry| entry.file_name != safe_file_name);
+    existing.files.push(ReportCacheFileMeta {
+        file_name: safe_file_name.clone(),
+        modified_ms: written_at_ms,
+        len: 0,
+    });
+    existing.newest.retain(|entry| entry.fileName != safe_file_name);
+    existing.oldest.retain(|entry| entry.fileName != safe_file_name);
+    existing.newest.push(summary.clone());
+    existing.newest.sort_by(|left, right| right.writtenAtMs.cmp(&left.writtenAtMs));
+    existing.oldest = existing.newest.clone();
+    existing.oldest.reverse();
 }
 
 fn report_summary_cache() -> &'static Mutex<Option<ReportSummaryCache>> {
