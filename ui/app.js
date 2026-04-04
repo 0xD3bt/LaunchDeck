@@ -129,6 +129,7 @@ const providerSelect = document.getElementById("provider-select");
 const buyProviderSelect = document.getElementById("buy-provider-select");
 const sellProviderSelect = document.getElementById("sell-provider-select");
 const settingsBackendRegionSummary = document.getElementById("settings-backend-region-summary");
+const platformRuntimeIndicators = document.getElementById("platform-runtime-indicators");
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
@@ -268,11 +269,24 @@ const bagsIdentityVerifiedWalletInput = getNamedInput("bagsIdentityVerifiedWalle
 const POPOUT_FORM_WIDTH = 532;
 const POPOUT_REPORTS_WIDTH = 560;
 const POPOUT_WORKSPACE_GAP = 12;
+const POPOUT_WINDOW_NAME = "launchdeck-popout";
 const pageSearchParams = new URLSearchParams(window.location.search);
-const isPopoutMode = pageSearchParams.get("popout") === "1";
-const popoutOutputParam = pageSearchParams.get("output");
-const popoutReportsParam = pageSearchParams.get("reports");
+const hasLegacyPopoutQuery = pageSearchParams.get("popout") === "1";
+const isPopoutMode = window.name === POPOUT_WINDOW_NAME || hasLegacyPopoutQuery;
 let popoutAutosizeFrame = 0;
+let liveSyncTimer = 0;
+let liveSyncReady = false;
+let isApplyingLiveSync = false;
+const LIVE_SYNC_CHANNEL_NAME = "launchdeck-live-sync.v1";
+const LIVE_SYNC_STORAGE_KEY = "launchdeck.liveSyncEvent.v1";
+const LIVE_SYNC_SESSION_STORAGE_KEY = "launchdeck.liveSyncSnapshot.v1";
+const EARLY_BOOT_STORAGE_KEY = "launchdeck.earlyBootSnapshot.v1";
+const EARLY_BOOT_SESSION_STORAGE_KEY = "launchdeck.earlyBootSnapshot.session.v1";
+const LIVE_SYNC_MAX_AGE_MS = 5 * 60 * 1000;
+const LIVE_SYNC_SOURCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const liveSyncChannel = typeof BroadcastChannel === "function"
+  ? new BroadcastChannel(LIVE_SYNC_CHANNEL_NAME)
+  : null;
 const RequestUtils = window.LaunchDeckRequestUtils || {};
 const RenderUtils = window.LaunchDeckRenderUtils || {};
 const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
@@ -281,7 +295,70 @@ const DEFAULT_LAUNCHPAD_TOKEN_METADATA = Object.freeze({
 });
 const STANDARD_RPC_SLIPPAGE_DEFAULT = "20";
 
+function readEarlyLiveSyncSnapshot() {
+  const isFreshPayload = (payload) => {
+    if (!payload || typeof payload !== "object") return false;
+    const timestampMs = Number(payload.timestampMs);
+    return Number.isFinite(timestampMs) && (Date.now() - timestampMs) <= LIVE_SYNC_MAX_AGE_MS;
+  };
+  try {
+    if (window.opener && window.opener !== window) {
+      const openerPayload = window.opener.__launchdeckLiveSyncSnapshot;
+      if (isFreshPayload(openerPayload)) return openerPayload;
+    }
+  } catch (_error) {
+    // Ignore opener access failures and continue with storage fallbacks.
+  }
+  try {
+    const sessionRaw = window.sessionStorage.getItem(EARLY_BOOT_SESSION_STORAGE_KEY);
+    if (sessionRaw) {
+      const sessionPayload = JSON.parse(sessionRaw);
+      if (isFreshPayload(sessionPayload)) return sessionPayload;
+    }
+  } catch (_error) {
+    // Ignore session storage failures and continue with other fallbacks.
+  }
+  try {
+    const localRaw = window.localStorage.getItem(EARLY_BOOT_STORAGE_KEY);
+    if (localRaw) {
+      const localPayload = JSON.parse(localRaw);
+      if (isFreshPayload(localPayload)) return localPayload;
+    }
+  } catch (_error) {
+    // Ignore localStorage failures and continue with live sync fallback.
+  }
+  try {
+    const sessionRaw = window.sessionStorage.getItem(LIVE_SYNC_SESSION_STORAGE_KEY);
+    if (sessionRaw) {
+      const sessionPayload = JSON.parse(sessionRaw);
+      if (isFreshPayload(sessionPayload)) return sessionPayload;
+    }
+  } catch (_error) {
+    // Ignore session storage failures and continue with localStorage fallback.
+  }
+  try {
+    const localRaw = window.localStorage.getItem(LIVE_SYNC_STORAGE_KEY);
+    if (localRaw) {
+      const localPayload = JSON.parse(localRaw);
+      if (isFreshPayload(localPayload)) return localPayload;
+    }
+  } catch (_error) {
+    // Ignore localStorage failures and keep boot functional.
+  }
+  return null;
+}
+
+const earlyLiveSyncSnapshot = readEarlyLiveSyncSnapshot();
+if (earlyLiveSyncSnapshot) {
+  window.__launchdeckEarlyLiveSyncSnapshot = earlyLiveSyncSnapshot;
+}
+
 if (isPopoutMode) {
+  try {
+    if (window.name !== POPOUT_WINDOW_NAME) window.name = POPOUT_WINDOW_NAME;
+  } catch (_error) {
+    // Ignore window.name failures and continue with static popout behavior.
+  }
   document.body.classList.add("popout-mode");
   document.title = "LaunchDeck Popout";
   window.addEventListener("load", () => {
@@ -293,12 +370,21 @@ if (isPopoutMode) {
     }).catch(() => {});
   }
 }
+if (pageSearchParams.has("popout") || pageSearchParams.has("output") || pageSearchParams.has("reports")) {
+  const cleanUrl = new URL(window.location.href);
+  cleanUrl.searchParams.delete("popout");
+  cleanUrl.searchParams.delete("output");
+  cleanUrl.searchParams.delete("reports");
+  try {
+    window.history.replaceState(null, "", `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`);
+  } catch (_error) {
+    // Ignore history replacement failures and keep boot functional.
+  }
+}
 
 setThemeMode(getStoredThemeMode(), { persist: false });
 setOutputSectionVisible(
-  isPopoutMode && popoutOutputParam != null
-    ? popoutOutputParam === "1"
-    : getStoredOutputSectionVisible(),
+  getStoredOutputSectionVisible(),
 );
 setImageLayoutCompact(getStoredImageLayoutCompact(), { persist: false });
 
@@ -340,10 +426,17 @@ let startupWarmState = {
   ready: false,
   promise: null,
   enabled: true,
+  backendLoaded: false,
+  backendPayload: null,
+  backendError: "",
 };
 const STARTUP_WARM_REQUEST_TIMEOUT_MS = 4000;
 const STARTUP_WARM_WAIT_TIMEOUT_MS = 1500;
+const STARTUP_WARM_CACHE_STORAGE_KEY = "launchdeck.startupWarmCache.v1";
+const WALLET_STATUS_LAST_REFRESH_STORAGE_KEY = "launchdeck.walletStatusLastRefreshAtMs";
+let walletStatusRefreshIntervalMs = 30000;
 const RUNTIME_STATUS_REFRESH_INTERVAL_MS = 15000;
+const STARTUP_WARM_CACHE_MAX_AGE_MS = RUNTIME_STATUS_REFRESH_INTERVAL_MS;
 const WARM_ACTIVITY_DEBOUNCE_MS = 1000;
 let quoteTimer = null;
 let defaultsApplied = false;
@@ -376,6 +469,7 @@ let metadataUploadState = {
   autoRetryDisabled: false,
 };
 let runtimeStatusRefreshTimer = null;
+let walletStatusRefreshTimer = null;
 let warmActivityState = {
   debounceTimer: null,
   inFlightPromise: null,
@@ -480,6 +574,10 @@ const ROUTE_CAPABILITIES = {
     buy: { tip: true, priority: true, slippage: true },
     sell: { tip: true, priority: true, slippage: true },
   },
+};
+const PROVIDER_FEE_REQUIREMENTS = {
+  "helius-sender": { minTipSol: 0.0002, priorityRequired: true },
+  "jito-bundle": { minTipSol: 0.0002, priorityRequired: true },
 };
 const TOTAL_SUPPLY_TOKENS = 1_000_000_000n;
 const TOKEN_DECIMALS = 6;
@@ -1142,7 +1240,7 @@ const reportsFeature = window.ReportsFeature.create({
     maxListWidth: REPORTS_TERMINAL_MAX_LIST_WIDTH,
   },
   schedulePopoutAutosize,
-  refreshOnVisible: () => refreshReportsTerminal(),
+  refreshOnVisible: () => refreshReportsTerminal({ showLoading: false }),
   renderOutput: () => renderReportsTerminalOutput(),
   renderList: () => renderReportsTerminalList(),
   loadEntry: (id, options) => loadReportsTerminalEntry(id, options),
@@ -1163,6 +1261,16 @@ reportsFeature.bindEvents();
 
 if (reportsTerminalOutput) {
   reportsTerminalOutput.addEventListener("click", async (event) => {
+    const reportTabButton = event.target.closest("[data-report-tab]");
+    if (reportTabButton) {
+      const nextTab = normalizeReportsTerminalTab(reportTabButton.getAttribute("data-report-tab"));
+      if (nextTab !== reportsTerminalState.activeTab) {
+        reportsTerminalState.activeTab = nextTab;
+        renderReportsTerminalOutput();
+        scheduleLiveSyncBroadcast();
+      }
+      return;
+    }
     const benchmarkPopoutButton = event.target.closest("[data-benchmark-popout]");
     if (benchmarkPopoutButton) {
       if (benchmarkPopoutButton.disabled) return;
@@ -1200,16 +1308,18 @@ function getStoredReportsTerminalListWidth() {
 }
 
 function setReportsTerminalListWidth(width, options) {
-  return reportsFeature.setListWidth(width, options);
+  const result = reportsFeature.setListWidth(width, options);
+  scheduleLiveSyncBroadcast();
+  return result;
 }
 
 function setReportsTerminalVisible(isVisible, options) {
-  return reportsFeature.setVisible(isVisible, options);
+  const result = reportsFeature.setVisible(isVisible, options);
+  scheduleLiveSyncBroadcast({ immediate: true });
+  return result;
 }
 setReportsTerminalVisible(
-  isPopoutMode && popoutReportsParam != null
-    ? popoutReportsParam === "1"
-    : getStoredReportsTerminalVisible(),
+  getStoredReportsTerminalVisible(),
   { persist: false },
 );
 setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
@@ -1847,6 +1957,7 @@ function setConfig(nextConfig) {
   }
   renderPresetChips();
   renderQuickDevBuyButtons(nextConfig);
+  scheduleLiveSyncBroadcast({ immediate: true });
 }
 
 function normalizeAutoFeeCapValue(value) {
@@ -1894,6 +2005,625 @@ function formatWarmTimestamp(value) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function normalizeWatcherHealth(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function truncateStatusText(value, maxLength = 140) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function providerFeeRequirements(provider) {
+  return PROVIDER_FEE_REQUIREMENTS[String(provider || "").trim().toLowerCase()] || null;
+}
+
+function providerMinimumTipSol(provider) {
+  const requirements = providerFeeRequirements(provider);
+  return requirements ? Number(requirements.minTipSol || 0) : 0;
+}
+
+function providerRequiresPriorityFee(provider) {
+  const requirements = providerFeeRequirements(provider);
+  return Boolean(requirements && requirements.priorityRequired);
+}
+
+function providerRequirementLabel(provider) {
+  const normalized = String(provider || "").trim().toLowerCase();
+  return PROVIDER_LABELS[normalized] || normalized || "selected provider";
+}
+
+function validateNonNegativeSolField(value) {
+  if (!value) return "";
+  const n = Number(value);
+  if (isNaN(n) || n < 0) return "Must be a valid number";
+  return "";
+}
+
+function validateRequiredPriorityFeeField(value, provider) {
+  const label = providerRequirementLabel(provider);
+  if (!value) return `Priority fee is required for ${label}.`;
+  const n = Number(value);
+  if (isNaN(n) || n <= 0) return `Priority fee must be greater than 0 for ${label}.`;
+  return "";
+}
+
+function validateRequiredTipField(value, provider) {
+  const label = providerRequirementLabel(provider);
+  const minimumTipSol = providerMinimumTipSol(provider);
+  if (!value) return `Tip is required for ${label}.`;
+  const n = Number(value);
+  if (isNaN(n) || n < 0) return "Must be a valid number";
+  if (minimumTipSol > 0 && n < minimumTipSol) {
+    return `Tip must be at least ${minimumTipSol.toFixed(4)} SOL for ${label}.`;
+  }
+  return "";
+}
+
+function validateOptionalAutoFeeCapField(value, provider) {
+  if (!value) return "";
+  const n = Number(value);
+  if (isNaN(n) || n <= 0) return "Must be greater than 0";
+  const minimumTipSol = providerMinimumTipSol(provider);
+  if (minimumTipSol > 0 && n < minimumTipSol) {
+    return `Max auto fee must be at least ${minimumTipSol.toFixed(4)} SOL for ${providerRequirementLabel(provider)}.`;
+  }
+  return "";
+}
+
+function normalizeWarmTargets(values) {
+  return Array.isArray(values)
+    ? values.filter((value) => value && typeof value === "object")
+    : [];
+}
+
+function formatWarmTargetName(target) {
+  const label = String(target && target.label || target && target.provider || "Target").trim() || "Target";
+  const rawTarget = String(target && target.target || "").trim();
+  if (!rawTarget) return label;
+  const normalizedTarget = /^https?:\/\//i.test(rawTarget) || /^wss?:\/\//i.test(rawTarget)
+    ? shortenReportEndpoint(rawTarget)
+    : rawTarget;
+  return `${label} (${normalizedTarget})`;
+}
+
+function summarizeWarmFailures(targets, limit = 2) {
+  const items = targets.slice(0, limit).map((target) => {
+    const name = formatWarmTargetName(target);
+    const error = truncateStatusText(target && target.lastError || "", 100);
+    return error ? `${name}: ${error}` : name;
+  });
+  if (targets.length > limit) {
+    items.push(`+${targets.length - limit} more`);
+  }
+  return items.join(" | ");
+}
+
+function summarizeWarmRateLimits(targets, limit = 2) {
+  const items = targets.slice(0, limit).map((target) => {
+    const name = formatWarmTargetName(target);
+    const message = truncateStatusText(target && target.lastRateLimitMessage || "", 100);
+    return message ? `${name}: ${message}` : `${name}: reachable but rate-limited`;
+  });
+  if (targets.length > limit) {
+    items.push(`+${targets.length - limit} more`);
+  }
+  return items.join(" | ");
+}
+
+function latestWarmTargetSuccess(targets) {
+  const values = targets
+    .map((target) => Number(target && target.lastSuccessAtMs || 0))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return values.length ? Math.max(...values) : 0;
+}
+
+function uniqueWarmTargetProviders(targets) {
+  return Array.from(new Set(
+    targets
+      .map((target) => String(target && target.provider || "").trim())
+      .filter(Boolean),
+  ));
+}
+
+function summarizeStartupWarmFailures(targets, limit = 2) {
+  const items = targets.slice(0, limit).map((target) => {
+    const label = String(target && target.label || "Target").trim() || "Target";
+    const error = truncateStatusText(target && target.error || "", 100);
+    return error ? `${label}: ${error}` : label;
+  });
+  if (targets.length > limit) {
+    items.push(`+${targets.length - limit} more`);
+  }
+  return items.join(" | ");
+}
+
+function describeWarmReason(reason) {
+  switch (String(reason || "").trim()) {
+    case "disabled-by-env":
+      return "disabled by settings";
+    case "suspended-idle":
+      return "paused automatically because the app is idle";
+    case "idle-awaiting-browser-activity":
+      return "waiting for activity before warming";
+    case "active-in-flight-request":
+      return "active because requests are in flight";
+    case "active-operator-activity":
+      return "active because the app is in use";
+    default:
+      return String(reason || "").trim() || "waiting";
+  }
+}
+
+function isWarmAutoPausedReason(reason) {
+  const normalized = String(reason || "").trim();
+  return normalized === "suspended-idle" || normalized === "idle-awaiting-browser-activity";
+}
+
+function walletRefreshPausedByIdleSuspend() {
+  const warm = latestRuntimeStatus && latestRuntimeStatus.warm && typeof latestRuntimeStatus.warm === "object"
+    ? latestRuntimeStatus.warm
+    : null;
+  if (!warm || warm.idleSuspendEnabled === false) return false;
+  if (warm.active === true) return false;
+  return Boolean(warm.suspended) || isWarmAutoPausedReason(warm.reason);
+}
+
+function clearWalletStatusRefreshTimer() {
+  if (!walletStatusRefreshTimer) return;
+  window.clearTimeout(walletStatusRefreshTimer);
+  walletStatusRefreshTimer = null;
+}
+
+function syncWalletStatusRefreshLoop({ immediateResume = false } = {}) {
+  if (walletRefreshPausedByIdleSuspend()) {
+    clearWalletStatusRefreshTimer();
+    return;
+  }
+  if (walletStatusRefreshTimer) return;
+  if (immediateResume) {
+    refreshWalletStatus(true, true).catch(() => {});
+    return;
+  }
+  scheduleWalletStatusRefresh();
+}
+
+/** Fresh success window (~3× default 10s keep-warm interval, capped). */
+const WARM_TELEMETRY_FRESH_MS = 180000;
+
+function warmTargetFreshSuccess(target, refNowMs) {
+  const t = Number(target && target.lastSuccessAtMs || 0);
+  return Number.isFinite(t) && t > 0 && (refNowMs - t) <= WARM_TELEMETRY_FRESH_MS;
+}
+
+function isWarmTelemetryTargetRateLimited(target) {
+  return String(target && target.status || "").trim() === "rate-limited";
+}
+
+function isWarmTelemetryTargetHealthy(target, refNowMs) {
+  if (isWarmTelemetryTargetRateLimited(target)) {
+    return false;
+  }
+  if (String(target && target.lastError || "").trim()) {
+    return false;
+  }
+  return warmTargetFreshSuccess(target, refNowMs);
+}
+
+function startupWarmSnapshot() {
+  if (!startupWarmState.enabled) {
+    return {
+      disabled: true,
+      stateTargets: [],
+      endpointTargets: [],
+      error: "",
+    };
+  }
+  const payload = startupWarmState.backendPayload && typeof startupWarmState.backendPayload === "object"
+    ? startupWarmState.backendPayload
+    : null;
+  const summary = payload && payload.startupWarm && typeof payload.startupWarm === "object"
+    ? payload.startupWarm
+    : null;
+  const stateTargets = summary && summary.stateTargets && typeof summary.stateTargets === "object"
+    ? Array.from({ length: Number(summary.stateTargets.total || 0) }, (_, index) => ({
+        label: `Startup state target ${index + 1}`,
+        ok: index < Number(summary.stateTargets.healthy || 0),
+        error: "",
+      }))
+    : payload ? [
+        { label: "Lookup tables", ok: Boolean(payload.lookupTables && payload.lookupTables.ok), error: payload.lookupTables && payload.lookupTables.error ? String(payload.lookupTables.error) : "" },
+        { label: "Pump global", ok: Boolean(payload.pumpGlobal && payload.pumpGlobal.ok), error: payload.pumpGlobal && payload.pumpGlobal.error ? String(payload.pumpGlobal.error) : "" },
+        { label: "Bonk state", ok: Boolean(payload.bonkState && payload.bonkState.ok), error: payload.bonkState && payload.bonkState.error ? String(payload.bonkState.error) : "" },
+        { label: "Fee market", ok: Boolean(payload.feeMarket && payload.feeMarket.ok), error: payload.feeMarket && payload.feeMarket.error ? String(payload.feeMarket.error) : "" },
+      ].filter((target) => target.ok || target.error) : [];
+  const endpointTargets = summary && summary.endpointTargets && typeof summary.endpointTargets === "object"
+    ? Array.from({ length: Number(summary.endpointTargets.total || 0) }, (_, index) => ({
+        label: String(summary.endpointTargets.label || "Endpoint warm").trim() || "Endpoint warm",
+        ok: index < Number(summary.endpointTargets.healthy || 0),
+        error: "",
+      }))
+    : payload && Array.isArray(payload.heliusSender)
+      ? payload.heliusSender.map((entry) => ({
+          label: String(entry && entry.endpoint || "Helius Sender").trim() || "Helius Sender",
+          ok: Boolean(entry && entry.ok),
+          error: entry && entry.error ? String(entry.error) : "",
+        }))
+      : [];
+  const stateFailures = summary && Array.isArray(summary.stateFailures)
+    ? summary.stateFailures.map((entry) => ({
+        label: String(entry && entry.label || "Startup state target").trim() || "Startup state target",
+        error: entry && entry.error ? String(entry.error) : "",
+      }))
+    : [];
+  const endpointFailures = summary && Array.isArray(summary.endpointFailures)
+    ? summary.endpointFailures.map((entry) => ({
+        label: String(entry && entry.label || summary && summary.endpointTargets && summary.endpointTargets.label || "Endpoint warm").trim() || "Endpoint warm",
+        error: entry && entry.error ? String(entry.error) : "",
+      }))
+    : [];
+  return {
+    disabled: false,
+    stateTargets,
+    endpointTargets,
+    stateFailures,
+    endpointFailures,
+    error: String(startupWarmState.backendError || "").trim(),
+  };
+}
+
+function currentWatchPathSnapshot() {
+  const runtimeFollow = runtimeFollowDaemonStatus();
+  const health = followStatusSnapshot().health || null;
+  const watcherHealthValues = [
+    health && health.signatureWatcher,
+    health && health.slotWatcher,
+    health && health.marketWatcher,
+  ].map(normalizeWatcherHealth).filter(Boolean);
+  const watcherMode = [
+    health && health.signatureWatcherMode,
+    health && health.slotWatcherMode,
+    health && health.marketWatcherMode,
+  ].map((value) => String(value || "").trim()).find(Boolean) || "";
+  const endpoint = health && health.watchEndpoint ? String(health.watchEndpoint).trim() : "";
+  if (!runtimeFollow || runtimeFollow.configured === false) {
+    return {
+      tone: "gray",
+      title: "Watch Path: disabled.",
+    };
+  }
+  if (!runtimeFollow.reachable) {
+    const reason = String(runtimeFollow.error || followJobsState.error || "Follow daemon is unreachable.").trim();
+    return {
+      tone: "red",
+      title: `Watch Path: offline. ${reason}`,
+    };
+  }
+  const healthyWatchers = watcherHealthValues.filter((value) => value === "healthy").length;
+  const failedWatchers = watcherHealthValues.filter((value) => value === "failed").length;
+  const degradedWatchers = watcherHealthValues.filter((value) => value === "degraded").length;
+  if (!endpoint) {
+    return {
+      tone: failedWatchers > 0 || degradedWatchers > 0 ? "yellow" : "green",
+      title: failedWatchers > 0 || degradedWatchers > 0
+        ? "Watch Path: partial. Follow daemon is reachable, but watcher health is mixed and no active endpoint is reported yet."
+        : "Watch Path: healthy. Ready, but no active watcher is running right now.",
+    };
+  }
+  if (failedWatchers > 0 || degradedWatchers > 0) {
+    const modeLabel = watcherMode || "websocket";
+    return {
+      tone: healthyWatchers > 0 ? "yellow" : "red",
+      title: healthyWatchers > 0
+        ? `Watch Path: partial. ${modeLabel} via ${shortenReportEndpoint(endpoint)}.`
+        : `Watch Path: failing. ${modeLabel} via ${shortenReportEndpoint(endpoint)}.`,
+    };
+  }
+  if (watcherMode === "helius-transaction-subscribe") {
+    return {
+      tone: "green",
+      title: `Watch Path: healthy. Helius transactionSubscribe via ${shortenReportEndpoint(endpoint)}.`,
+    };
+  }
+  return {
+    tone: "green",
+    title: `Watch Path: healthy. Standard websocket via ${shortenReportEndpoint(endpoint)}.`,
+  };
+}
+
+function buildPlatformRuntimeIndicatorState() {
+  const warm = latestRuntimeStatus && latestRuntimeStatus.warm && typeof latestRuntimeStatus.warm === "object"
+    ? latestRuntimeStatus.warm
+    : null;
+  const startupWarm = startupWarmSnapshot();
+  const useStartupWarmFallback = !appBootstrapState.runtimeLoaded && startupWarmState.backendLoaded;
+  const nowMs = Date.now();
+  const stateTargets = normalizeWarmTargets(warm && warm.stateTargets);
+  const endpointTargets = normalizeWarmTargets(warm && warm.endpointTargets);
+  const activeStateTargets = stateTargets.filter((target) => Boolean(target && target.active));
+  const activeEndpointTargets = endpointTargets.filter((target) => Boolean(target && target.active));
+  const healthyStateTargets = stateTargets.filter((target) => isWarmTelemetryTargetHealthy(target, nowMs));
+  const healthyEndpointTargets = endpointTargets.filter((target) => isWarmTelemetryTargetHealthy(target, nowMs));
+  const rateLimitedActiveStateTargets = activeStateTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
+  const rateLimitedActiveEndpointTargets = activeEndpointTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
+  const staleActiveStateTargets = activeStateTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
+  const staleActiveEndpointTargets = activeEndpointTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
+  const failingActiveStateTargets = activeStateTargets.filter((target) => String(target && target.lastError || "").trim());
+  const failingActiveEndpointTargets = activeEndpointTargets.filter((target) => String(target && target.lastError || "").trim());
+  const failingStateTargets = stateTargets.filter((target) => String(target && target.lastError || "").trim());
+  const failingEndpointTargets = endpointTargets.filter((target) => String(target && target.lastError || "").trim());
+  const endpointTargetProviders = uniqueWarmTargetProviders(activeEndpointTargets.length ? activeEndpointTargets : endpointTargets);
+  const senderConnectionWarm = (endpointTargetProviders.length === 1 && endpointTargetProviders[0] === "helius-sender")
+    || (!endpointTargetProviders.length && startupWarm.endpointTargets.length > 0);
+  const endpointWarmLabel = senderConnectionWarm ? "Sender connection warm" : "Endpoint prewarm";
+  const warmProviders = warm && Array.isArray(warm.selectedProviders)
+    ? warm.selectedProviders.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  const lastWarmSuccess = warm ? formatWarmTimestamp(warm.lastWarmSuccessAtMs) : "--";
+  const warmReason = warm && warm.reason ? String(warm.reason).trim() : "";
+  const warmError = warm && warm.lastError ? String(warm.lastError).trim() : "";
+  const warmDisabledByUser = warm && warm.continuousEnabled === false && warm.startupEnabled === false;
+  const startupWarmInProgress = startupWarmState.enabled && startupWarmState.started && !startupWarmState.ready;
+  const startupStateFailures = startupWarm.stateFailures && startupWarm.stateFailures.length
+    ? startupWarm.stateFailures
+    : startupWarm.stateTargets.filter((target) => !target.ok && target.error);
+  const startupEndpointFailures = startupWarm.endpointFailures && startupWarm.endpointFailures.length
+    ? startupWarm.endpointFailures
+    : startupWarm.endpointTargets.filter((target) => !target.ok && target.error);
+
+  let stateWarm = {
+    tone: startupWarmInProgress ? "yellow" : "gray",
+    title: startupWarmInProgress ? "State Warm: starting." : "State Warm: disabled.",
+  };
+  if (useStartupWarmFallback) {
+    if (startupWarm.disabled) {
+      stateWarm = {
+        tone: "gray",
+        title: "State Warm: disabled by user.",
+      };
+    } else if (startupStateFailures.length > 0) {
+      stateWarm = {
+        tone: startupStateFailures.length < startupWarm.stateTargets.length ? "yellow" : "red",
+        title: startupStateFailures.length < startupWarm.stateTargets.length
+          ? `State Warm: partial. ${startupStateFailures.length}/${startupWarm.stateTargets.length} startup target${startupWarm.stateTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupStateFailures)}`
+          : `State Warm: failing. ${startupStateFailures.length}/${startupWarm.stateTargets.length} startup target${startupWarm.stateTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupStateFailures)}`,
+      };
+    } else if (startupWarm.stateTargets.length > 0) {
+      stateWarm = {
+        tone: "green",
+        title: `State Warm: healthy. ${startupWarm.stateTargets.length} startup target${startupWarm.stateTargets.length === 1 ? "" : "s"} succeeded.`,
+      };
+    } else if (startupWarm.error) {
+      stateWarm = {
+        tone: "red",
+        title: `State Warm: failing. ${startupWarm.error}`,
+      };
+    }
+  } else if (warm) {
+    if (warmDisabledByUser) {
+      stateWarm = {
+        tone: "gray",
+        title: "State Warm: disabled by user.",
+      };
+    } else if (failingActiveStateTargets.length > 0) {
+      stateWarm = {
+        tone: failingActiveStateTargets.length < activeStateTargets.length ? "yellow" : "red",
+        title: failingActiveStateTargets.length < activeStateTargets.length
+          ? `State Warm: partial. ${failingActiveStateTargets.length}/${activeStateTargets.length} active target${activeStateTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveStateTargets)}`
+          : `State Warm: failing. ${failingActiveStateTargets.length}/${activeStateTargets.length} active target${activeStateTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveStateTargets)}`,
+      };
+    } else if (rateLimitedActiveStateTargets.length > 0) {
+      stateWarm = {
+        tone: "yellow",
+        title: rateLimitedActiveStateTargets.length < activeStateTargets.length
+          ? `State Warm: degraded. ${rateLimitedActiveStateTargets.length}/${activeStateTargets.length} active target${activeStateTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveStateTargets)}`
+          : `State Warm: rate-limited. ${rateLimitedActiveStateTargets.length}/${activeStateTargets.length} active target${activeStateTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveStateTargets)}`,
+      };
+    } else if (staleActiveStateTargets.length > 0) {
+      stateWarm = {
+        tone: "yellow",
+        title: `State Warm: waiting. ${staleActiveStateTargets.length} active target${staleActiveStateTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
+      };
+    } else if (activeStateTargets.length > 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeStateTargets));
+      stateWarm = {
+        tone: "green",
+        title: `State Warm: healthy. ${activeStateTargets.length} active target${activeStateTargets.length === 1 ? "" : "s"}. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyStateTargets.length > 0 && failingStateTargets.length === 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(healthyStateTargets));
+      stateWarm = {
+        tone: "green",
+        title: `State Warm: healthy. Warm state is enabled and ready. ${healthyStateTargets.length} target${healthyStateTargets.length === 1 ? "" : "s"} succeeded. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyStateTargets.length > 0 && failingStateTargets.length > 0) {
+      stateWarm = {
+        tone: "yellow",
+        title: `State Warm: partial. Warm state is enabled, but some targets failed. ${summarizeWarmFailures(failingStateTargets)}`,
+      };
+    } else if (warm.active && warmError) {
+      stateWarm = {
+        tone: "red",
+        title: `State Warm: failing. ${warmError}`,
+      };
+    } else {
+      const warmReasonText = describeWarmReason(warmReason);
+      stateWarm = {
+        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        title: stateTargets.length > 0
+          ? `State Warm: auto-paused. ${warmReasonText}. Last success ${lastWarmSuccess}.`
+          : startupWarmInProgress
+            ? "State Warm: starting."
+            : isWarmAutoPausedReason(warmReason)
+              ? `State Warm: auto-paused. ${warmReasonText}.`
+              : `State Warm: waiting. ${warmReasonText}.`,
+      };
+    }
+  }
+
+  let endpointPrewarm = {
+    tone: startupWarmInProgress ? "yellow" : "gray",
+    title: startupWarmInProgress ? `${endpointWarmLabel}: starting.` : `${endpointWarmLabel}: disabled.`,
+  };
+  if (useStartupWarmFallback) {
+    if (startupWarm.disabled) {
+      endpointPrewarm = {
+        tone: "gray",
+        title: `${endpointWarmLabel}: disabled by user.`,
+      };
+    } else if (startupEndpointFailures.length > 0) {
+      endpointPrewarm = {
+        tone: startupEndpointFailures.length < startupWarm.endpointTargets.length ? "yellow" : "red",
+        title: startupEndpointFailures.length < startupWarm.endpointTargets.length
+          ? `${endpointWarmLabel}: partial. ${startupEndpointFailures.length}/${startupWarm.endpointTargets.length} startup target${startupWarm.endpointTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupEndpointFailures)}`
+          : `${endpointWarmLabel}: failing. ${startupEndpointFailures.length}/${startupWarm.endpointTargets.length} startup target${startupWarm.endpointTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupEndpointFailures)}`,
+      };
+    } else if (startupWarm.endpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: "green",
+        title: `${endpointWarmLabel}: healthy. ${startupWarm.endpointTargets.length} startup target${startupWarm.endpointTargets.length === 1 ? "" : "s"} succeeded.`,
+      };
+    } else if (startupWarm.error) {
+      endpointPrewarm = {
+        tone: "red",
+        title: `${endpointWarmLabel}: failing. ${startupWarm.error}`,
+      };
+    }
+  } else if (warm) {
+    if (warmDisabledByUser || (!warmProviders.length && !activeEndpointTargets.length && !endpointTargets.length)) {
+      endpointPrewarm = {
+        tone: "gray",
+        title: `${endpointWarmLabel}: disabled by user.`,
+      };
+    } else if (failingActiveEndpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: failingActiveEndpointTargets.length < activeEndpointTargets.length ? "yellow" : "red",
+        title: failingActiveEndpointTargets.length < activeEndpointTargets.length
+          ? `${endpointWarmLabel}: partial. ${failingActiveEndpointTargets.length}/${activeEndpointTargets.length} active target${activeEndpointTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveEndpointTargets)}`
+          : `${endpointWarmLabel}: failing. ${failingActiveEndpointTargets.length}/${activeEndpointTargets.length} active target${activeEndpointTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveEndpointTargets)}`,
+      };
+    } else if (rateLimitedActiveEndpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: "yellow",
+        title: rateLimitedActiveEndpointTargets.length < activeEndpointTargets.length
+          ? `${endpointWarmLabel}: degraded. ${rateLimitedActiveEndpointTargets.length}/${activeEndpointTargets.length} active target${activeEndpointTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveEndpointTargets)}`
+          : `${endpointWarmLabel}: rate-limited. ${rateLimitedActiveEndpointTargets.length}/${activeEndpointTargets.length} active target${activeEndpointTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveEndpointTargets)}`,
+      };
+    } else if (staleActiveEndpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: "yellow",
+        title: `${endpointWarmLabel}: waiting. ${staleActiveEndpointTargets.length} active target${staleActiveEndpointTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
+      };
+    } else if (activeEndpointTargets.length > 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeEndpointTargets));
+      endpointPrewarm = {
+        tone: "green",
+        title: `${endpointWarmLabel}: healthy. ${activeEndpointTargets.length} active target${activeEndpointTargets.length === 1 ? "" : "s"} across ${formatWarmProviders(warmProviders)}. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyEndpointTargets.length > 0 && failingEndpointTargets.length === 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(healthyEndpointTargets));
+      endpointPrewarm = {
+        tone: "green",
+        title: `${endpointWarmLabel}: healthy. Warm routing is enabled and ready across ${formatWarmProviders(warmProviders)}. ${healthyEndpointTargets.length} target${healthyEndpointTargets.length === 1 ? "" : "s"} succeeded. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyEndpointTargets.length > 0 && failingEndpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: "yellow",
+        title: `${endpointWarmLabel}: partial. Warm routing is enabled, but some targets failed. ${summarizeWarmFailures(failingEndpointTargets)}`,
+      };
+    } else if (warmProviders.length > 0) {
+      const warmReasonText = describeWarmReason(warmReason);
+      endpointPrewarm = {
+        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        title: endpointTargets.length > 0
+          ? `${endpointWarmLabel}: auto-paused. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`
+          : startupWarmInProgress
+            ? `${endpointWarmLabel}: starting. Selected providers: ${formatWarmProviders(warmProviders)}.`
+            : isWarmAutoPausedReason(warmReason)
+              ? `${endpointWarmLabel}: auto-paused. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`
+              : `${endpointWarmLabel}: waiting for telemetry. ${warmReasonText}. Selected providers: ${formatWarmProviders(warmProviders)}.`,
+      };
+    } else {
+      endpointPrewarm = {
+        tone: "gray",
+        title: `${endpointWarmLabel}: disabled by user.`,
+      };
+    }
+  }
+
+  return [
+    {
+      key: "state-warm",
+      label: "State warm",
+      ...stateWarm,
+    },
+    {
+      key: "endpoint-prewarm",
+      label: endpointWarmLabel,
+      ...endpointPrewarm,
+    },
+    {
+      key: "watch-path",
+      label: "Watch path",
+      ...currentWatchPathSnapshot(),
+    },
+  ];
+}
+
+function formatRpcRequestsPerMinuteLabel() {
+  const rt = latestRuntimeStatus && latestRuntimeStatus.rpcTraffic && typeof latestRuntimeStatus.rpcTraffic === "object"
+    ? latestRuntimeStatus.rpcTraffic
+    : null;
+  if (!latestRuntimeStatus || !rt) {
+    return {
+      text: "\u2014/min",
+      title: "Outbound RPC-credit requests in the last 60 seconds. Waiting for runtime status\u2026",
+      muted: true,
+    };
+  }
+  if (rt.enabled === false) {
+    return {
+      text: "off",
+      title: "RPC traffic meter disabled (set LAUNCHDECK_RPC_TRAFFIC_METER=1 to enable, or remove the env var).",
+      muted: true,
+    };
+  }
+  const raw = rt.requestsLast60s;
+  const n = raw == null ? null : Number(raw);
+  if (n == null || !Number.isFinite(n)) {
+    return {
+      text: "\u2014/min",
+      title: "Outbound RPC-credit requests in the last 60 seconds. No sample yet.",
+      muted: true,
+    };
+  }
+  const rounded = Math.max(0, Math.round(n));
+  return {
+    text: `${rounded}/min`,
+    title: `About ${rounded} outbound RPC-credit requests in the last 60 seconds (JSON-RPC, Helius priority estimates, warm getVersion, wallet balance reads, and other metered RPC calls). Jito-only requests and Sender pings are excluded.`,
+    muted: false,
+  };
+}
+
+function renderPlatformRuntimeIndicators() {
+  if (!platformRuntimeIndicators) return;
+  const indicators = buildPlatformRuntimeIndicatorState();
+  const dotsMarkup = indicators.map((indicator) => {
+    const tone = ["green", "yellow", "blue", "red", "gray"].includes(indicator.tone) ? indicator.tone : "gray";
+    const title = `${indicator.label}: ${indicator.title.replace(/^[^:]+:\s*/, "")}`;
+    return `<span class="runtime-indicator-dot is-${tone}" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"></span>`;
+  }).join("");
+  const rpcLabel = formatRpcRequestsPerMinuteLabel();
+  const rpcClass = `runtime-rpc-rate${rpcLabel.muted ? " is-muted" : ""}`;
+  const markup = `${dotsMarkup}<span class="${rpcClass}" title="${escapeHTML(rpcLabel.title)}">${escapeHTML(rpcLabel.text)}</span>`;
+  if (RenderUtils.setCachedHTML) {
+    RenderUtils.setCachedHTML(renderCache, "platformRuntimeIndicators", platformRuntimeIndicators, markup);
+  } else {
+    platformRuntimeIndicators.innerHTML = markup;
+  }
 }
 
 function renderBackendRegionSummary(regionRouting = latestWalletStatus && latestWalletStatus.regionRouting) {
@@ -2172,28 +2902,524 @@ function warmDevBuyQuoteCache(signal) {
   return Promise.allSettled(warmRequests);
 }
 
+function readStoredStartupWarmCache() {
+  try {
+    const raw = window.localStorage.getItem(STARTUP_WARM_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const cachedAtMs = Number(parsed.cachedAtMs);
+    if (!Number.isFinite(cachedAtMs)) return null;
+    if ((Date.now() - cachedAtMs) > STARTUP_WARM_CACHE_MAX_AGE_MS) return null;
+    const payload = parsed.payload && typeof parsed.payload === "object" ? parsed.payload : null;
+    if (!payload) return null;
+    return { cachedAtMs, payload };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function writeStoredStartupWarmCache(payload) {
+  try {
+    if (!payload || typeof payload !== "object") {
+      window.localStorage.removeItem(STARTUP_WARM_CACHE_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(STARTUP_WARM_CACHE_STORAGE_KEY, JSON.stringify({
+      cachedAtMs: Date.now(),
+      payload,
+    }));
+  } catch (_error) {
+    // Ignore storage failures and keep boot flow functional.
+  }
+}
+
+function clearStoredStartupWarmCache() {
+  try {
+    window.localStorage.removeItem(STARTUP_WARM_CACHE_STORAGE_KEY);
+  } catch (_error) {
+    // Ignore storage failures and keep boot flow functional.
+  }
+}
+
+function getCurrentThemeMode() {
+  return document.documentElement.classList.contains("theme-light") ? "light" : "dark";
+}
+
+function isImageLayoutCompactActive() {
+  return Boolean(tokenSurfaceSection && tokenSurfaceSection.classList.contains("is-image-compact"));
+}
+
+function getLiveSyncControlKey(control) {
+  if (!(control instanceof HTMLElement)) return "";
+  if (control.id) return `id:${control.id}`;
+  const name = control.getAttribute("name");
+  if (!name) return "";
+  const type = String(control.getAttribute("type") || "").toLowerCase();
+  if (type === "radio" || type === "checkbox") {
+    return `name:${name}:value:${control.getAttribute("value") || ""}`;
+  }
+  return `name:${name}`;
+}
+
+function getLiveSyncControls() {
+  if (!form) return [];
+  return Array.from(form.querySelectorAll("input, select, textarea"))
+    .filter((control) => control instanceof HTMLElement && String(control.getAttribute("type") || "").toLowerCase() !== "file");
+}
+
+function buildLiveSyncFormControls() {
+  return getLiveSyncControls().reduce((accumulator, control) => {
+    const key = getLiveSyncControlKey(control);
+    if (!key) return accumulator;
+    const type = String(control.getAttribute("type") || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") {
+      accumulator[key] = { checked: Boolean(control.checked) };
+    } else {
+      accumulator[key] = { value: "value" in control ? String(control.value) : "" };
+    }
+    return accumulator;
+  }, {});
+}
+
+function buildLiveSyncPayload() {
+  return {
+    sourceId: LIVE_SYNC_SOURCE_ID,
+    timestampMs: Date.now(),
+    themeMode: getCurrentThemeMode(),
+    outputVisible: isOutputSectionCurrentlyVisible(),
+    reportsVisible: isReportsTerminalCurrentlyVisible(),
+    reportsListWidth: getCurrentReportsTerminalListWidth(),
+    imageLayoutCompact: isImageLayoutCompactActive(),
+    selectedWalletKey: walletSelect ? String(walletSelect.value || "") : "",
+    config: cloneConfig(getConfig()),
+    walletStatusSnapshot: latestWalletStatus,
+    runtimeStatusSnapshot: latestRuntimeStatus,
+    startupWarmSnapshot: {
+      started: Boolean(startupWarmState.started),
+      ready: Boolean(startupWarmState.ready),
+      enabled: startupWarmState.enabled !== false,
+      backendLoaded: Boolean(startupWarmState.backendLoaded),
+      backendPayload: startupWarmState.backendPayload,
+      backendError: String(startupWarmState.backendError || ""),
+    },
+    reportsTerminalSnapshot: {
+      ...reportsTerminalState,
+      activePayload: reportsTerminalState.activePayload,
+      activeBenchmarkSnapshot: reportsTerminalState.activeBenchmarkSnapshot,
+    },
+    followJobsSnapshot: {
+      ...followJobsState,
+      refreshTimer: null,
+    },
+    outputSnapshot: {
+      statusLabel: currentStatusLabel(),
+      metaText: metaNode ? String(metaNode.textContent || "") : "",
+      outputText: output ? String(output.textContent || "") : "",
+    },
+    formControls: buildLiveSyncFormControls(),
+  };
+}
+
+function buildEarlyBootSnapshot(payload = buildLiveSyncPayload()) {
+  return {
+    sourceId: payload.sourceId,
+    timestampMs: payload.timestampMs,
+    themeMode: payload.themeMode,
+    outputVisible: payload.outputVisible,
+    reportsVisible: payload.reportsVisible,
+    reportsListWidth: payload.reportsListWidth,
+    imageLayoutCompact: payload.imageLayoutCompact,
+    selectedWalletKey: payload.selectedWalletKey,
+    config: payload.config || null,
+    walletStatusSnapshot: payload.walletStatusSnapshot || null,
+    runtimeStatusSnapshot: payload.runtimeStatusSnapshot || null,
+    startupWarmSnapshot: payload.startupWarmSnapshot || null,
+    formControls: payload.formControls || {},
+  };
+}
+
+function buildPersistedLiveSyncPayload(payload = buildLiveSyncPayload()) {
+  return {
+    sourceId: payload.sourceId,
+    timestampMs: payload.timestampMs,
+    themeMode: payload.themeMode,
+    outputVisible: payload.outputVisible,
+    reportsVisible: payload.reportsVisible,
+    reportsListWidth: payload.reportsListWidth,
+    imageLayoutCompact: payload.imageLayoutCompact,
+    selectedWalletKey: payload.selectedWalletKey,
+    config: payload.config || null,
+    walletStatusSnapshot: payload.walletStatusSnapshot || null,
+    runtimeStatusSnapshot: payload.runtimeStatusSnapshot || null,
+    startupWarmSnapshot: payload.startupWarmSnapshot || null,
+    reportsTerminalSnapshot: payload.reportsTerminalSnapshot
+      ? {
+          allEntries: Array.isArray(payload.reportsTerminalSnapshot.allEntries) ? payload.reportsTerminalSnapshot.allEntries : [],
+          entries: Array.isArray(payload.reportsTerminalSnapshot.entries) ? payload.reportsTerminalSnapshot.entries : [],
+          launches: Array.isArray(payload.reportsTerminalSnapshot.launches) ? payload.reportsTerminalSnapshot.launches : [],
+          launchBundles: payload.reportsTerminalSnapshot.launchBundles || {},
+          launchMetadataByUri: payload.reportsTerminalSnapshot.launchMetadataByUri || {},
+          activeId: payload.reportsTerminalSnapshot.activeId || "",
+          activePayload: payload.reportsTerminalSnapshot.activePayload || null,
+          activeBenchmarkReportId: payload.reportsTerminalSnapshot.activeBenchmarkReportId || "",
+          activeBenchmarkSnapshot: payload.reportsTerminalSnapshot.activeBenchmarkSnapshot || null,
+          activeText: payload.reportsTerminalSnapshot.activeText || "",
+          activeTab: payload.reportsTerminalSnapshot.activeTab || "overview",
+          view: payload.reportsTerminalSnapshot.view || "transactions",
+          sort: payload.reportsTerminalSnapshot.sort || "newest",
+        }
+      : null,
+    followJobsSnapshot: payload.followJobsSnapshot
+      ? {
+          configured: Boolean(payload.followJobsSnapshot.configured),
+          reachable: Boolean(payload.followJobsSnapshot.reachable),
+          jobs: Array.isArray(payload.followJobsSnapshot.jobs) ? payload.followJobsSnapshot.jobs : [],
+          health: payload.followJobsSnapshot.health || null,
+          error: payload.followJobsSnapshot.error || "",
+          loaded: Boolean(payload.followJobsSnapshot.loaded),
+          refreshTimer: null,
+        }
+      : null,
+    outputSnapshot: payload.outputSnapshot || null,
+    formControls: payload.formControls || {},
+  };
+}
+
+function readStoredLiveSyncPayload() {
+  try {
+    const raw = window.localStorage.getItem(LIVE_SYNC_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const timestampMs = Number(parsed.timestampMs);
+    if (!Number.isFinite(timestampMs)) return null;
+    if ((Date.now() - timestampMs) > LIVE_SYNC_MAX_AGE_MS) return null;
+    return parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function readStoredEarlyBootSnapshot() {
+  try {
+    const raw = window.localStorage.getItem(EARLY_BOOT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const timestampMs = Number(parsed.timestampMs);
+    if (!Number.isFinite(timestampMs)) return null;
+    if ((Date.now() - timestampMs) > LIVE_SYNC_MAX_AGE_MS) return null;
+    return parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function readSessionEarlyBootSnapshot() {
+  try {
+    const raw = window.sessionStorage.getItem(EARLY_BOOT_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const timestampMs = Number(parsed.timestampMs);
+    if (!Number.isFinite(timestampMs)) return null;
+    if ((Date.now() - timestampMs) > LIVE_SYNC_MAX_AGE_MS) return null;
+    return parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function readSessionLiveSyncPayload() {
+  try {
+    const raw = window.sessionStorage.getItem(LIVE_SYNC_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const timestampMs = Number(parsed.timestampMs);
+    if (!Number.isFinite(timestampMs)) return null;
+    if ((Date.now() - timestampMs) > LIVE_SYNC_MAX_AGE_MS) return null;
+    return parsed;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function readOpenerLiveSyncPayload() {
+  try {
+    if (!window.opener || window.opener === window) return null;
+    const payload = window.opener.__launchdeckLiveSyncSnapshot;
+    if (!payload || typeof payload !== "object") return null;
+    const timestampMs = Number(payload.timestampMs);
+    if (!Number.isFinite(timestampMs)) return null;
+    if ((Date.now() - timestampMs) > LIVE_SYNC_MAX_AGE_MS) return null;
+    return payload;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function dispatchLiveSyncPayload(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const earlyBootPayload = buildEarlyBootSnapshot(payload);
+  const persistedPayload = buildPersistedLiveSyncPayload(payload);
+  try {
+    window.__launchdeckLiveSyncSnapshot = payload;
+  } catch (_error) {
+    // Ignore window assignment failures and continue with other sync paths.
+  }
+  try {
+    window.__launchdeckEarlyLiveSyncSnapshot = earlyBootPayload;
+  } catch (_error) {
+    // Ignore window assignment failures and continue with storage fallbacks.
+  }
+  try {
+    window.sessionStorage.setItem(EARLY_BOOT_SESSION_STORAGE_KEY, JSON.stringify(earlyBootPayload));
+  } catch (_error) {
+    // Ignore session storage failures and continue with other sync paths.
+  }
+  try {
+    window.sessionStorage.setItem(LIVE_SYNC_SESSION_STORAGE_KEY, JSON.stringify(persistedPayload));
+  } catch (_error) {
+    // Ignore session storage failures and continue with other sync paths.
+  }
+  if (liveSyncChannel) {
+    try {
+      liveSyncChannel.postMessage(payload);
+    } catch (_error) {
+      // Ignore BroadcastChannel failures and continue with storage fallback.
+    }
+  }
+  try {
+    window.localStorage.setItem(EARLY_BOOT_STORAGE_KEY, JSON.stringify(earlyBootPayload));
+  } catch (_error) {
+    // Ignore storage failures and keep live sync best-effort.
+  }
+  try {
+    window.localStorage.setItem(LIVE_SYNC_STORAGE_KEY, JSON.stringify(persistedPayload));
+  } catch (_error) {
+    // Ignore storage failures and keep live sync best-effort.
+  }
+}
+
+function scheduleLiveSyncBroadcast({ immediate = false } = {}) {
+  if (!liveSyncReady || isApplyingLiveSync) return;
+  if (liveSyncTimer) {
+    window.clearTimeout(liveSyncTimer);
+    liveSyncTimer = 0;
+  }
+  if (immediate) {
+    dispatchLiveSyncPayload(buildLiveSyncPayload());
+    return;
+  }
+  liveSyncTimer = window.setTimeout(() => {
+    liveSyncTimer = 0;
+    dispatchLiveSyncPayload(buildLiveSyncPayload());
+  }, 60);
+}
+
+function applyLiveSyncFormControls(formControls) {
+  if (!formControls || typeof formControls !== "object") return;
+  const controlsByKey = new Map(
+    getLiveSyncControls().map((control) => [getLiveSyncControlKey(control), control]),
+  );
+  Object.entries(formControls).forEach(([key, snapshot]) => {
+    const control = controlsByKey.get(key);
+    if (!control || !snapshot || typeof snapshot !== "object") return;
+    const type = String(control.getAttribute("type") || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") {
+      const nextChecked = Boolean(snapshot.checked);
+      if (control.checked === nextChecked) return;
+      control.checked = nextChecked;
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+    const nextValue = snapshot.value == null ? "" : String(snapshot.value);
+    if (String(control.value) === nextValue) return;
+    control.value = nextValue;
+    const eventName = control.tagName === "SELECT" ? "change" : "input";
+    control.dispatchEvent(new Event(eventName, { bubbles: true }));
+  });
+}
+
+function applyIncomingLiveSyncPayload(payload, { allowBeforeReady = false } = {}) {
+  if (!allowBeforeReady && !liveSyncReady) return;
+  if (!payload || typeof payload !== "object" || payload.sourceId === LIVE_SYNC_SOURCE_ID) return;
+  isApplyingLiveSync = true;
+  try {
+    if (payload.themeMode === "light" || payload.themeMode === "dark") {
+      setThemeMode(payload.themeMode);
+    }
+    if (typeof payload.outputVisible === "boolean") {
+      setOutputSectionVisible(payload.outputVisible);
+    }
+    if (typeof payload.reportsVisible === "boolean") {
+      setReportsTerminalVisible(payload.reportsVisible);
+    }
+    if (Number.isFinite(payload.reportsListWidth)) {
+      setReportsTerminalListWidth(payload.reportsListWidth);
+    }
+    if (typeof payload.imageLayoutCompact === "boolean") {
+      setImageLayoutCompact(payload.imageLayoutCompact);
+    }
+    if (payload.config && typeof payload.config === "object") {
+      const nextConfig = cloneConfig(payload.config);
+      setConfig(nextConfig);
+      setPresetEditing(isPresetEditing(nextConfig));
+      applyPresetToSettingsInputs(getActivePreset(nextConfig), { syncToMainForm: false });
+    }
+    if (payload.startupWarmSnapshot && typeof payload.startupWarmSnapshot === "object") {
+      startupWarmState = {
+        ...startupWarmState,
+        started: Boolean(payload.startupWarmSnapshot.started),
+        ready: Boolean(payload.startupWarmSnapshot.ready),
+        enabled: payload.startupWarmSnapshot.enabled !== false,
+        backendLoaded: Boolean(payload.startupWarmSnapshot.backendLoaded),
+        backendPayload: payload.startupWarmSnapshot.backendPayload && typeof payload.startupWarmSnapshot.backendPayload === "object"
+          ? payload.startupWarmSnapshot.backendPayload
+          : null,
+        backendError: String(payload.startupWarmSnapshot.backendError || ""),
+        promise: null,
+      };
+      renderPlatformRuntimeIndicators();
+    }
+    if (payload.walletStatusSnapshot && typeof payload.walletStatusSnapshot === "object") {
+      applyWalletStatusPayload(payload.walletStatusSnapshot);
+    }
+    if (payload.runtimeStatusSnapshot && typeof payload.runtimeStatusSnapshot === "object") {
+      applyRuntimeStatusPayload(payload.runtimeStatusSnapshot, { hydrateOnly: true });
+    }
+    if (payload.followJobsSnapshot && typeof payload.followJobsSnapshot === "object") {
+      clearFollowJobsRefreshTimer();
+      followJobsState = {
+        ...followJobsState,
+        ...payload.followJobsSnapshot,
+        refreshTimer: null,
+      };
+      syncFollowStatusChrome();
+      renderReportsTerminalList();
+      renderReportsTerminalOutput();
+    }
+    if (payload.reportsTerminalSnapshot && typeof payload.reportsTerminalSnapshot === "object") {
+      reportsTerminalState = {
+        ...reportsTerminalState,
+        ...payload.reportsTerminalSnapshot,
+      };
+      renderReportsTerminalList();
+      renderReportsTerminalOutput();
+    }
+    if (payload.outputSnapshot && typeof payload.outputSnapshot === "object") {
+      setStatusLabel(payload.outputSnapshot.statusLabel || "");
+      if (metaNode) metaNode.textContent = String(payload.outputSnapshot.metaText || "");
+      if (output) output.textContent = String(payload.outputSnapshot.outputText || "");
+    }
+    if (payload.selectedWalletKey && walletSelect && walletSelect.value !== payload.selectedWalletKey) {
+      walletSelect.value = payload.selectedWalletKey;
+      walletSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    applyLiveSyncFormControls(payload.formControls);
+  } finally {
+    isApplyingLiveSync = false;
+    schedulePopoutAutosize();
+  }
+}
+
+function enableLiveSync() {
+  liveSyncReady = true;
+  const storedPayload = readStoredLiveSyncPayload();
+  if (storedPayload) {
+    applyIncomingLiveSyncPayload(storedPayload);
+  }
+  scheduleLiveSyncBroadcast({ immediate: true });
+}
+
+function preloadLiveSyncSnapshot() {
+  const payload = readOpenerLiveSyncPayload()
+    || window.__launchdeckEarlyLiveSyncSnapshot
+    || readSessionEarlyBootSnapshot()
+    || readStoredEarlyBootSnapshot()
+    || readSessionLiveSyncPayload()
+    || readStoredLiveSyncPayload();
+  if (!payload) return false;
+  applyIncomingLiveSyncPayload(payload, { allowBeforeReady: true });
+  return true;
+}
+
+// Run after this script finishes so `fieldValidators` and other `const` helpers below exist
+// (validateFieldByName is invoked from live-sync / auto-sell blur handlers during hydration).
+queueMicrotask(() => {
+  preloadLiveSyncSnapshot();
+});
+
 function beginStartupWarmup() {
   if (!startupWarmState.enabled) {
     startupWarmState.started = true;
     startupWarmState.ready = true;
+    startupWarmState.backendLoaded = true;
+    startupWarmState.backendPayload = null;
+    startupWarmState.backendError = "";
     startupWarmState.promise = Promise.resolve();
+    renderPlatformRuntimeIndicators();
     return startupWarmState.promise;
   }
   if (startupWarmState.started) {
     return startupWarmState.promise || Promise.resolve();
   }
+  const cachedWarm = readStoredStartupWarmCache();
+  if (cachedWarm) {
+    startupWarmState.started = true;
+    startupWarmState.ready = true;
+    startupWarmState.backendLoaded = true;
+    startupWarmState.backendPayload = cachedWarm.payload;
+    startupWarmState.backendError = "";
+    startupWarmState.promise = Promise.resolve(cachedWarm.payload);
+    renderPlatformRuntimeIndicators();
+    return startupWarmState.promise;
+  }
   startupWarmState.started = true;
+  renderPlatformRuntimeIndicators();
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const timeoutId = setTimeout(() => {
     if (controller) controller.abort();
   }, STARTUP_WARM_REQUEST_TIMEOUT_MS);
-  const backendWarm = fetch("/api/startup-warm", controller ? { method: "POST", signal: controller.signal } : { method: "POST" })
+  const warmRequest = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(currentWarmActivityPayload()),
+    ...(controller ? { signal: controller.signal } : {}),
+  };
+  const backendWarm = fetch("/api/startup-warm", warmRequest)
     .then((response) => response.json().catch(() => ({})).then((payload) => ({ response, payload })))
-    .catch(() => ({ response: null, payload: null }));
+    .then(({ response, payload }) => {
+      startupWarmState.backendLoaded = true;
+      startupWarmState.backendPayload = payload && typeof payload === "object" ? payload : null;
+      startupWarmState.backendError = response && !response.ok
+        ? String(payload && payload.error || "Startup warm failed.")
+        : "";
+      if (response && response.ok && payload && typeof payload === "object") {
+        writeStoredStartupWarmCache(payload);
+      } else {
+        clearStoredStartupWarmCache();
+      }
+      renderPlatformRuntimeIndicators();
+      return { response, payload };
+    })
+    .catch((error) => {
+      startupWarmState.backendLoaded = true;
+      startupWarmState.backendPayload = null;
+      startupWarmState.backendError = error && error.message ? error.message : "Startup warm failed.";
+      clearStoredStartupWarmCache();
+      renderPlatformRuntimeIndicators();
+      return { response: null, payload: null };
+    });
   const quoteWarm = Promise.resolve(warmDevBuyQuoteCache(controller ? controller.signal : undefined)).catch(() => {});
   startupWarmState.promise = Promise.allSettled([backendWarm, quoteWarm]).finally(() => {
     clearTimeout(timeoutId);
     startupWarmState.ready = true;
+    renderPlatformRuntimeIndicators();
   });
   return startupWarmState.promise;
 }
@@ -3268,6 +4494,32 @@ function getStoredSelectedWalletKey() {
   } catch (_error) {
     return "";
   }
+}
+
+function getStoredWalletStatusLastRefreshAtMs() {
+  try {
+    const raw = window.localStorage.getItem(WALLET_STATUS_LAST_REFRESH_STORAGE_KEY);
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+function setStoredWalletStatusLastRefreshAtMs(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return;
+  try {
+    window.localStorage.setItem(WALLET_STATUS_LAST_REFRESH_STORAGE_KEY, String(Math.round(numeric)));
+  } catch (_error) {
+    // Ignore storage access failures and keep the UI functional.
+  }
+}
+
+function walletStatusRefreshDelayMs(referenceMs = Date.now()) {
+  const lastRefreshAtMs = getStoredWalletStatusLastRefreshAtMs();
+  if (!lastRefreshAtMs) return walletStatusRefreshIntervalMs;
+  return Math.max(0, walletStatusRefreshIntervalMs - Math.max(0, referenceMs - lastRefreshAtMs));
 }
 
 function setStoredSelectedWalletKey(walletKey) {
@@ -4571,9 +5823,12 @@ async function refreshWalletStatus(preserveSelection = true, force = false) {
       throw new Error(payload.error || "Failed to load wallet status.");
     }
     applyWalletStatusPayload(payload);
+    setStoredWalletStatusLastRefreshAtMs(Date.now());
   } catch (error) {
     if (walletBalance && !latestWalletStatus) walletBalance.textContent = "-";
     metaNode.textContent = error.message;
+  } finally {
+    scheduleWalletStatusRefresh();
   }
 }
 
@@ -4581,19 +5836,54 @@ function applyBootstrapFastPayload(payload) {
   startupWarmState.enabled = payload && payload.startupWarm
     ? payload.startupWarm.enabled !== false
     : true;
+  const configuredWalletStatusRefreshIntervalMs = Number(
+    payload && payload.uiRefresh && payload.uiRefresh.walletStatusIntervalMs,
+  );
+  if (Number.isFinite(configuredWalletStatusRefreshIntervalMs) && configuredWalletStatusRefreshIntervalMs > 0) {
+    walletStatusRefreshIntervalMs = Math.max(1000, Math.round(configuredWalletStatusRefreshIntervalMs));
+  }
+  renderPlatformRuntimeIndicators();
+  const previousWalletStatus = latestWalletStatus || null;
+  const previousWallets = previousWalletStatus && Array.isArray(previousWalletStatus.wallets)
+    ? previousWalletStatus.wallets
+    : [];
+  const nextWallets = Array.isArray(payload.wallets) && payload.wallets.length
+    ? payload.wallets.map((wallet) => {
+        const previous = previousWallets.find((entry) => entry && entry.envKey === (wallet && wallet.envKey));
+        return {
+          ...(previous || {}),
+          ...(wallet || {}),
+          balanceLamports: wallet && wallet.balanceLamports == null
+            ? (previous && previous.balanceLamports != null ? previous.balanceLamports : null)
+            : wallet.balanceLamports,
+          balanceSol: wallet && wallet.balanceSol == null
+            ? (previous && previous.balanceSol != null ? previous.balanceSol : null)
+            : wallet.balanceSol,
+          usd1Balance: wallet && wallet.usd1Balance == null
+            ? (previous && previous.usd1Balance != null ? previous.usd1Balance : null)
+            : wallet.usd1Balance,
+        };
+      })
+    : previousWallets;
   latestWalletStatus = {
-    ...(latestWalletStatus || {}),
-    selectedWalletKey: payload.selectedWalletKey || "",
-    wallets: Array.isArray(payload.wallets) ? payload.wallets : [],
-    wallet: payload.wallet || null,
+    ...(previousWalletStatus || {}),
+    selectedWalletKey: payload.selectedWalletKey || (previousWalletStatus && previousWalletStatus.selectedWalletKey) || "",
+    wallets: nextWallets,
+    wallet: payload.wallet || (previousWalletStatus && previousWalletStatus.wallet) || null,
     connected: Boolean(payload.connected),
-    balanceLamports: payload.balanceLamports == null ? null : payload.balanceLamports,
-    balanceSol: payload.balanceSol == null ? null : payload.balanceSol,
-    usd1Balance: payload.usd1Balance == null ? null : payload.usd1Balance,
-    config: payload.config,
-    regionRouting: payload.regionRouting || null,
-    providers: payload.providers || {},
-    launchpads: payload.launchpads || {},
+    balanceLamports: payload.balanceLamports == null
+      ? ((previousWalletStatus && previousWalletStatus.balanceLamports) ?? null)
+      : payload.balanceLamports,
+    balanceSol: payload.balanceSol == null
+      ? ((previousWalletStatus && previousWalletStatus.balanceSol) ?? null)
+      : payload.balanceSol,
+    usd1Balance: payload.usd1Balance == null
+      ? ((previousWalletStatus && previousWalletStatus.usd1Balance) ?? null)
+      : payload.usd1Balance,
+    config: payload.config || (previousWalletStatus && previousWalletStatus.config) || null,
+    regionRouting: payload.regionRouting || (previousWalletStatus && previousWalletStatus.regionRouting) || null,
+    providers: payload.providers || (previousWalletStatus && previousWalletStatus.providers) || {},
+    launchpads: payload.launchpads || (previousWalletStatus && previousWalletStatus.launchpads) || {},
   };
   renderWalletOptions(latestWalletStatus.wallets || [], latestWalletStatus.selectedWalletKey || "", latestWalletStatus.balanceSol);
   applyPersistentDefaults(payload.config);
@@ -4612,19 +5902,35 @@ function applyBootstrapFastPayload(payload) {
   schedulePopoutAutosize();
 }
 
-function applyRuntimeStatusPayload(payload) {
+function applyRuntimeStatusPayload(payload, { hydrateOnly = false } = {}) {
   latestRuntimeStatus = payload;
   markBootstrapState({ runtimeLoaded: true });
   renderBackendRegionSummary();
   syncFollowStatusChrome();
-  refreshFollowJobs({ silent: true }).catch(() => {});
+  syncWalletStatusRefreshLoop();
+  if (!hydrateOnly) {
+    refreshFollowJobs({ silent: true }).catch(() => {});
+  }
 }
 
 function currentWarmActivityPayload() {
+  const preset = getActivePreset(getConfig()) || {};
+  const creationSettings = preset && preset.creationSettings && typeof preset.creationSettings === "object"
+    ? preset.creationSettings
+    : {};
+  const buySettings = preset && preset.buySettings && typeof preset.buySettings === "object"
+    ? preset.buySettings
+    : {};
+  const sellSettings = preset && preset.sellSettings && typeof preset.sellSettings === "object"
+    ? preset.sellSettings
+    : {};
   return {
     creationProvider: providerSelect ? providerSelect.value : "",
+    creationEndpointProfile: String(creationSettings.endpointProfile || "").trim(),
     buyProvider: buyProviderSelect ? buyProviderSelect.value : "",
+    buyEndpointProfile: String(buySettings.endpointProfile || "").trim(),
     sellProvider: sellProviderSelect ? sellProviderSelect.value : "",
+    sellEndpointProfile: String(sellSettings.endpointProfile || "").trim(),
   };
 }
 
@@ -4648,8 +5954,13 @@ async function flushWarmActivity() {
       latestRuntimeStatus = {
         ...(latestRuntimeStatus || {}),
         warm: payload.warm,
+        ...(payload.rpcTraffic && typeof payload.rpcTraffic === "object"
+          ? { rpcTraffic: payload.rpcTraffic }
+          : {}),
       };
       renderBackendRegionSummary();
+      syncFollowStatusChrome();
+      syncWalletStatusRefreshLoop({ immediateResume: true });
     })
     .catch(() => {})
     .finally(() => {
@@ -4675,6 +5986,16 @@ function startRuntimeStatusRefreshLoop() {
   runtimeStatusRefreshTimer = window.setInterval(() => {
     refreshRuntimeStatus().catch(() => {});
   }, RUNTIME_STATUS_REFRESH_INTERVAL_MS);
+}
+
+function scheduleWalletStatusRefresh() {
+  clearWalletStatusRefreshTimer();
+  if (walletRefreshPausedByIdleSuspend()) return;
+  const delayMs = walletStatusRefreshIntervalMs;
+  walletStatusRefreshTimer = window.setTimeout(() => {
+    walletStatusRefreshTimer = null;
+    refreshWalletStatus(true, true).catch(() => {});
+  }, delayMs);
 }
 
 function runtimeFollowDaemonStatus() {
@@ -4756,6 +6077,7 @@ function syncFollowStatusChrome() {
         ? `Dashboard (${snapshot.counts.active} active follow launch${snapshot.counts.active === 1 ? "" : "es"})`
         : "Dashboard";
   }
+  renderPlatformRuntimeIndicators();
 }
 
 function scheduleFollowJobsRefresh() {
@@ -4920,6 +6242,7 @@ function applyWalletStatusPayload(payload) {
 async function bootstrapApp() {
   markBootstrapState({ started: true });
   setSettingsLoadingState(true);
+  setBootOverlayMessage(null, "Connecting to engine…");
   const storedWalletKey = getStoredSelectedWalletKey();
   const bootstrapUrl = storedWalletKey
     ? `/api/bootstrap-fast?wallet=${encodeURIComponent(storedWalletKey)}`
@@ -4935,15 +6258,15 @@ async function bootstrapApp() {
     throw new Error(payload.error || "Failed to load app bootstrap.");
   }
   applyBootstrapFastPayload(payload);
+  setBootOverlayMessage(null, "Syncing wallets, runtime status, and warm caches…");
   const startupWarmPromise = beginStartupWarmup().catch(() => {});
-  const walletHydrationPromise = refreshWalletStatus(true).catch(() => {});
   const runtimeHydrationPromise = refreshRuntimeStatus().catch(() => {});
   refreshBagsIdentityStatus().catch(() => {});
   await Promise.allSettled([
     startupWarmPromise,
-    walletHydrationPromise,
     runtimeHydrationPromise,
   ]);
+  await refreshWalletStatus(true, true).catch(() => {});
 }
 
 async function refreshRuntimeStatus() {
@@ -5130,34 +6453,37 @@ const fieldValidators = {
     return "";
   },
   creationTipSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getProvider();
+    if (isNamedChecked("creationAutoFeeEnabled") || !providerMinimumTipSol(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredTipField(v, provider);
   },
   creationPriorityFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getProvider();
+    if (isNamedChecked("creationAutoFeeEnabled") || !providerRequiresPriorityFee(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredPriorityFeeField(v, provider);
   },
   creationMaxFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    return isNamedChecked("creationAutoFeeEnabled")
+      ? validateOptionalAutoFeeCapField(v, getProvider())
+      : validateNonNegativeSolField(v);
   },
   buyPriorityFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getBuyProvider();
+    if (isNamedChecked("buyAutoFeeEnabled") || !providerRequiresPriorityFee(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredPriorityFeeField(v, provider);
   },
   buyTipSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getBuyProvider();
+    if (isNamedChecked("buyAutoFeeEnabled") || !providerMinimumTipSol(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredTipField(v, provider);
   },
   buySlippagePercent(v) {
     if (!v) return "";
@@ -5166,22 +6492,23 @@ const fieldValidators = {
     return "";
   },
   buyMaxFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    return isNamedChecked("buyAutoFeeEnabled")
+      ? validateOptionalAutoFeeCapField(v, getBuyProvider())
+      : validateNonNegativeSolField(v);
   },
   sellPriorityFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getSellProvider();
+    if (isNamedChecked("sellAutoFeeEnabled") || !providerRequiresPriorityFee(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredPriorityFeeField(v, provider);
   },
   sellTipSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    const provider = getSellProvider();
+    if (isNamedChecked("sellAutoFeeEnabled") || !providerMinimumTipSol(provider)) {
+      return validateNonNegativeSolField(v);
+    }
+    return validateRequiredTipField(v, provider);
   },
   sellSlippagePercent(v) {
     if (!v) return "";
@@ -5190,10 +6517,9 @@ const fieldValidators = {
     return "";
   },
   sellMaxFeeSol(v) {
-    if (!v) return "";
-    const n = Number(v);
-    if (isNaN(n) || n < 0) return "Must be a valid number";
-    return "";
+    return isNamedChecked("sellAutoFeeEnabled")
+      ? validateOptionalAutoFeeCapField(v, getSellProvider())
+      : validateNonNegativeSolField(v);
   },
   automaticDevSellPercent(v) {
     if (!isNamedChecked("automaticDevSellEnabled")) return "";
@@ -5261,6 +6587,33 @@ function validateAllInlineFields() {
     if (msg) errors.push(msg);
   }
   return errors;
+}
+
+function focusFirstInvalidInlineField() {
+  const input = form.querySelector(".input-error");
+  if (!input || typeof input.focus !== "function") return;
+  input.focus();
+  if (typeof input.select === "function" && input.tagName === "INPUT" && input.type !== "checkbox") {
+    input.select();
+  }
+}
+
+function validateSettingsModalBeforeSave() {
+  const errors = validateAllInlineFields();
+  if (!errors.length) return [];
+  focusFirstInvalidInlineField();
+  return errors;
+}
+
+function validateProviderFeeFields(scope) {
+  const names = scope === "creation"
+    ? ["creationPriorityFeeSol", "creationTipSol", "creationMaxFeeSol"]
+    : scope === "buy"
+      ? ["buyPriorityFeeSol", "buyTipSol", "buyMaxFeeSol"]
+      : scope === "sell"
+        ? ["sellPriorityFeeSol", "sellTipSol", "sellMaxFeeSol"]
+        : [];
+  names.forEach((name) => validateFieldByName(name));
 }
 
 function validateAgentSplit() {
@@ -5701,7 +7054,9 @@ async function run(action) {
         startOutputFollowRefresh(reportId);
       }
     }
-    refreshWalletStatus(true).catch(() => {});
+    if (actualAction === "send") {
+      refreshWalletStatus(true, true).catch(() => {});
+    }
   } catch (error) {
     setStatusLabel("Error");
     output.textContent = error.message;
@@ -5792,6 +7147,12 @@ async function saveSettings() {
   if (!hasBootstrapConfig()) {
     setStatusLabel("Loading");
     metaNode.textContent = "Settings are still loading from the backend.";
+    return;
+  }
+  const inlineErrors = validateSettingsModalBeforeSave();
+  if (inlineErrors.length) {
+    setStatusLabel("Error");
+    output.textContent = inlineErrors[0] || "Please fix the highlighted settings fields.";
     return;
   }
   setBusy(true, "Saving defaults...");
@@ -5898,6 +7259,7 @@ function setOutputSectionVisible(isVisible) {
     // Ignore storage access failures and keep the UI functional.
   }
   schedulePopoutAutosize();
+  scheduleLiveSyncBroadcast({ immediate: true });
 }
 
 function getStoredReportsTerminalVisible() {
@@ -5938,6 +7300,7 @@ function setImageLayoutCompact(isCompact, { persist = true } = {}) {
     }
   }
   schedulePopoutAutosize();
+  scheduleLiveSyncBroadcast();
 }
 
 function clampReportsTerminalListWidth(width) {
@@ -6407,15 +7770,37 @@ function formatLamportsForReport(value) {
   return numeric.toLocaleString();
 }
 
+function formatSolForReport(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "--";
+  if (numeric === 0) return "0";
+  const fixed = numeric.toFixed(9).replace(/\.?0+$/, "");
+  return fixed === "-0" ? "0" : fixed;
+}
+
+function formatPriorityPriceForReport(value) {
+  const numeric = parseReportMetricNumber(value);
+  if (numeric == null) return "--";
+  const solEquivalent = formatSolForReport(numeric / 1_000_000_000);
+  return `${numeric.toLocaleString()} micro-lamports/CU (~${solEquivalent} SOL @ 1M CU)`;
+}
+
+function formatTipLamportsForReport(value) {
+  const numeric = parseReportMetricNumber(value);
+  if (numeric == null) return "--";
+  const solEquivalent = formatSolForReport(numeric / 1_000_000_000);
+  return `${numeric.toLocaleString()} lamports (${solEquivalent} SOL)`;
+}
+
 function buildAutoFeeActionCards(label, action) {
   if (!action || typeof action !== "object" || !action.enabled) return [];
   return [
     { label: `${label} Provider`, value: action.provider || "--" },
-    { label: `${label} Priority Source`, value: action.prioritySource || "--", detail: action.priorityEstimateLamports != null ? `${formatLamportsForReport(action.priorityEstimateLamports)} est` : "" },
-    { label: `${label} Priority Used`, value: action.resolvedPriorityLamports != null ? formatLamportsForReport(action.resolvedPriorityLamports) : "--" },
-    { label: `${label} Tip Source`, value: action.tipSource || "--", detail: action.tipEstimateLamports != null ? `${formatLamportsForReport(action.tipEstimateLamports)} est` : "" },
-    { label: `${label} Tip Used`, value: action.resolvedTipLamports != null ? formatLamportsForReport(action.resolvedTipLamports) : "--" },
-    { label: `${label} Cap`, value: action.capLamports != null ? formatLamportsForReport(action.capLamports) : "--" },
+    { label: `${label} Priority Source`, value: action.prioritySource || "--", detail: action.priorityEstimateLamports != null ? `${formatPriorityPriceForReport(action.priorityEstimateLamports)} est` : "" },
+    { label: `${label} Priority Used`, value: action.resolvedPriorityLamports != null ? formatPriorityPriceForReport(action.resolvedPriorityLamports) : "--" },
+    { label: `${label} Tip Source`, value: action.tipSource || "--", detail: action.tipEstimateLamports != null ? `${formatTipLamportsForReport(action.tipEstimateLamports)} est` : "" },
+    { label: `${label} Tip Used`, value: action.resolvedTipLamports != null ? formatTipLamportsForReport(action.resolvedTipLamports) : "--" },
+    { label: `${label} Priority Cap`, value: action.capLamports != null ? formatPriorityPriceForReport(action.capLamports) : "--" },
   ];
 }
 
@@ -6423,11 +7808,9 @@ function buildAutoFeeBenchmarkSection(autoFee, benchmarkMode) {
   if (!autoFee || benchmarkMode !== "Full") return "";
   const snapshot = autoFee.snapshot && typeof autoFee.snapshot === "object" ? autoFee.snapshot : {};
   const snapshotCards = [
-    { label: "Generic Helius", value: snapshot.helius_priority_lamports != null ? formatLamportsForReport(snapshot.helius_priority_lamports) : "--" },
-    { label: "Launch Template", value: snapshot.helius_launch_priority_lamports != null ? formatLamportsForReport(snapshot.helius_launch_priority_lamports) : "--" },
-    { label: "Trade Template", value: snapshot.helius_trade_priority_lamports != null ? formatLamportsForReport(snapshot.helius_trade_priority_lamports) : "--" },
-    { label: "Jito p99", value: snapshot.jito_tip_p99_lamports != null ? formatLamportsForReport(snapshot.jito_tip_p99_lamports) : "--" },
-  ];
+    { label: "Launch Template Price", value: snapshot.helius_launch_priority_lamports != null ? formatPriorityPriceForReport(snapshot.helius_launch_priority_lamports) : "--" },
+    { label: "Jito p99 Tip", value: snapshot.jito_tip_p99_lamports != null ? formatTipLamportsForReport(snapshot.jito_tip_p99_lamports) : "--" },
+  ].filter((card) => card.value !== "--");
   const actionCards = []
     .concat(buildAutoFeeActionCards("Creation", autoFee.creation))
     .concat(buildAutoFeeActionCards("Buy", autoFee.buy))
@@ -7761,15 +9144,19 @@ function renderReportsTerminalList() {
   }
 }
 
-async function loadReportsTerminalEntry(id, { syncMainOutput = false } = {}) {
+async function loadReportsTerminalEntry(id, { syncMainOutput = false, showLoading = true } = {}) {
   if (!id || !reportsTerminalOutput) return;
   if (normalizeReportsTerminalView(reportsTerminalState.view) !== "transactions") return;
   const loadSerial = ++reportsTerminalLoadSerial;
   reportsTerminalState.activeId = id;
-  reportsTerminalState.activePayload = null;
-  reportsTerminalState.activeText = "Loading report...";
-  renderReportsTerminalList();
-  renderReportsTerminalOutput();
+  if (showLoading) {
+    reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeText = "Loading report...";
+    renderReportsTerminalList();
+    renderReportsTerminalOutput();
+  } else {
+    renderReportsTerminalList();
+  }
   const url = `/api/reports/view?id=${encodeURIComponent(id)}`;
   const result = RequestUtils.fetchJsonLatest
     ? await RequestUtils.fetchJsonLatest("report-view", url, {}, requestStates.reportView)
@@ -7799,13 +9186,15 @@ async function loadReportsTerminalEntry(id, { syncMainOutput = false } = {}) {
   renderReportsTerminalList();
 }
 
-async function refreshReportsTerminal({ preserveSelection = true, preferId = "" } = {}) {
+async function refreshReportsTerminal({ preserveSelection = true, preferId = "", showLoading = true } = {}) {
   if (!reportsTerminalList || !reportsTerminalOutput) return;
   syncReportsTerminalChrome();
-  if (RenderUtils.setCachedHTML) {
-    RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, '<div class="reports-terminal-empty">Loading reports...</div>');
-  } else {
-    reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
+  if (showLoading) {
+    if (RenderUtils.setCachedHTML) {
+      RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, '<div class="reports-terminal-empty">Loading reports...</div>');
+    } else {
+      reportsTerminalList.innerHTML = '<div class="reports-terminal-empty">Loading reports...</div>';
+    }
   }
   const url = "/api/reports?sort=newest";
   const result = RequestUtils.fetchJsonLatest
@@ -7861,7 +9250,7 @@ async function refreshReportsTerminal({ preserveSelection = true, preferId = "" 
     renderReportsTerminalOutput();
     return;
   }
-  await loadReportsTerminalEntry(nextId);
+  await loadReportsTerminalEntry(nextId, { showLoading });
 }
 
 function applyWalletSelectionFromLaunch(walletKey) {
@@ -8099,6 +9488,19 @@ function setThemeMode(mode, { persist = true } = {}) {
   } catch (_error) {
     // Ignore storage failures and keep theme switching functional.
   }
+  scheduleLiveSyncBroadcast({ immediate: true });
+}
+
+function setBootOverlayMessage(title, note) {
+  if (!bootOverlay) return;
+  if (title != null && title !== "") {
+    const titleNode = bootOverlay.querySelector(".boot-overlay-title");
+    if (titleNode) titleNode.textContent = title;
+  }
+  if (note != null) {
+    const noteNode = bootOverlay.querySelector(".boot-overlay-note");
+    if (noteNode) noteNode.textContent = note;
+  }
 }
 
 function completeInitialBoot() {
@@ -8106,6 +9508,7 @@ function completeInitialBoot() {
     window.clearTimeout(window.__launchdeckBootFallback);
     window.__launchdeckBootFallback = null;
   }
+  setBootOverlayMessage("LaunchDeck", "Preparing wallets, settings, caches, and runtime status.");
   if (isPopoutMode) {
     resizePopoutToVisibleLayout();
   }
@@ -8208,11 +9611,10 @@ function schedulePopoutAutosize() {
 
 function openPopoutWindow() {
   const popoutUrl = new URL(window.location.href);
-  popoutUrl.searchParams.set("popout", "1");
-  const outputVisible = isOutputSectionCurrentlyVisible();
-  const reportsVisible = isReportsTerminalCurrentlyVisible();
-  popoutUrl.searchParams.set("output", outputVisible ? "1" : "0");
-  popoutUrl.searchParams.set("reports", reportsVisible ? "1" : "0");
+  popoutUrl.searchParams.delete("popout");
+  popoutUrl.searchParams.delete("output");
+  popoutUrl.searchParams.delete("reports");
+  dispatchLiveSyncPayload(buildLiveSyncPayload());
   const contentWidth = getPreferredPopoutContentWidth();
   const contentHeight = getPreferredPopoutContentHeight();
   const chromeWidth = Math.max(0, window.outerWidth - window.innerWidth);
@@ -8227,7 +9629,7 @@ function openPopoutWindow() {
   );
   window.open(
     popoutUrl.toString(),
-    "launchdeck-popout",
+    POPOUT_WINDOW_NAME,
     `popup=yes,width=${width},height=${height},menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes`,
   );
 }
@@ -8414,14 +9816,17 @@ if (devBuyPercentInput) {
 if (providerSelect) providerSelect.addEventListener("change", () => {
   syncActivePresetFromInputs();
   updateJitoVisibility();
+  validateProviderFeeFields("creation");
 });
 if (buyProviderSelect) buyProviderSelect.addEventListener("change", () => {
   ensureStandardRpcSlippageDefault(buySlippageInput, getBuyProvider());
   syncActivePresetFromInputs();
+  validateProviderFeeFields("buy");
 });
 if (sellProviderSelect) sellProviderSelect.addEventListener("change", () => {
   ensureStandardRpcSlippageDefault(sellSlippageInput, getSellProvider());
   syncActivePresetFromInputs();
+  validateProviderFeeFields("sell");
 });
 feeSplitPill.addEventListener("click", () => {
   const mode = getMode();
@@ -8839,6 +10244,9 @@ if (presetEditToggle) {
     syncActivePresetFromInputs();
     syncSettingsCapabilities();
     if (input.name) validateFieldByName(input.name);
+    if (input === creationAutoFeeInput) validateProviderFeeFields("creation");
+    if (input === buyAutoFeeInput) validateProviderFeeFields("buy");
+    if (input === sellAutoFeeInput) validateProviderFeeFields("sell");
     if (sniperModal && !sniperModal.hidden) {
       renderSniperUI();
     }
@@ -8961,7 +10369,14 @@ renderReportsTerminalOutput();
 Promise.resolve(bootstrapApp())
   .then(() => {
     startRuntimeStatusRefreshLoop();
-    queueWarmActivity({ immediate: true });
+    enableLiveSync();
+    if (isPopoutMode && isReportsTerminalCurrentlyVisible()) {
+      refreshReportsTerminal({
+        preserveSelection: true,
+        preferId: reportsTerminalState.activeId,
+        showLoading: false,
+      }).catch(() => {});
+    }
     completeInitialBoot();
   })
   .catch((error) => {
@@ -8978,16 +10393,22 @@ Promise.resolve(bootstrapApp())
 document.addEventListener("input", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
+  // Ignore programmatic sync/update events so they do not keep idle warm alive.
+  if (!event.isTrusted) return;
   if (target.matches("input, textarea, select") || target.isContentEditable) {
     queueWarmActivity();
+    scheduleLiveSyncBroadcast();
   }
 }, true);
 
 document.addEventListener("change", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
+  // Only count real operator edits as warm activity.
+  if (!event.isTrusted) return;
   if (target.matches("input, textarea, select")) {
     queueWarmActivity({ immediate: true });
+    scheduleLiveSyncBroadcast({ immediate: true });
   }
 }, true);
 
@@ -9002,8 +10423,27 @@ window.addEventListener("focus", () => {
   queueWarmActivity({ immediate: true });
 });
 
+window.addEventListener("pagehide", () => {
+  dispatchLiveSyncPayload(buildLiveSyncPayload());
+});
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
   queueWarmActivity({ immediate: true });
   refreshRuntimeStatus().catch(() => {});
+});
+
+if (liveSyncChannel) {
+  liveSyncChannel.addEventListener("message", (event) => {
+    applyIncomingLiveSyncPayload(event && event.data);
+  });
+}
+
+window.addEventListener("storage", (event) => {
+  if (event.key !== LIVE_SYNC_STORAGE_KEY || !event.newValue) return;
+  try {
+    applyIncomingLiveSyncPayload(JSON.parse(event.newValue));
+  } catch (_error) {
+    // Ignore malformed storage sync payloads.
+  }
 });

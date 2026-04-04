@@ -147,7 +147,7 @@ At minimum, most operators will want to fill in:
 - `SOLANA_WS_URL`
 - `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height reads off your main RPC
 - `SOLANA_PRIVATE_KEY` or your `SOLANA_PRIVATE_KEY*` set
-- `USER_REGION`
+- `USER_REGION` for your preferred regional group or explicit metro list
 
 Optional but common:
 

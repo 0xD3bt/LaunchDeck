@@ -5,6 +5,7 @@ use std::env;
 
 use crate::{
     config::{NormalizedConfig, NormalizedExecution, has_launch_follow_up},
+    endpoint_profile::{metro_token_canonical, normalize_user_region, parse_config_endpoint_profile},
     providers::get_provider_meta,
 };
 
@@ -71,13 +72,6 @@ fn normalize_provider(provider: &str) -> String {
     }
 }
 
-fn normalized_supported_region(region: &str) -> Option<String> {
-    match region.trim().to_lowercase().as_str() {
-        "global" | "us" | "eu" | "west" | "asia" => Some(region.trim().to_lowercase()),
-        _ => None,
-    }
-}
-
 fn first_non_empty_env(keys: &[&str]) -> String {
     keys.iter()
         .find_map(|key| {
@@ -101,7 +95,7 @@ fn provider_region_env_key(provider: &str) -> Option<&'static str> {
 }
 
 fn default_endpoint_profile_from_user_region(user_region: &str) -> String {
-    normalized_supported_region(user_region).unwrap_or_else(|| DEFAULT_ENDPOINT_PROFILE.to_string())
+    normalize_user_region(user_region).unwrap_or_else(|| DEFAULT_ENDPOINT_PROFILE.to_string())
 }
 
 fn resolve_default_endpoint_profile_for_provider(
@@ -112,8 +106,8 @@ fn resolve_default_endpoint_profile_for_provider(
     if normalize_provider(provider) == "standard-rpc" {
         return String::new();
     }
-    normalized_supported_region(provider_region)
-        .or_else(|| normalized_supported_region(shared_region))
+    normalize_user_region(provider_region)
+        .or_else(|| normalize_user_region(shared_region))
         .unwrap_or_else(|| DEFAULT_ENDPOINT_PROFILE.to_string())
 }
 
@@ -144,11 +138,12 @@ fn normalize_endpoint_profile(provider: &str, endpoint_profile: &str) -> String 
     if normalized_provider == "standard-rpc" {
         return String::new();
     }
-    match endpoint_profile.trim().to_lowercase().as_str() {
-        "" => default_endpoint_profile_for_provider(provider),
-        "global" | "us" | "eu" | "west" | "asia" => endpoint_profile.trim().to_lowercase(),
-        _ => default_endpoint_profile_for_provider(provider),
+    let trimmed = endpoint_profile.trim();
+    if trimmed.is_empty() {
+        return default_endpoint_profile_for_provider(provider);
     }
+    parse_config_endpoint_profile(trimmed)
+        .unwrap_or_else(|_| default_endpoint_profile_for_provider(provider))
 }
 
 fn configured_helius_sender_override() -> Option<String> {
@@ -193,15 +188,28 @@ pub fn configured_helius_sender_endpoints_for_profile(endpoint_profile: &str) ->
     let regional = |codes: &[&str]| {
         DEFAULT_HELIUS_SENDER_REGIONAL_ENDPOINTS
             .iter()
-            .filter(|(code, _)| codes.contains(code))
+            .filter(|(code, _)| codes.iter().any(|c| *c == *code))
             .map(|(_, endpoint)| endpoint.to_string())
             .collect::<Vec<_>>()
     };
+    if resolved_endpoint_profile.contains(',') {
+        let codes: Vec<&str> = resolved_endpoint_profile
+            .split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .collect();
+        let endpoints = regional(&codes);
+        return if endpoints.is_empty() {
+            vec![global_endpoint]
+        } else {
+            endpoints
+        };
+    }
     match resolved_endpoint_profile.as_str() {
         "us" => regional(&["slc", "ewr"]),
-        "eu" => regional(&["lon", "fra", "ams"]),
+        "eu" => regional(&["fra", "ams"]),
         "asia" => regional(&["sg", "tyo"]),
-        "west" => regional(&["slc", "ewr", "lon", "fra", "ams"]),
+        code if metro_token_canonical(code).is_some() => regional(&[code]),
         _ => vec![global_endpoint],
     }
 }
@@ -274,8 +282,26 @@ pub fn transport_ordering(execution: &NormalizedExecution, transaction_count: us
     }
 }
 
+fn jito_name_matches_metro_token(name: &str, token: &str) -> bool {
+    match token.trim().to_lowercase().as_str() {
+        "slc" => name.contains("slc."),
+        "ewr" | "ny" => name.contains("ny."),
+        "fra" => name.contains("frankfurt."),
+        "ams" => name.contains("amsterdam."),
+        "lon" => name.contains("london."),
+        "sg" => name.contains("singapore."),
+        "tyo" => name.contains("tokyo."),
+        _ => false,
+    }
+}
+
 fn jito_endpoint_matches_profile(endpoint: &JitoBundleEndpoint, endpoint_profile: &str) -> bool {
     let name = endpoint.name.to_lowercase();
+    if endpoint_profile.contains(',') {
+        return endpoint_profile
+            .split(',')
+            .any(|t| jito_name_matches_metro_token(&name, t.trim()));
+    }
     match endpoint_profile {
         "us" => name.contains("ny.") || name.contains("slc."),
         "eu" => {
@@ -285,15 +311,8 @@ fn jito_endpoint_matches_profile(endpoint: &JitoBundleEndpoint, endpoint_profile
                 || name.contains("dublin.")
         }
         "asia" => name.contains("singapore.") || name.contains("tokyo."),
-        "west" => {
-            name.contains("ny.")
-                || name.contains("slc.")
-                || name.contains("frankfurt.")
-                || name.contains("amsterdam.")
-                || name.contains("london.")
-                || name.contains("dublin.")
-        }
-        _ => true,
+        "global" => true,
+        other => jito_name_matches_metro_token(&name, other),
     }
 }
 
@@ -535,6 +554,18 @@ mod tests {
     }
 
     #[test]
+    fn helius_sender_multi_metro_profile_filters_endpoints() {
+        let mut config = sample_config("helius-sender");
+        config.execution.endpointProfile = "fra,lon".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "fra,lon");
+        assert_eq!(plan.heliusSenderEndpoints.len(), 2);
+        assert!(plan.heliusSenderEndpoints.iter().all(|entry| {
+            entry.contains("fra-") || entry.contains("lon-")
+        }));
+    }
+
+    #[test]
     fn helius_sender_eu_profile_filters_endpoints() {
         let mut config = sample_config("helius-sender");
         config.execution.endpointProfile = "eu".to_string();
@@ -542,8 +573,13 @@ mod tests {
         assert_eq!(plan.resolvedEndpointProfile, "eu");
         assert!(!plan.heliusSenderEndpoints.is_empty());
         assert!(plan.heliusSenderEndpoints.iter().all(|entry| {
-            entry.contains("lon-") || entry.contains("fra-") || entry.contains("ams-")
+            entry.contains("fra-") || entry.contains("ams-")
         }));
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| !entry.contains("lon-"))
+        );
         assert!(
             plan.heliusSenderEndpoints
                 .iter()
@@ -570,8 +606,15 @@ mod tests {
     fn user_region_defaults_endpoint_profile() {
         assert_eq!(default_endpoint_profile_from_user_region("EU"), "eu");
         assert_eq!(default_endpoint_profile_from_user_region("asia"), "asia");
+        assert_eq!(default_endpoint_profile_from_user_region("fra"), "fra");
+        assert_eq!(
+            default_endpoint_profile_from_user_region("fra, ams"),
+            "fra,ams"
+        );
+        assert_eq!(default_endpoint_profile_from_user_region("NY"), "ewr");
         assert_eq!(default_endpoint_profile_from_user_region(""), "global");
         assert_eq!(default_endpoint_profile_from_user_region("nope"), "global");
+        assert_eq!(default_endpoint_profile_from_user_region("west"), "global");
     }
 
     #[test]
@@ -619,5 +662,17 @@ mod tests {
             "global",
             Some("wss://example-rpc.com/ws")
         ));
+    }
+
+    #[test]
+    fn jito_bundle_fra_profile_filters_to_frankfurt_only() {
+        let mut config = sample_config("jito-bundle");
+        config.execution.endpointProfile = "fra".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert!(!plan.jitoBundleEndpoints.is_empty());
+        assert!(plan
+            .jitoBundleEndpoints
+            .iter()
+            .all(|e| e.name.to_lowercase().contains("frankfurt")));
     }
 }

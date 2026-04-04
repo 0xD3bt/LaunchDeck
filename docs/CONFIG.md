@@ -12,7 +12,7 @@ Most operators can get started with just these values:
 - `SOLANA_WS_URL`
 - `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height observation off your main RPC
 - `SOLANA_PRIVATE_KEY` or additional `SOLANA_PRIVATE_KEY*`
-- `USER_REGION` if you want a default regional provider preference
+- `USER_REGION` if you want a default provider profile or metro preference
 
 Optional but common:
 
@@ -43,12 +43,14 @@ LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recomm
 - `LAUNCHDECK_WARM_RPC_URL`
   Optional alternate RPC used for startup warmup and block-height observation. Leave it blank to reuse `SOLANA_RPC_URL`.
 - `USER_REGION`
-  Default region for providers that support endpoint profiles. Supported values are `global`, `us`, `eu`, `west`, and `asia`.
+  Default region for providers that support endpoint profiles. Use a regional group (`global`, `us`, `eu`, `asia`) or pin Helius Sender metros: `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`. You can comma-separate metros (e.g. `fra,ams`). `ny` is accepted and normalized to `ewr` (Newark / Jito `ny.`). The old `west` aggregate is removed; use `us`, `eu`, or explicit metros instead.
+
+For a consolidated table of vendor base URLs (**Helius Sender**, **Helius RPC/WS**, **Jito**, **Hello Moon Lunar Lander**, **Shyft**), see [Full endpoint catalog (reference)](PROVIDERS.md#full-endpoint-catalog-reference) in `PROVIDERS.md`.
 
 Recommended practice:
 
-- set `USER_REGION` to your nearest region instead of pinning one sender or bundle endpoint
-- region fanout is usually faster and more reliable because LaunchDeck can send across that region's endpoint group instead of depending on a single host
+- set `USER_REGION` to your nearest regional group or explicit metro list instead of pinning one sender or bundle endpoint
+- profile and metro fanout are usually faster and more reliable because LaunchDeck can send across the selected endpoint set instead of depending on a single host
 - use provider-specific region overrides only when one provider needs a different region than your shared default
 - for most operators, use Helius for both `SOLANA_RPC_URL` and `SOLANA_WS_URL` because it is currently the fastest and best-supported overall setup in LaunchDeck
 - for `LAUNCHDECK_WARM_RPC_URL`, a separate [Shyft](https://shyft.to/) RPC with a free API key is a good default so startup warm and block-height reads do not consume your main execution RPC budget
@@ -79,13 +81,13 @@ Watch endpoint vs execution provider:
 - `LAUNCHDECK_ENABLE_STARTUP_WARM`
   One-shot startup warm toggle. `true|false`, with blank defaulting to `true`.
 - `LAUNCHDECK_ENABLE_CONTINUOUS_WARM`
-  Shared active keep-warm toggle. `true|false`, with blank defaulting to `true` while the browser/app is being used. When enabled, LaunchDeck keeps all actively configured live provider routes warm, which can become very consuming if creation, buy, and sell use different providers.
+  Shared active keep-warm toggle. `true|false`, with blank defaulting to `true` while the browser/app is being used. When enabled, LaunchDeck keeps the currently active provider routes warm; this can become request-heavy if creation, buy, and sell use different providers or wider endpoint sets.
 - `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND`
-  Idle suspend toggle for active keep-warm. Blank defaults to `true`.
+  Idle suspend toggle for active keep-warm. Blank defaults to `true`. When enabled, LaunchDeck also pauses the activity-driven background blockhash refresh, fee-market refresh, Jito tip stream, and scheduled wallet balance refresh while the app is idle, then resumes them on the next operator activity.
 - `LAUNCHDECK_IDLE_WARM_TIMEOUT_MS`
-  Idle timeout before active keep-warm suspends. Blank defaults to `30000`.
+  Idle timeout before active keep-warm suspends. Blank defaults to `75000`.
 - `LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS`
-  Active keep-warm cadence. Blank defaults to `10000`.
+  Active keep-warm cadence. Blank defaults to `50000`.
 - `LAUNCHDECK_DISABLE_STARTUP_WARM`
   Legacy negative startup-warm fallback. This is only consulted when `LAUNCHDECK_ENABLE_STARTUP_WARM` is unset.
 - `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
@@ -102,6 +104,21 @@ Watch endpoint vs execution provider:
   Current runtime report timing mode. Supported values: `off`, `light`, `full`. Blank defaults to `full`. Legacy `basic` is still accepted and maps to `light`.
 - `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT`
   Default for `execution.trackSendBlockHeight`. When enabled, reports also capture observed block height at send time and confirmation time. This env default is only applied when benchmark mode is `full`; `off` and `light` keep it off by default unless a request or preset explicitly sets `execution.trackSendBlockHeight`.
+
+Startup warm API and telemetry:
+
+- On engine startup, the one-shot warm path checks lookup tables, Pump/Bonk warm reads, fee-market estimates, and each resolved Helius Sender host.
+- **`feeMarket`** in the startup response includes `heliusPriorityLamports`, `heliusLaunchPriorityLamports`, `heliusTradePriorityLamports` (launch/trade fall back to the generic Helius estimate when a template-specific value is missing), and `jitoTipP99Lamports` when the snapshot succeeds.
+- **`startupWarm`** in that response includes aggregate **`stateTargets`** / **`endpointTargets`** counts, optional failure lists (**`stateFailures`**, **`endpointFailures`**), and human-readable labels for endpoint rows (Sender prewarm).
+- Helius Sender rows are warmed with an HTTP **GET** to the Sender **`/ping`** URL derived from each **`/fast`** submit URL, not with JSON-RPC on your main `SOLANA_RPC_URL`.
+
+Continuous warm (runtime status):
+
+- While active keep-warm runs, **`warm.stateTargets`** and **`warm.endpointTargets`** list each probe (category, label, provider, target host/URL, whether it was part of the latest pass, last attempt/success timestamps, last error, consecutive failures). The UI uses this for the platform runtime indicator.
+- Rows from older configs are dropped after about **one hour** without appearing in a new pass, so the map does not grow forever when providers or endpoints change.
+
+- `LAUNCHDECK_RPC_TRAFFIC_METER`
+  When `0`, `false`, `no`, or `off`, the engine **stops counting** metered outbound RPC-credit requests for the UI pill (each `record` becomes a cheap flag check only). When enabled (default if unset), the counter includes **Solana JSON-RPC** (reads, sends, sims, confirmations, block height, warm `getVersion`), **Helius priority-fee RPC**, and **wallet balance** RPC. The UI merges **`rpcTraffic`** from both **`/api/runtime-status`** and **`/api/warm/activity`** so the value updates during keep-warm, not only on the runtime poll interval.
 
 How these settings fit together:
 
@@ -130,8 +147,12 @@ How these settings fit together:
 
 - `LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL`
   Helius priority-fee selector for auto-fee mode. Supported values: `recommended`, `none`, `low`, `medium`, `high`, `veryHigh`, `unsafeMax`.
+- `LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS`
+  Background refresh cadence for the Helius `getPriorityFeeEstimate` snapshot used by auto-fee mode. Blank defaults to `6000ms`.
 - `LAUNCHDECK_AUTO_FEE_JITO_TIP_PERCENTILE`
   Jito tip-floor percentile selector for auto-fee mode. Supported values: `p25`, `p50`, `p75`, `p95`, `p99`. Bags setup bundle tip selection follows this shared setting too; there is no separate Bags percentile override.
+- `LAUNCHDECK_WALLET_STATUS_REFRESH_INTERVAL_MS`
+  Frontend wallet balance/status refresh cadence. Blank defaults to `30000ms`. The UI still does an immediate refresh after launches and persists the last refresh timestamp in `localStorage`, but the steady-state refresh loop auto-pauses during idle suspend and resumes on activity.
 - `LAUNCHDECK_LAUNCH_COMPUTE_UNIT_LIMIT`
 - `LAUNCHDECK_AGENT_SETUP_COMPUTE_UNIT_LIMIT`
 - `LAUNCHDECK_FOLLOW_UP_COMPUTE_UNIT_LIMIT`
@@ -151,7 +172,7 @@ How these settings fit together:
 Practical note:
 
 - the current recommended auto-fee default is `veryHigh` plus `p99`, then cap cost in the UI with a max auto-fee value if needed
-- current shipped compute-unit defaults are `340000` launch, `180000` agent setup, `175000` follow-up, `120000` sniper buy, `145000` dev auto-sell, and `90000` Bonk `usd1` top-up
+- current shipped compute-unit defaults are `340000` launch, `180000` agent setup, `175000` follow-up, `120000` sniper buy, `145000` automatic dev sell, and `90000` Bonk `usd1` top-up
 - helper worker mode keeps one Node helper process alive for repeated Bonk/Bags requests
 - if a helper worker transport call fails or times out, LaunchDeck falls back to restarting the helper and retrying instead of permanently requiring worker mode
 
@@ -336,6 +357,10 @@ Important operator-facing fields:
   Required by normalization before launch can proceed
 - `execution.provider`, `execution.buyProvider`, `execution.sellProvider`
   Separate provider controls for creation, buy, and sell flows
+- `execution.priorityFeeSol`, `execution.buyPriorityFeeSol`, `execution.sellPriorityFeeSol`
+  UI-facing priority-fee inputs. These are stored as SOL-equivalent values on a fixed `1,000,000` compute-unit basis; the engine converts them to `computeUnitPriceMicroLamports` when compiling transactions.
+- `execution.tipSol`, `execution.buyTipSol`, `execution.sellTipSol`
+  UI-facing tip inputs for creation, buy, and sell flows.
 - `tx.computeUnitPriceMicroLamports`
 - `tx.jitoTipLamports`
 - `followLaunch`
@@ -364,6 +389,11 @@ For `helius-sender`:
 - `tx.computeUnitPriceMicroLamports` must be greater than `0`
 - `tx.jitoTipLamports` must be at least `200000`
 
+For `jito-bundle`:
+
+- `tx.computeUnitPriceMicroLamports` must be greater than `0`
+- `tx.jitoTipLamports` must be at least `200000`
+
 For all providers:
 
 - removed provider values such as `auto` are not valid live config values anymore
@@ -381,7 +411,9 @@ For all providers:
 - `followLaunch.snipes[].postBuySell` is not supported yet and is rejected
 - `submitWithLaunch` cannot be combined with `submitDelayMs` or `targetBlockOffset`
 - follow constraints and retry budgets are validated
-- dev auto-sell supports an exclusive `time` or `market-cap` trigger family
+- if any follow sniper buy is enabled and `execution.buyAutoGas=false`, then `helius-sender` and `jito-bundle` buy routes require `execution.buyPriorityFeeSol > 0` and `execution.buyTipSol >= 0.0002`
+- if automatic dev sell is enabled and `execution.sellAutoGas=false`, then `helius-sender` and `jito-bundle` sell routes require `execution.sellPriorityFeeSol > 0` and `execution.sellTipSol >= 0.0002`
+- automatic dev sell supports an exclusive `time` or `market-cap` trigger family
 - market-cap timeout is stored in seconds and supports `timeoutAction=stop|sell`
 - Pump `agent-custom` and `agent-locked` use an explicit creator-vault split for follow actions:
   - same-window `+0` buys and sells stay on the original launch-creator / deployer vault path
@@ -396,13 +428,14 @@ The app tries to give operators a sensible baseline without manual tuning.
 Current defaults include:
 
 - default provider: `helius-sender`
-- default creation tip: `0.01`
-- default trade priority fee: `0.009`
-- default trade tip: `0.01`
-- default trade slippage: `90`
+- default creation priority fee: `0.000001`
+- default creation tip: `0.0002`
+- default trade priority fee: `0.000001`
+- default trade tip: `0.0002`
+- default trade slippage: `20`
 - default quick dev-buy presets: `0.5`, `1`, and `2`
 
-Defaults are only a starting point. The engine may still override behavior depending on provider or launch shape.
+Defaults are only a starting point. The engine may still override behavior depending on provider or launch shape, and any settings-modal saves still persist only to the local ignored `.local/launchdeck/app-config.json`.
 
 ## Endpoint Profiles
 
@@ -416,8 +449,11 @@ Supported profile values:
 - `global`
 - `us`
 - `eu`
-- `west`
 - `asia`
+- Helius Sender metros (and Jito filtering by matching block-engine host): `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo` (optional comma list, e.g. `fra,ams`)
+- `ny` (normalized to `ewr` for Sender; matches Newark Jito hosts)
+
+The `west` profile is no longer supported.
 
 Resolution order:
 

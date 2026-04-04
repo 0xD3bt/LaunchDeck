@@ -908,6 +908,78 @@ fn parse_choice(
     }
 }
 
+const REQUIRED_PROVIDER_TIP_LAMPORTS: u64 = 200_000;
+
+fn provider_requires_tip_and_priority(provider: &str) -> bool {
+    matches!(provider.trim(), "helius-sender" | "jito-bundle")
+}
+
+fn parse_sol_decimal_to_lamports(value: &str, label: &str) -> Result<u64, ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    if !trimmed
+        .chars()
+        .all(|char| char.is_ascii_digit() || char == '.')
+    {
+        return Err(ConfigError::Message(format!(
+            "{label} must be a positive decimal string. Got: {value}"
+        )));
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fractional = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Err(ConfigError::Message(format!(
+            "{label} must be a positive decimal string. Got: {value}"
+        )));
+    }
+    if fractional.len() > 9 {
+        return Err(ConfigError::Message(format!(
+            "{label} supports at most 9 decimal places. Got: {value}"
+        )));
+    }
+    let normalized = format!("{whole}{fractional:0<width$}", width = 9);
+    let digits = normalized.trim_start_matches('0');
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    digits
+        .parse::<u64>()
+        .map_err(|error| ConfigError::Message(error.to_string()))
+}
+
+fn validate_manual_provider_fee_fields(
+    provider: &str,
+    auto_gas: bool,
+    priority_fee_sol: &str,
+    tip_sol: &str,
+    label_prefix: &str,
+) -> Result<(), ConfigError> {
+    if auto_gas || !provider_requires_tip_and_priority(provider) {
+        return Ok(());
+    }
+    if priority_fee_sol.trim().is_empty() && tip_sol.trim().is_empty() {
+        return Ok(());
+    }
+    let priority_lamports =
+        parse_sol_decimal_to_lamports(priority_fee_sol, &format!("{label_prefix}PriorityFeeSol"))?;
+    if priority_lamports == 0 {
+        return Err(ConfigError::Message(format!(
+            "{label_prefix}PriorityFeeSol must be greater than 0 when {label_prefix}Provider is {provider}."
+        )));
+    }
+    let tip_lamports =
+        parse_sol_decimal_to_lamports(tip_sol, &format!("{label_prefix}TipSol"))?;
+    if tip_lamports < REQUIRED_PROVIDER_TIP_LAMPORTS {
+        return Err(ConfigError::Message(format!(
+            "{label_prefix}TipSol must be at least 0.0002 SOL when {label_prefix}Provider is {provider}."
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_bags_mode(mode: &str) -> String {
     match mode {
         "regular" | "bags-2-2" => "bags-2-2".to_string(),
@@ -1637,12 +1709,10 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             endpointProfile: if is_blank(&raw.execution.endpointProfile) {
                 String::new()
             } else {
-                parse_choice(
-                    &raw.execution.endpointProfile,
-                    "execution.endpointProfile",
-                    &["global", "us", "eu", "west", "asia"],
-                    "global",
-                )?
+                crate::endpoint_profile::parse_config_endpoint_profile(&raw.execution.endpointProfile)
+                    .map_err(|msg| {
+                        ConfigError::Message(format!("execution.endpointProfile: {msg}"))
+                    })?
             },
             autoGas: parse_bool(&raw.execution.autoGas, true),
             autoMode: if is_blank(&raw.execution.autoMode) {
@@ -1663,12 +1733,12 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             buyEndpointProfile: if is_blank(&raw.execution.buyEndpointProfile) {
                 String::new()
             } else {
-                parse_choice(
+                crate::endpoint_profile::parse_config_endpoint_profile(
                     &raw.execution.buyEndpointProfile,
-                    "execution.buyEndpointProfile",
-                    &["global", "us", "eu", "west", "asia"],
-                    "global",
-                )?
+                )
+                .map_err(|msg| {
+                    ConfigError::Message(format!("execution.buyEndpointProfile: {msg}"))
+                })?
             },
             buyAutoGas: parse_bool(&raw.execution.buyAutoGas, true),
             buyAutoMode: if is_blank(&raw.execution.buyAutoMode) {
@@ -1696,12 +1766,12 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             sellEndpointProfile: if is_blank(&raw.execution.sellEndpointProfile) {
                 String::new()
             } else {
-                parse_choice(
+                crate::endpoint_profile::parse_config_endpoint_profile(
                     &raw.execution.sellEndpointProfile,
-                    "execution.sellEndpointProfile",
-                    &["global", "us", "eu", "west", "asia"],
-                    "global",
-                )?
+                )
+                .map_err(|msg| {
+                    ConfigError::Message(format!("execution.sellEndpointProfile: {msg}"))
+                })?
             },
             sellPriorityFeeSol: raw.execution.sellPriorityFeeSol.trim().to_string(),
             sellTipSol: raw.execution.sellTipSol.trim().to_string(),
@@ -1812,6 +1882,21 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             "jitoTipAccount is required when jitoTipLamports is set.".to_string(),
         ));
     }
+    if provider_requires_tip_and_priority(&normalized.execution.provider) {
+        if normalized.tx.computeUnitPriceMicroLamports.unwrap_or(0) <= 0 {
+            return Err(ConfigError::Message(format!(
+                "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is {}.",
+                normalized.execution.provider
+            )));
+        }
+        if normalized.tx.jitoTipLamports < REQUIRED_PROVIDER_TIP_LAMPORTS as i64 {
+            return Err(ConfigError::Message(format!(
+                "tx.jitoTipLamports must be at least {} when execution.provider is {}.",
+                REQUIRED_PROVIDER_TIP_LAMPORTS,
+                normalized.execution.provider
+            )));
+        }
+    }
     if normalized.execution.provider == "helius-sender" {
         if !normalized.execution.skipPreflight {
             return Err(ConfigError::Message(
@@ -1831,6 +1916,29 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     .to_string(),
             ));
         }
+    }
+    if normalized.followLaunch.snipes.iter().any(|snipe| snipe.enabled) {
+        validate_manual_provider_fee_fields(
+            &normalized.execution.buyProvider,
+            normalized.execution.buyAutoGas,
+            &normalized.execution.buyPriorityFeeSol,
+            &normalized.execution.buyTipSol,
+            "execution.buy",
+        )?;
+    }
+    if normalized
+        .followLaunch
+        .devAutoSell
+        .as_ref()
+        .is_some_and(|sell| sell.enabled)
+    {
+        validate_manual_provider_fee_fields(
+            &normalized.execution.sellProvider,
+            normalized.execution.sellAutoGas,
+            &normalized.execution.sellPriorityFeeSol,
+            &normalized.execution.sellTipSol,
+            "execution.sell",
+        )?;
     }
 
     // Keep variable live for future parity extensions.
@@ -1926,6 +2034,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_west_endpoint_profile() {
+        let mut raw = sample_raw_config();
+        raw.execution.endpointProfile = "west".to_string();
+        let err = normalize_raw_config(raw).expect_err("west should be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("west"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_comma_metro_endpoint_profile() {
+        let mut raw = sample_raw_config();
+        raw.execution.endpointProfile = "fra,ams".to_string();
+        let normalized = normalize_raw_config(raw).expect("config should normalize");
+        assert_eq!(normalized.execution.endpointProfile, "fra,ams");
+    }
+
+    #[test]
+    fn normalizes_ny_endpoint_profile_to_ewr() {
+        let mut raw = sample_raw_config();
+        raw.execution.endpointProfile = "NY".to_string();
+        let normalized = normalize_raw_config(raw).expect("config should normalize");
+        assert_eq!(normalized.execution.endpointProfile, "ewr");
+    }
+
+    #[test]
     fn ignores_legacy_policy_fields_during_normalization() {
         let mut raw = sample_raw_config();
         raw.execution.policy = "not-a-valid-policy-anymore".to_string();
@@ -1962,6 +2097,68 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "execution.skipPreflight must be true when execution.provider is helius-sender."
+        );
+    }
+
+    #[test]
+    fn jito_bundle_requires_priority_and_minimum_tip() {
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "jito-bundle".to_string();
+        raw.tx.jitoTipLamports = Some(json!(100_000));
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(0));
+        let error = normalize_raw_config(raw).expect_err("jito bundle should require priority");
+        assert_eq!(
+            error.to_string(),
+            "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is jito-bundle."
+        );
+
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "jito-bundle".to_string();
+        raw.tx.jitoTipLamports = Some(json!(100_000));
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+        let error = normalize_raw_config(raw).expect_err("jito bundle should require minimum tip");
+        assert_eq!(
+            error.to_string(),
+            "tx.jitoTipLamports must be at least 200000 when execution.provider is jito-bundle."
+        );
+    }
+
+    #[test]
+    fn manual_buy_provider_fees_must_satisfy_provider_minimums() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.buyProvider = "jito-bundle".to_string();
+        raw.execution.buyAutoGas = Some(json!(false));
+        raw.execution.buyPriorityFeeSol = String::new();
+        raw.execution.buyTipSol = "0.0001".to_string();
+        let error = normalize_raw_config(raw).expect_err("manual buy fees should be validated");
+        assert_eq!(
+            error.to_string(),
+            "execution.buyPriorityFeeSol must be greater than 0 when execution.buyProvider is jito-bundle."
+        );
+
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.buyProvider = "jito-bundle".to_string();
+        raw.execution.buyAutoGas = Some(json!(false));
+        raw.execution.buyPriorityFeeSol = "0.001".to_string();
+        raw.execution.buyTipSol = "0.0001".to_string();
+        let error = normalize_raw_config(raw).expect_err("manual buy tip floor should be validated");
+        assert_eq!(
+            error.to_string(),
+            "execution.buyTipSol must be at least 0.0002 SOL when execution.buyProvider is jito-bundle."
         );
     }
 

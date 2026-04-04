@@ -68,7 +68,7 @@ Common causes:
 What to do:
 
 1. set `SOLANA_WS_URL` explicitly
-2. set `USER_REGION` to your closest region
+2. set `USER_REGION` to your closest regional group or explicit metro list
 3. prefer region fanout over pinning one explicit sender or bundle endpoint
 4. if needed, use provider-specific region overrides
 5. if you are on Helius dev tier and LaunchDeck is watching through a Helius websocket endpoint, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
@@ -121,6 +121,10 @@ For the best current Sender path:
 2. use the matching Helius websocket for `SOLANA_WS_URL`
 3. use a Shyft RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 4. use Helius dev tier if you want the strongest performance and watcher behavior
+
+### Sender “connection warm” or startup Sender checks fail
+
+Startup and continuous warm hit each Sender URL’s **`/ping`** endpoint (from the same host as **`/fast`**). If those requests fail but normal Solana JSON-RPC works, check outbound HTTP to `*-sender.helius-rpc.com`, TLS interception, or accidental blocking of non-RPC paths—not `SOLANA_RPC_URL` health.
 
 ## Standard RPC Not Using Tip
 

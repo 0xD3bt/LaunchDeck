@@ -46,12 +46,16 @@ Supported profile values:
 - `global`
 - `us`
 - `eu`
-- `west`
 - `asia`
+- Metro codes (Helius regional senders; Jito uses the same tokens to filter block-engine bases): `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`
+- Optional comma-separated metro lists (e.g. `fra,ams`)
+- `ny` accepted as an alias for Newark (`ewr` for Helius Sender; Jito `ny.` hosts)
 
-When a profile is selected, LaunchDeck fans out across the endpoints in that profile group. It does not simply pick one endpoint.
+The former `west` aggregate is removed—use `us`, `eu`, or explicit metros.
 
-For most operators, this is the recommended setup. Using `USER_REGION` or a provider-specific region override is usually faster and more reliable than pinning a single endpoint because the runtime can fan out across the region's endpoint group instead of depending on one host.
+When a profile is selected, LaunchDeck fans out across the endpoints in that selected group or metro set. It does not simply pick one endpoint.
+
+For most operators, this is the recommended setup. Using `USER_REGION` or a provider-specific region override is usually faster and more reliable than pinning a single endpoint because the runtime can fan out across the selected endpoint set instead of depending on one host.
 
 Region resolution order:
 
@@ -60,6 +64,100 @@ Region resolution order:
 3. provider default or global fallback
 
 If you set explicit endpoint overrides, profile-based routing is bypassed. Use explicit endpoints only when you have a specific reason to force one host or one private integration.
+
+### Helius Sender regional endpoints
+
+When `HELIUS_SENDER_ENDPOINT` / `HELIUS_SENDER_BASE_URL` are unset, profile fanout uses Helius regional Sender HTTP hosts (each submit path ends in `/fast`). The mapping is:
+
+| Profile | Sender hosts used |
+| --- | --- |
+| `global` | default `sender.helius-rpc.com` |
+| `us` | `slc-sender`, `ewr-sender` |
+| `eu` | `fra-sender`, `ams-sender` |
+| `asia` | `sg-sender`, `tyo-sender` |
+| Single metro (e.g. `fra`, `lon`) | that region’s `*-sender` host only |
+| Comma metros (e.g. `fra,lon`) | the union of those regional hosts |
+
+London (`lon-sender`) is available only when you set `lon`, `eu` (which is fra+ams only), or an explicit list that includes `lon`. Override envs still bypass this table.
+
+## Full endpoint catalog (reference)
+
+This section lists **concrete URLs** operators may plug into env vars or provider-specific overrides. It matches what the LaunchDeck engine uses by default where applicable, and vendor-published endpoints elsewhere—hostnames can change, so verify with each provider’s documentation if something stops resolving.
+
+### Helius Sender (execution)
+
+Used when `execution.provider` is `helius-sender`. Send path is always `…/fast`; LaunchDeck’s Sender **warm** path uses **`…/ping`** on the same host (not JSON-RPC).
+
+| Key | Location | Send URL | Warm URL |
+| --- | --- | --- | --- |
+| `global` | Global front door | `https://sender.helius-rpc.com/fast` | `https://sender.helius-rpc.com/ping` |
+| `slc` | Salt Lake City | `http://slc-sender.helius-rpc.com/fast` | `http://slc-sender.helius-rpc.com/ping` |
+| `ewr` | Newark | `http://ewr-sender.helius-rpc.com/fast` | `http://ewr-sender.helius-rpc.com/ping` |
+| `lon` | London | `http://lon-sender.helius-rpc.com/fast` | `http://lon-sender.helius-rpc.com/ping` |
+| `fra` | Frankfurt | `http://fra-sender.helius-rpc.com/fast` | `http://fra-sender.helius-rpc.com/ping` |
+| `ams` | Amsterdam | `http://ams-sender.helius-rpc.com/fast` | `http://ams-sender.helius-rpc.com/ping` |
+| `sg` | Singapore | `http://sg-sender.helius-rpc.com/fast` | `http://sg-sender.helius-rpc.com/ping` |
+| `tyo` | Tokyo | `http://tyo-sender.helius-rpc.com/fast` | `http://tyo-sender.helius-rpc.com/ping` |
+
+`HELIUS_SENDER_ENDPOINT` / `HELIUS_SENDER_BASE_URL` override the above and bypass profile fanout.
+
+### Helius Solana RPC and WebSocket (reads / confirm / watchers)
+
+These are **normal Solana JSON-RPC and websocket** endpoints—not Sender. Typical shapes:
+
+| Usage | Example pattern |
+| --- | --- |
+| HTTPS RPC (`SOLANA_RPC_URL`) | `https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
+| Websocket (`SOLANA_WS_URL`) | `wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
+
+Exact paths and query parameter names follow [Helius](https://www.helius.dev/) documentation for your plan.
+
+### Jito Block Engine (execution)
+
+Used when `execution.provider` is `jito-bundle`. LaunchDeck derives bundle **send** from each regional **base**: `{base}/api/v1/bundles` and **status**: `{base}/api/v1/getBundleStatuses` (unless `JITO_SEND_BUNDLE_ENDPOINT` / `JITO_BUNDLE_STATUS_ENDPOINT` or `JITO_BUNDLE_BASE_URLS` override defaults).
+
+| Region key | Location | Base URL |
+| --- | --- | --- |
+| `mainnet` | Global mainnet | `https://mainnet.block-engine.jito.wtf` |
+| `new-york` / `ny` | New York | `https://ny.mainnet.block-engine.jito.wtf` |
+| `salt-lake-city` / `slc` | Salt Lake City | `https://slc.mainnet.block-engine.jito.wtf` |
+| `frankfurt` | Frankfurt | `https://frankfurt.mainnet.block-engine.jito.wtf` |
+| `amsterdam` | Amsterdam | `https://amsterdam.mainnet.block-engine.jito.wtf` |
+| `london` | London | `https://london.mainnet.block-engine.jito.wtf` |
+| `dublin` | Dublin | `https://dublin.mainnet.block-engine.jito.wtf` |
+| `singapore` | Singapore | `https://singapore.mainnet.block-engine.jito.wtf` |
+| `tokyo` | Tokyo | `https://tokyo.mainnet.block-engine.jito.wtf` |
+
+LaunchDeck **endpoint profile** metro tokens (`slc`, `ewr`, `fra`, etc.) filter this list by matching these hostnames (for example `ewr` / `ny` match the New York base).
+
+### Hello Moon — Lunar Lander (reference)
+
+Hello Moon is **not** a separate execution provider in the current runtime registry. Legacy config may still map `hellomoon` → `standard-rpc`. The table below documents **published Lunar Lander regional HTTP send** endpoints as operator reference data. Submission modes (batch send, bundle, QUIC) are described in Hello Moon’s own API docs, linked below.
+
+| Key | Location | Send URL |
+| --- | --- | --- |
+| `global` | Geolocated / global path | `http://lunar-lander.hellomoon.io/send` |
+| `fra` | Frankfurt | `http://fra.lunar-lander.hellomoon.io/send` |
+| `ams` | Amsterdam | `http://ams.lunar-lander.hellomoon.io/send` |
+| `nyc` | New York | `http://nyc.lunar-lander.hellomoon.io/send` |
+| `ash` | Ashburn, Virginia | `http://ash.lunar-lander.hellomoon.io/send` |
+| `tyo` | Tokyo | `http://tyo.lunar-lander.hellomoon.io/send` |
+
+API references: [Batch Send](https://docs.hellomoon.io/reference/batch-send-api), [Send Bundle](https://docs.hellomoon.io/reference/send-bundle-api), [QUIC submission](https://docs.hellomoon.io/reference/quic-submission). For generic RPC, see `HELLOMOON_RPC_URL` in [CONFIG.md](CONFIG.md) if you use Hello Moon as a normal RPC provider.
+
+### Shyft — regional Solana RPC (standard-RPC style)
+
+[Shyft](https://shyft.to/) regional HTTPS RPC hosts are commonly used for `LAUNCHDECK_WARM_RPC_URL` and sometimes for `LAUNCHDECK_STANDARD_RPC_SEND_URLS`. Replace `YOUR_API_KEY` with your key.
+
+| Key | Location | Endpoint |
+| --- | --- | --- |
+| `fra` | Frankfurt | `https://rpc.fra.shyft.to?api_key=YOUR_API_KEY` |
+| `ams` | Amsterdam | `https://rpc.ams.shyft.to?api_key=YOUR_API_KEY` |
+| `sgp` | Singapore | `https://rpc.sgp.shyft.to?api_key=YOUR_API_KEY` |
+| `va` | Virginia | `https://rpc.va.shyft.to?api_key=YOUR_API_KEY` |
+| `ny` | New York | `https://rpc.ny.shyft.to?api_key=YOUR_API_KEY` |
+
+Shyft may publish additional regions; treat this table as a common regional set, not an exhaustive vendor list.
 
 ## Helius Sender
 
@@ -169,16 +267,6 @@ Practical note:
 
 - bundle members are treated as an ordered grouped send
 - bundle submission is fanned out across the selected profile group when profiles are used
-
-## Upcoming Relay Integrations
-
-Additional private relay integrations are planned but not yet live in the current runtime.
-
-Current roadmap includes:
-
-- `bloxroute`
-- `astralane`
-- `hello moon`
 
 ## Engine-Owned Overrides
 

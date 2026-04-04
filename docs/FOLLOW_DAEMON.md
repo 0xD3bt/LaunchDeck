@@ -45,7 +45,7 @@ The daemon is responsible for:
 - arming jobs once launch-specific context is known
 - running slot, signature, and market watchers
 - executing delayed sniper buys
-- executing dev auto-sells
+- executing automatic dev sells
 - executing snipe sells
 - persisting independent follow-job state
 
@@ -90,12 +90,12 @@ Use this mainly when your latency is high enough that waiting for observed submi
 
 How it works:
 
-- selected same-time buys compile alongside the launch
+- selected same-time sniper buys compile alongside the launch
 - Bonk uses launch-first submission on non-bundle transports so the buy path does not outrun creation
 - Bonk `usd1` same-time sniper buys compile as atomic swap-and-buy transactions
 - if a same-time buy lands before creation, it fails
 - a same-time fee safeguard warns when buy-side fees are higher than launch fees
-- eligible same-time buys can arm a one-time daemon retry if the first landing fails
+- eligible same-time sniper buys can arm a one-time daemon retry if the first landing fails
 
 Retry behavior:
 
@@ -105,7 +105,7 @@ Retry behavior:
 
 ### `On Submit + Delay`
 
-Use this for sniper buys or auto-sell actions scheduled from observed launch submission.
+Use this for delayed sniper buys or automatic dev sell actions scheduled from observed launch submission.
 
 How it works:
 
@@ -124,7 +124,7 @@ How it works:
 - the daemon watches launch-relative block progress
 - the action fires when the configured confirmed-block target is observed
 - because it waits for observed launch state, it is more conservative than `Same Time`
-- use the current UI-configured range rather than older stale docs that referenced a smaller range
+- the exact allowed block-offset range is enforced by the current UI and backend validation
 
 ### Sell Triggers
 
@@ -134,7 +134,7 @@ Sell-side follow actions can also wait on:
 - market-cap triggers
 - confirmation requirements
 
-Current dev auto-sell behavior:
+Current automatic dev sell behavior:
 
 - the UI exposes mutually exclusive `Time` and `Market Cap` trigger families
 - market-cap mode is exclusive and does not silently carry a hidden time delay

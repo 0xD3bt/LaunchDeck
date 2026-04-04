@@ -5,7 +5,9 @@ const path = require("path");
 
 const PRODUCT_SLUG = "launchdeck";
 const PROVIDERS = ["helius-sender", "standard-rpc", "jito-bundle"];
-const ENDPOINT_PROFILES = ["global", "us", "eu", "west", "asia"];
+const ENDPOINT_PROFILE_AGGREGATES = ["global", "us", "eu", "asia"];
+const ENDPOINT_PROFILE_METROS = ["slc", "ewr", "lon", "fra", "ams", "sg", "tyo"];
+const ENDPOINT_PROFILES = [...ENDPOINT_PROFILE_AGGREGATES, ...ENDPOINT_PROFILE_METROS];
 const PROVIDER_ENDPOINT_PROFILES = {
   "helius-sender": ENDPOINT_PROFILES,
   "jito-bundle": ENDPOINT_PROFILES,
@@ -29,10 +31,11 @@ const DEFAULT_POLICY = "safe";
 const DEFAULT_PROVIDER = "helius-sender";
 const DEFAULT_ENDPOINT_PROFILE = "global";
 const DEFAULT_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
-const DEFAULT_CREATION_TIP_SOL = "0.01";
-const DEFAULT_TRADE_PRIORITY_FEE_SOL = "0.009";
-const DEFAULT_TRADE_TIP_SOL = "0.01";
-const DEFAULT_TRADE_SLIPPAGE_PERCENT = "90";
+const DEFAULT_CREATION_PRIORITY_FEE_SOL = "0.000001";
+const DEFAULT_CREATION_TIP_SOL = "0.0002";
+const DEFAULT_TRADE_PRIORITY_FEE_SOL = "0.000001";
+const DEFAULT_TRADE_TIP_SOL = "0.0002";
+const DEFAULT_TRADE_SLIPPAGE_PERCENT = "20";
 
 function normalizeProvider(provider, fallback = DEFAULT_PROVIDER) {
   const normalized = String(provider || "").trim().toLowerCase();
@@ -45,12 +48,42 @@ function providerSupportsEndpointProfiles(provider) {
   return Array.isArray(PROVIDER_ENDPOINT_PROFILES[provider]) && PROVIDER_ENDPOINT_PROFILES[provider].length > 0;
 }
 
+/**
+ * Validates endpoint profile strings (aggregates, one metro, or comma-separated metros).
+ * `ny` normalizes to `ewr`. `west` is rejected (falls back at call sites).
+ */
+function validateEndpointProfileLiteral(profile) {
+  const raw = String(profile || "").trim().toLowerCase();
+  if (!raw) return { ok: false };
+  if (raw === "west") return { ok: false };
+  if (raw.includes(",")) {
+    const seen = new Set();
+    const out = [];
+    for (const part of raw.split(",")) {
+      const p = part.trim().toLowerCase();
+      if (!p) continue;
+      if (ENDPOINT_PROFILE_AGGREGATES.includes(p)) return { ok: false };
+      const metro = p === "ny" ? "ewr" : p;
+      if (!ENDPOINT_PROFILE_METROS.includes(metro)) return { ok: false };
+      if (!seen.has(metro)) {
+        seen.add(metro);
+        out.push(metro);
+      }
+    }
+    return out.length ? { ok: true, value: out.join(",") } : { ok: false };
+  }
+  if (ENDPOINT_PROFILE_AGGREGATES.includes(raw)) return { ok: true, value: raw };
+  const metro = raw === "ny" ? "ewr" : raw;
+  if (ENDPOINT_PROFILE_METROS.includes(metro)) return { ok: true, value: metro };
+  return { ok: false };
+}
+
 function normalizeEndpointProfile(provider, profile, fallback = DEFAULT_ENDPOINT_PROFILE) {
   const normalizedProvider = normalizeProvider(provider);
   if (!providerSupportsEndpointProfiles(normalizedProvider)) return "";
-  const normalized = String(profile || "").trim().toLowerCase();
-  if (!normalized) return fallback;
-  return PROVIDER_ENDPOINT_PROFILES[normalizedProvider].includes(normalized) ? normalized : fallback;
+  const checked = validateEndpointProfileLiteral(profile);
+  if (checked.ok) return checked.value;
+  return fallback;
 }
 
 function normalizePolicy(policy, fallback = DEFAULT_POLICY) {
@@ -85,7 +118,7 @@ function createCreationSettings({
   endpointProfile = DEFAULT_ENDPOINT_PROFILE,
   policy = DEFAULT_POLICY,
   tipSol = DEFAULT_CREATION_TIP_SOL,
-  priorityFeeSol = "0.001",
+  priorityFeeSol = DEFAULT_CREATION_PRIORITY_FEE_SOL,
   devBuySol = "",
 } = {}) {
   return {
@@ -93,7 +126,7 @@ function createCreationSettings({
     endpointProfile: normalizeEndpointProfile(provider, endpointProfile),
     policy: normalizePolicy(policy),
     tipSol: normalizeDecimalString(tipSol, DEFAULT_CREATION_TIP_SOL),
-    priorityFeeSol: normalizeDecimalString(priorityFeeSol, "0.001"),
+    priorityFeeSol: normalizeDecimalString(priorityFeeSol, DEFAULT_CREATION_PRIORITY_FEE_SOL),
     devBuySol: normalizeDecimalString(devBuySol),
   };
 }

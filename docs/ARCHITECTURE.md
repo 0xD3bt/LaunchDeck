@@ -47,7 +47,7 @@ The follow daemon is responsible for:
 - accepting reserved and armed follow jobs
 - maintaining websocket-backed watchers for slots, signatures, and market conditions
 - executing delayed sniper buys
-- executing automatic dev sells
+- executing automatic dev sell actions
 - executing snipe sells
 - tracking job state outside the main request lifecycle
 - persisting follow telemetry, watcher health, and timing profiles
@@ -115,7 +115,7 @@ Verified Bonk support includes:
 - `usd1`
 - immediate dev buy
 - same-time sniper buys
-- snipe buys
+- delayed sniper buys
 - snipe sells
 - automatic dev sell
 
@@ -126,6 +126,7 @@ Bagsapp is available when configured, but it is still experimental.
 - availability depends on Bags credentials
 - launch/trade assembly uses the hosted Bags API or SDK bridge
 - Rust still owns normalization, transport planning, reporting, and the UI integration layer
+- current operator support includes `bags-2-2`, `bags-025-1`, `bags-1-025`, `sol`, immediate dev buy, same-time sniper buys, delayed sniper buys, snipe sells, and automatic dev sell
 
 ## Provider And Transport Layer
 
@@ -199,7 +200,7 @@ The current runtime uses several caching and warm-up paths to reduce launch late
 - warmed lookup tables cached in memory and persisted locally
 - cached blockhash refresh in the host and daemon
 - cached Pump global state for compile-time launch assembly and dev-buy quoting
-- arm-time preparation of delayed snipe buys
+- arm-time preparation of delayed sniper buys
 - daemon-side hot-state refresh for delayed follow jobs
 - concurrency for same-time compile and non-bundle submit paths that preserve launch ordering
 

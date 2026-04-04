@@ -3,10 +3,114 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     fs,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+/// Rolling window for UI "requests per minute" (count in the last 60s).
+const PROVIDER_HTTP_TRAFFIC_WINDOW_SECS: u64 = 60;
+/// Cap deque size if the clock jumps or under pathological load.
+const TRAFFIC_QUEUE_CAP: usize = 128;
+
+static OUTBOUND_PROVIDER_HTTP_TRAFFIC: Mutex<VecDeque<(u64, u32)>> = Mutex::new(VecDeque::new());
+
+/// When `false`, `record_outbound_provider_http_request` is a no-op (single atomic read, no lock).
+/// Set `LAUNCHDECK_RPC_TRAFFIC_METER=0` (or `false` / `off`) to disable. Unset defaults to enabled.
+fn rpc_traffic_meter_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LAUNCHDECK_RPC_TRAFFIC_METER")
+            .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+                "" => true,
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => true,
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn provider_traffic_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn prune_traffic_queue_before_read(now: u64, queue: &mut VecDeque<(u64, u32)>) {
+    while let Some(&(sec, _)) = queue.front() {
+        if now.saturating_sub(sec) >= PROVIDER_HTTP_TRAFFIC_WINDOW_SECS {
+            queue.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// JSON for `runtime-status` and `warm/activity` (`enabled` + `requestsLast60s` or null).
+pub fn rpc_traffic_snapshot() -> Value {
+    if !rpc_traffic_meter_enabled() {
+        return json!({
+            "enabled": false,
+            "requestsLast60s": Value::Null,
+        });
+    }
+    let now = provider_traffic_now_secs();
+    let mut queue = OUTBOUND_PROVIDER_HTTP_TRAFFIC
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_traffic_queue_before_read(now, &mut queue);
+    let total: u64 = queue
+        .iter()
+        .filter(|(sec, _)| now.saturating_sub(*sec) < PROVIDER_HTTP_TRAFFIC_WINDOW_SECS)
+        .map(|(_, count)| *count as u64)
+        .sum();
+    json!({
+        "enabled": true,
+        "requestsLast60s": total,
+    })
+}
+
+pub fn clear_outbound_provider_http_traffic() {
+    if !rpc_traffic_meter_enabled() {
+        return;
+    }
+    let mut queue = OUTBOUND_PROVIDER_HTTP_TRAFFIC
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queue.clear();
+}
+
+/// Count one outbound RPC-credit round-trip: Solana JSON-RPC, Helius priority-fee RPC,
+/// wallet balance RPC, and other metered RPC calls that consume provider credits/tokens.
+#[inline]
+pub fn record_outbound_provider_http_request() {
+    if !rpc_traffic_meter_enabled() {
+        return;
+    }
+    record_outbound_provider_http_request_metered();
+}
+
+fn record_outbound_provider_http_request_metered() {
+    let now = provider_traffic_now_secs();
+    let mut queue = OUTBOUND_PROVIDER_HTTP_TRAFFIC
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(back) = queue.back_mut() {
+        if back.0 == now {
+            back.1 = back.1.saturating_add(1);
+            return;
+        }
+    }
+    queue.push_back((now, 1));
+    prune_traffic_queue_before_read(now, &mut queue);
+    while queue.len() > TRAFFIC_QUEUE_CAP {
+        queue.pop_front();
+    }
+}
 
 use crate::{
     fs_utils::atomic_write,
@@ -382,5 +486,22 @@ mod tests {
             std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
         }
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn outbound_provider_http_counter_increments() {
+        let before = rpc_traffic_snapshot()
+            .get("requestsLast60s")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        record_outbound_provider_http_request();
+        let after = rpc_traffic_snapshot()
+            .get("requestsLast60s")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        assert!(
+            after >= before + 1,
+            "expected counter to increase (before={before}, after={after})"
+        );
     }
 }

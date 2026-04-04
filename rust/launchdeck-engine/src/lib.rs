@@ -3,6 +3,7 @@
 pub mod bags_native;
 pub mod bonk_native;
 pub mod config;
+pub mod endpoint_profile;
 pub mod follow;
 pub mod fs_utils;
 pub mod helper_worker;

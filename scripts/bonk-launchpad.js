@@ -2,10 +2,13 @@
 
 require("dotenv").config({ quiet: true });
 
+const fs = require("fs");
+const path = require("path");
 const readline = require("readline");
 const bs58 = require("bs58");
 const BN = require("bn.js");
 const {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   Keypair,
@@ -47,11 +50,18 @@ const USD1_MINT = new PublicKey("USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB");
 const RAYDIUM_ROUTE_PROGRAM = new PublicKey("routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS");
 const PINNED_USD1_ROUTE_POOL_ID = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS";
 const PREFERRED_USD1_ROUTE_CONFIG = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp";
+const BONK_HELPER_CACHE_SCHEMA_VERSION = 1;
+const DEFAULT_BONK_LAUNCH_DEFAULTS_CACHE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_BONK_LOOKUP_TABLE_CACHE_TTL_MS = 30 * 60 * 1000;
+const BONK_PINNED_LOOKUP_TABLE_ADDRESSES = new Set([BONK_USD1_SUPER_LOOKUP_TABLE]);
 const USD1_ROUTE_SETUP_CACHE = new Map();
 const BONK_LAUNCH_DEFAULTS_CACHE = new Map();
 const BONK_LAUNCH_DEFAULTS_IN_FLIGHT = new Map();
 const RAYDIUM_LAUNCH_CONFIGS_CACHE = new Map();
 const RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT = new Map();
+const LOOKUP_TABLE_ACCOUNT_CACHE = new Map();
+let persistentBonkCacheStore = null;
 
 function resolveQuoteAssetConfig(asset) {
   return String(asset || "").trim().toLowerCase() === "usd1"
@@ -69,8 +79,205 @@ function envInt(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function bonkHelperCachePath() {
+  const explicit = String(process.env.LAUNCHDECK_BONK_HELPER_CACHE_PATH || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const localRoot = String(process.env.LAUNCHDECK_LOCAL_DATA_DIR || "").trim()
+    || path.join(process.cwd(), ".local", "launchdeck");
+  return path.join(localRoot, "bonk-helper-cache.json");
+}
+
+function encodePersistentCacheValue(value) {
+  if (typeof value === "bigint") {
+    return { __type: "bigint", value: value.toString(10) };
+  }
+  if (BN.isBN(value)) {
+    return { __type: "bn", value: value.toString(10) };
+  }
+  if (value instanceof PublicKey) {
+    return { __type: "pubkey", value: value.toBase58() };
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => encodePersistentCacheValue(entry));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, encodePersistentCacheValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function decodePersistentCacheValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => decodePersistentCacheValue(entry));
+  }
+  if (value && typeof value === "object") {
+    if (value.__type === "bigint") {
+      return BigInt(String(value.value || "0"));
+    }
+    if (value.__type === "bn") {
+      return new BN(String(value.value || "0"), 10);
+    }
+    if (value.__type === "pubkey") {
+      return new PublicKey(String(value.value || ""));
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, decodePersistentCacheValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function loadPersistentBonkCacheStore() {
+  if (persistentBonkCacheStore) {
+    return persistentBonkCacheStore;
+  }
+  const cachePath = bonkHelperCachePath();
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8").trim();
+    if (!raw) {
+      throw new Error("empty cache file");
+    }
+    const parsed = JSON.parse(raw);
+    if (parsed.version !== BONK_HELPER_CACHE_SCHEMA_VERSION || !parsed.entries || typeof parsed.entries !== "object") {
+      throw new Error("cache schema mismatch");
+    }
+    persistentBonkCacheStore = parsed;
+  } catch (_error) {
+    persistentBonkCacheStore = {
+      version: BONK_HELPER_CACHE_SCHEMA_VERSION,
+      entries: {},
+    };
+  }
+  return persistentBonkCacheStore;
+}
+
+function persistBonkCacheStore() {
+  try {
+    const cachePath = bonkHelperCachePath();
+    const store = loadPersistentBonkCacheStore();
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, JSON.stringify(store), "utf8");
+  } catch (_error) {
+    // Ignore disk cache persistence failures and continue with in-memory caches.
+  }
+}
+
+function readPersistentTimedCache(namespace, key, ttlMs) {
+  try {
+    const store = loadPersistentBonkCacheStore();
+    const namespacedEntries = store.entries[namespace];
+    const entry = namespacedEntries && namespacedEntries[key];
+    if (!entry) {
+      return null;
+    }
+    if (Date.now() - Number(entry.storedAtMs || 0) > ttlMs) {
+      delete namespacedEntries[key];
+      persistBonkCacheStore();
+      return null;
+    }
+    return decodePersistentCacheValue(entry.value);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function writePersistentTimedCache(namespace, key, value) {
+  try {
+    const store = loadPersistentBonkCacheStore();
+    if (!store.entries[namespace] || typeof store.entries[namespace] !== "object") {
+      store.entries[namespace] = {};
+    }
+    store.entries[namespace][key] = {
+      storedAtMs: Date.now(),
+      value: encodePersistentCacheValue(value),
+    };
+    persistBonkCacheStore();
+  } catch (_error) {
+    // Ignore disk cache persistence failures and continue with in-memory caches.
+  }
+}
+
+function readSharedTimedCache(map, namespace, key, ttlMs) {
+  const memoryCached = readTimedCache(map, key, ttlMs);
+  if (memoryCached) {
+    return memoryCached;
+  }
+  const persistentCached = readPersistentTimedCache(namespace, key, ttlMs);
+  if (!persistentCached) {
+    return null;
+  }
+  writeTimedCache(map, key, persistentCached);
+  return persistentCached;
+}
+
+function writeSharedTimedCache(map, namespace, key, value) {
+  writeTimedCache(map, key, value);
+  writePersistentTimedCache(namespace, key, value);
+}
+
 function bonkLaunchDefaultsCacheTtlMs() {
-  return envInt("BONK_LAUNCH_DEFAULTS_CACHE_TTL_MS", 5000);
+  return envInt("BONK_LAUNCH_DEFAULTS_CACHE_TTL_MS", DEFAULT_BONK_LAUNCH_DEFAULTS_CACHE_TTL_MS);
+}
+
+function bonkLookupTableCacheTtlMs() {
+  return envInt("BONK_LOOKUP_TABLE_CACHE_TTL_MS", DEFAULT_BONK_LOOKUP_TABLE_CACHE_TTL_MS);
+}
+
+function isPinnedLookupTableAddress(address) {
+  return BONK_PINNED_LOOKUP_TABLE_ADDRESSES.has(String(address || "").trim());
+}
+
+function serializeLookupTableAccount(account) {
+  return {
+    key: account.key.toBase58(),
+    state: {
+      deactivationSlot: String(account.state.deactivationSlot),
+      lastExtendedSlot: Number(account.state.lastExtendedSlot || 0),
+      lastExtendedSlotStartIndex: Number(account.state.lastExtendedSlotStartIndex || 0),
+      authority: account.state.authority ? account.state.authority.toBase58() : null,
+      addresses: (account.state.addresses || []).map((entry) => entry.toBase58()),
+    },
+  };
+}
+
+function deserializeLookupTableAccount(snapshot) {
+  if (!snapshot || !snapshot.key || !snapshot.state || !Array.isArray(snapshot.state.addresses)) {
+    throw new Error("Invalid lookup table snapshot.");
+  }
+  return new AddressLookupTableAccount({
+    key: new PublicKey(String(snapshot.key)),
+    state: {
+      deactivationSlot: BigInt(String(snapshot.state.deactivationSlot || "0")),
+      lastExtendedSlot: Number(snapshot.state.lastExtendedSlot || 0),
+      lastExtendedSlotStartIndex: Number(snapshot.state.lastExtendedSlotStartIndex || 0),
+      authority: snapshot.state.authority ? new PublicKey(String(snapshot.state.authority)) : undefined,
+      addresses: snapshot.state.addresses.map((entry) => new PublicKey(String(entry))),
+    },
+  });
+}
+
+function readPinnedLookupTableSnapshot(address, ttlMs) {
+  if (!isPinnedLookupTableAddress(address)) {
+    return null;
+  }
+  try {
+    const snapshot = readPersistentTimedCache("lookup-table-snapshots", address, ttlMs);
+    return snapshot ? deserializeLookupTableAccount(snapshot) : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function writePinnedLookupTableSnapshot(account) {
+  const address = account && account.key ? account.key.toBase58() : "";
+  if (!isPinnedLookupTableAddress(address)) {
+    return;
+  }
+  writePersistentTimedCache("lookup-table-snapshots", address, serializeLookupTableAccount(account));
 }
 
 function getUsd1TopupPolicy() {
@@ -79,7 +286,7 @@ function getUsd1TopupPolicy() {
     minPoolTvlUsd: envFloat("BONK_USD1_MIN_POOL_TVL_USD", 100000),
     minRemainingSol: envFloat("BONK_USD1_MIN_REMAINING_SOL", 0.02),
     maxSearchIterations: envInt("BONK_USD1_MAX_INPUT_SEARCH_ITERATIONS", 10),
-    routeSetupCacheTtlMs: envInt("BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS", 5000),
+    routeSetupCacheTtlMs: envInt("BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS", DEFAULT_BONK_USD1_ROUTE_SETUP_CACHE_TTL_MS),
     searchToleranceBps: envInt("BONK_USD1_SEARCH_TOLERANCE_BPS", 50),
     searchMinLamports: envInt("BONK_USD1_SEARCH_MIN_LAMPORTS", 50000),
     searchBufferBps: envInt("BONK_USD1_SEARCH_BUFFER_BPS", 25),
@@ -96,6 +303,8 @@ function createUsd1QuoteMetrics() {
     routeSetupCacheHits: 0,
     routeSetupCacheMisses: 0,
     routeSetupFetchMs: 0,
+    superAltLocalSnapshotHits: 0,
+    superAltRpcRefreshes: 0,
     expansionQuoteCalls: 0,
     binarySearchQuoteCalls: 0,
     bufferQuoteCalls: 0,
@@ -184,7 +393,16 @@ function addUsd1QuoteMetric(metrics, key, amount = 1) {
 }
 
 function formatUsd1QuoteMetrics(metrics) {
-  if (!metrics || (!metrics.quoteCalls && !metrics.routeSetupCacheHits && !metrics.routeSetupLocalHits)) {
+  if (
+    !metrics
+    || (
+      !metrics.quoteCalls
+      && !metrics.routeSetupCacheHits
+      && !metrics.routeSetupLocalHits
+      && !metrics.superAltLocalSnapshotHits
+      && !metrics.superAltRpcRefreshes
+    )
+  ) {
     return null;
   }
   return {
@@ -196,6 +414,8 @@ function formatUsd1QuoteMetrics(metrics) {
     routeSetupCacheHits: metrics.routeSetupCacheHits,
     routeSetupCacheMisses: metrics.routeSetupCacheMisses,
     routeSetupFetchMs: metrics.routeSetupFetchMs,
+    superAltLocalSnapshotHits: metrics.superAltLocalSnapshotHits,
+    superAltRpcRefreshes: metrics.superAltRpcRefreshes,
     expansionQuoteCalls: metrics.expansionQuoteCalls,
     binarySearchQuoteCalls: metrics.binarySearchQuoteCalls,
     bufferQuoteCalls: metrics.bufferQuoteCalls,
@@ -463,24 +683,44 @@ function allowAtaCreation(request) {
   return Boolean(request && request.allowAtaCreation);
 }
 
-async function resolveLookupTableAccounts(connection, transaction) {
+async function loadAddressLookupTableAccount(connection, key, requestContext = null) {
+  const cacheKey = key.toBase58();
+  const cached = readTimedCache(LOOKUP_TABLE_ACCOUNT_CACHE, cacheKey, bonkLookupTableCacheTtlMs());
+  if (cached) {
+    return cached;
+  }
+  const pinnedSnapshot = readPinnedLookupTableSnapshot(cacheKey, bonkLookupTableCacheTtlMs());
+  if (pinnedSnapshot) {
+    const context = ensureUsd1QuoteRequestContext(requestContext);
+    addUsd1QuoteMetric(context.metrics, "superAltLocalSnapshotHits");
+    writeTimedCache(LOOKUP_TABLE_ACCOUNT_CACHE, cacheKey, pinnedSnapshot);
+    return pinnedSnapshot;
+  }
+  const response = await connection.getAddressLookupTable(key);
+  if (!response || !response.value) {
+    throw new Error(`Address lookup table not found: ${cacheKey}`);
+  }
+  const context = ensureUsd1QuoteRequestContext(requestContext);
+  addUsd1QuoteMetric(context.metrics, "superAltRpcRefreshes");
+  writeTimedCache(LOOKUP_TABLE_ACCOUNT_CACHE, cacheKey, response.value);
+  writePinnedLookupTableSnapshot(response.value);
+  return response.value;
+}
+
+async function resolveLookupTableAccounts(connection, transaction, requestContext = null) {
   if (!(transaction instanceof VersionedTransaction)) {
     return [];
   }
   const lookups = transaction.message.addressTableLookups || [];
   const resolved = await Promise.all(lookups.map(async (lookup) => {
-    const response = await connection.getAddressLookupTable(lookup.accountKey);
-    if (!response || !response.value) {
-      throw new Error(`Address lookup table not found: ${lookup.accountKey.toBase58()}`);
-    }
-    return response.value;
+    return loadAddressLookupTableAccount(connection, lookup.accountKey, requestContext);
   }));
   return resolved;
 }
 
-async function decompileTransactionInstructions(connection, transaction) {
+async function decompileTransactionInstructions(connection, transaction, requestContext = null) {
   if (transaction instanceof VersionedTransaction) {
-    const addressLookupTableAccounts = await resolveLookupTableAccounts(connection, transaction);
+    const addressLookupTableAccounts = await resolveLookupTableAccounts(connection, transaction, requestContext);
     const message = TransactionMessage.decompile(transaction.message, { addressLookupTableAccounts });
     return {
       instructions: message.instructions,
@@ -503,23 +743,16 @@ function mergeLookupTableAccounts(...lists) {
   return Array.from(merged.values());
 }
 
-async function resolveLookupTableAccountsForAddresses(connection, addresses) {
+async function resolveLookupTableAccountsForAddresses(connection, addresses, requestContext = null) {
   const resolved = await Promise.all(addresses.map(async (address) => {
     const key = new PublicKey(address);
-    const response = await connection.getAddressLookupTable(key);
-    if (!response || !response.value) {
-      throw new Error(`Address lookup table not found: ${key.toBase58()}`);
-    }
-    return response.value;
+    return loadAddressLookupTableAccount(connection, key, requestContext);
   }));
   return resolved;
 }
 
-async function resolveBonkUsd1AtomicLookupTables(connection, request) {
-  if (resolveQuoteAssetConfig(request && request.quoteAsset).asset !== "usd1") {
-    return [];
-  }
-  return resolveLookupTableAccountsForAddresses(connection, [BONK_USD1_SUPER_LOOKUP_TABLE]);
+async function resolveBonkUsd1AtomicLookupTables(connection, request, requestContext = null) {
+  return resolveLookupTableAccountsForAddresses(connection, [BONK_USD1_SUPER_LOOKUP_TABLE], requestContext);
 }
 
 function estimatedAccountKeyCount(ownerPubkey, instructions) {
@@ -677,8 +910,8 @@ async function ensureInlineTipOnSwapResult(connection, owner, result, txConfig) 
     : { transactions: rebuiltTransactions };
 }
 
-async function buildBonkUsd1LookupTableCandidates(connection, request, baseLookupTables) {
-  const customLookupTables = await resolveBonkUsd1AtomicLookupTables(connection, request);
+async function buildBonkUsd1LookupTableCandidates(connection, request, baseLookupTables, requestContext = null) {
+  const customLookupTables = await resolveBonkUsd1AtomicLookupTables(connection, request, requestContext);
   const mergedLookupTables = mergeLookupTableAccounts(customLookupTables, baseLookupTables);
   const candidates = [];
   if (customLookupTables.length) {
@@ -705,15 +938,19 @@ function compileVersionedTransactionWithLookupTables(owner, recentBlockhash, ins
   return { message, transaction };
 }
 
-async function preferBonkUsd1LookupTableOnTransaction(connection, owner, request, transaction, extraSigners = []) {
+async function preferBonkUsd1LookupTableOnTransaction(
+  connection,
+  owner,
+  request,
+  transaction,
+  extraSigners = [],
+  requestContext = null,
+) {
   if (!(transaction instanceof VersionedTransaction)) {
     return transaction;
   }
-  if (resolveQuoteAssetConfig(request && request.quoteAsset).asset !== "usd1") {
-    return transaction;
-  }
-  const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction);
-  const { candidates } = await buildBonkUsd1LookupTableCandidates(connection, request, addressLookupTableAccounts);
+  const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction, requestContext);
+  const { candidates } = await buildBonkUsd1LookupTableCandidates(connection, request, addressLookupTableAccounts, requestContext);
   const originalLookupCount = lookupTablesUsedOnTransaction(transaction).length;
   let bestTransaction = transaction;
   let bestLookupCount = originalLookupCount;
@@ -748,10 +985,19 @@ async function preferBonkUsd1LookupTableOnTransaction(connection, owner, request
   return bestTransaction;
 }
 
-async function combineAtomicUsd1ActionTransaction(connection, owner, request, swapTransaction, actionTransaction, extraSigners = []) {
+async function combineAtomicUsd1ActionTransaction(
+  connection,
+  owner,
+  request,
+  swapTransaction,
+  actionTransaction,
+  extraSigners = [],
+  blockhashContext = null,
+  requestContext = null,
+) {
   const [swapBundle, actionBundle] = await Promise.all([
-    decompileTransactionInstructions(connection, swapTransaction),
-    decompileTransactionInstructions(connection, actionTransaction),
+    decompileTransactionInstructions(connection, swapTransaction, requestContext),
+    decompileTransactionInstructions(connection, actionTransaction, requestContext),
   ]);
   const swapInstructions = swapBundle.instructions.filter((instruction) => (
     !isComputeBudgetInstruction(instruction)
@@ -784,7 +1030,8 @@ async function combineAtomicUsd1ActionTransaction(connection, owner, request, sw
   if (tipInstruction) {
     instructions.push(tipInstruction);
   }
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const { blockhash, lastValidBlockHeight } = blockhashContext
+    || await connection.getLatestBlockhash(request.commitment || "confirmed");
   const txVersion = atomicUsd1TxVersion(request);
   const baseLookupTables = mergeLookupTableAccounts(
     swapBundle.addressLookupTableAccounts,
@@ -794,6 +1041,7 @@ async function combineAtomicUsd1ActionTransaction(connection, owner, request, sw
     connection,
     request,
     baseLookupTables,
+    requestContext,
   );
   const precompileDiagnostics = {
     txVersion: txVersion === TxVersion.LEGACY ? "legacy" : "v0",
@@ -912,10 +1160,9 @@ async function combineAtomicUsd1ActionTransaction(connection, owner, request, sw
 async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regular", quoteAsset = "sol") {
   const launchMode = normalizeBonkLaunchMode(mode);
   const quote = resolveQuoteAssetConfig(quoteAsset);
-  const cacheScope = connectionCacheScope(connection);
-  const cacheKey = `${cacheScope}:${launchMode}:${quote.asset}`;
+  const cacheKey = `${launchMode}:${quote.asset}`;
   const ttlMs = bonkLaunchDefaultsCacheTtlMs();
-  const cached = readTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, cacheKey, ttlMs);
+  const cached = readSharedTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, "launch-defaults", cacheKey, ttlMs);
   const staticDefaults = cached || await (async () => {
     if (BONK_LAUNCH_DEFAULTS_IN_FLIGHT.has(cacheKey)) {
       return BONK_LAUNCH_DEFAULTS_IN_FLIGHT.get(cacheKey);
@@ -923,9 +1170,10 @@ async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regu
     const loader = (async () => {
       const { platformId } = resolveBonkPlatform(launchMode);
       const configId = getPdaLaunchpadConfigId(LAUNCHPAD_PROGRAM, quote.mint, 0, 0).publicKey;
-      const launchConfigsKey = `launch-configs:${cacheScope}`;
-      const launchConfigsCached = readTimedCache(
+      const launchConfigsKey = "global";
+      const launchConfigsCached = readSharedTimedCache(
         RAYDIUM_LAUNCH_CONFIGS_CACHE,
+        "launch-configs",
         launchConfigsKey,
         ttlMs,
       );
@@ -937,7 +1185,7 @@ async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regu
           }
           const promise = raydium.api.fetchLaunchConfigs()
             .then((value) => {
-              writeTimedCache(RAYDIUM_LAUNCH_CONFIGS_CACHE, launchConfigsKey, value);
+              writeSharedTimedCache(RAYDIUM_LAUNCH_CONFIGS_CACHE, "launch-configs", launchConfigsKey, value);
               return value;
             })
             .finally(() => {
@@ -1027,7 +1275,7 @@ async function loadLaunchDefaults(raydium, connection, ownerPubkey, mode = "regu
           quoteDecimals: quote.decimals,
         },
       };
-      writeTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, cacheKey, defaults);
+      writeSharedTimedCache(BONK_LAUNCH_DEFAULTS_CACHE, "launch-defaults", cacheKey, defaults);
       return defaults;
     })().finally(() => {
       BONK_LAUNCH_DEFAULTS_IN_FLIGHT.delete(cacheKey);
@@ -1246,10 +1494,9 @@ async function estimateDevBuyTokenAmount(raydium, connection, defaults, devBuy, 
   return new BN(curveQuote.amountA.amount.toString());
 }
 
-function buildUsd1RouteSetupCacheKey(connection) {
+function buildUsd1RouteSetupCacheKey() {
   return [
     "usd1-route-setup",
-    connectionCacheScope(connection),
     PINNED_USD1_ROUTE_POOL_ID,
     PREFERRED_USD1_ROUTE_CONFIG,
   ].join(":");
@@ -1268,7 +1515,7 @@ function toBasicPoolInfo(pool) {
 async function loadUsd1RouteSetup(raydium, connection, requestContext = null) {
   const context = ensureUsd1QuoteRequestContext(requestContext);
   const policy = getUsd1TopupPolicy();
-  const cacheKey = buildUsd1RouteSetupCacheKey(connection);
+  const cacheKey = buildUsd1RouteSetupCacheKey();
   if (context.localCache.has(cacheKey)) {
     addUsd1QuoteMetric(context.metrics, "routeSetupLocalHits");
     return context.localCache.get(cacheKey);
@@ -1762,9 +2009,21 @@ async function buildUsd1Topup(request) {
       usd1QuoteMetrics: prepared && prepared.usd1QuoteMetrics ? prepared.usd1QuoteMetrics : undefined,
     };
   }
+  const remappedTopupTransactions = await Promise.all(
+    extractTransactions(prepared.swapResult).map((transaction) => (
+      preferBonkUsd1LookupTableOnTransaction(
+        connection,
+        owner,
+        request,
+        transaction,
+        [],
+        usd1QuoteContext,
+      )
+    )),
+  );
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
   return {
-    compiledTransaction: normalizeTransactions(prepared.swapResult, {
+    compiledTransaction: normalizeTransactions({ transactions: remappedTopupTransactions }, {
       labelPrefix: request.labelPrefix || "usd1-topup",
       computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
       computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
@@ -1887,7 +2146,8 @@ async function buildLaunch(request) {
   const topupTransactions = usd1Topup && usd1Topup.swapResult
     ? extractTransactions(usd1Topup.swapResult)
     : [];
-  const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const latestBlockhash = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const { lastValidBlockHeight } = latestBlockhash;
   let compiledTransactions;
   let atomicCombined = false;
   let atomicFallbackReason = null;
@@ -1901,6 +2161,8 @@ async function buildLaunch(request) {
           topupTransactions[0],
           launchTransactions[0],
           [mintKeypair],
+          latestBlockhash,
+          usd1QuoteContext,
         );
         atomicCombined = true;
         compiledTransactions = normalizeTransactions({ transactions: [combined.transaction] }, {
@@ -1926,6 +2188,7 @@ async function buildLaunch(request) {
         request,
         transaction,
         index === 0 ? [mintKeypair] : [],
+        usd1QuoteContext,
       )
     )));
     compiledTransactions = normalizeTransactions({ transactions: remappedLaunchTransactions }, {
@@ -1938,7 +2201,14 @@ async function buildLaunch(request) {
     });
     if (topupTransactions.length) {
       const remappedTopupTransactions = await Promise.all(topupTransactions.map((transaction) => (
-        preferBonkUsd1LookupTableOnTransaction(connection, owner, request, transaction)
+        preferBonkUsd1LookupTableOnTransaction(
+          connection,
+          owner,
+          request,
+          transaction,
+          [],
+          usd1QuoteContext,
+        )
       )));
       compiledTransactions.unshift(...normalizeTransactions({ transactions: remappedTopupTransactions }, {
         labelPrefix: request.labelPrefix || "launch-usd1-topup",
@@ -2052,12 +2322,16 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
       if (topupTransactions.length !== 1 || buyTransactions.length !== 1) {
         throw new Error("Atomic USD1 follow buy requires exactly one top-up transaction and one buy transaction.");
       }
+      const latestBlockhash = await connection.getLatestBlockhash(request.commitment || "confirmed");
       const combined = await combineAtomicUsd1ActionTransaction(
         connection,
         owner,
         request,
         topupTransactions[0],
         buyTransactions[0],
+        [],
+        latestBlockhash,
+        usd1QuoteContext,
       );
       return {
         compiledTransaction: normalizeTransactions({ transactions: [combined.transaction] }, {
@@ -2073,8 +2347,20 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
     }
   }
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const remappedBuyTransactions = await Promise.all(
+    extractTransactions(buildResult).map((transaction) => (
+      preferBonkUsd1LookupTableOnTransaction(
+        connection,
+        owner,
+        request,
+        transaction,
+        [],
+        quote.asset === "usd1" ? usd1QuoteContext : null,
+      )
+    )),
+  );
   return {
-    compiledTransaction: normalizeTransactions(buildResult, {
+    compiledTransaction: normalizeTransactions({ transactions: remappedBuyTransactions }, {
       labelPrefix,
       computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
       computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
@@ -2089,6 +2375,9 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
 async function compileFollowSell(request) {
   const owner = parseKeypair(request.ownerSecret);
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
+  const requestContext = resolveQuoteAssetConfig(request.quoteAsset).asset === "usd1"
+    ? createUsd1QuoteRequestContext()
+    : null;
   const raydium = await Raydium.load({
     connection,
     owner,
@@ -2147,8 +2436,20 @@ async function compileFollowSell(request) {
     checkCreateATAOwner: true,
   });
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const remappedSellTransactions = await Promise.all(
+    extractTransactions(buildResult).map((transaction) => (
+      preferBonkUsd1LookupTableOnTransaction(
+        connection,
+        owner,
+        request,
+        transaction,
+        [],
+        requestContext,
+      )
+    )),
+  );
   return {
-    compiledTransaction: normalizeTransactions(buildResult, {
+    compiledTransaction: normalizeTransactions({ transactions: remappedSellTransactions }, {
       labelPrefix: "follow-sell",
       computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
       computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,

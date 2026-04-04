@@ -1,6 +1,7 @@
 mod bags_native;
 mod bonk_native;
 mod config;
+mod endpoint_profile;
 mod follow;
 mod fs_utils;
 mod helper_worker;
@@ -44,7 +45,9 @@ use crate::{
     },
     launchpads::launchpad_registry,
     observability::{
-        log_event, new_trace_context, persist_launch_report, update_persisted_launch_report,
+        clear_outbound_provider_http_traffic, log_event, new_trace_context,
+        persist_launch_report, record_outbound_provider_http_request, rpc_traffic_snapshot,
+        update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
     bonk_native::{
@@ -62,9 +65,8 @@ use crate::{
     rpc::{
         CompiledTransaction, confirm_submitted_transactions_for_transport,
         confirm_transactions_with_websocket_fallback, configured_warm_rpc_url,
-        fetch_current_block_height,
-        send_transactions_bundle,
-        simulate_transactions, spawn_blockhash_refresh_task, prewarm_jito_bundle_endpoint,
+        fetch_current_block_height, refresh_latest_blockhash_cache, JitoWarmResult,
+        send_transactions_bundle, simulate_transactions, prewarm_jito_bundle_endpoint,
         prewarm_rpc_endpoint, submit_independent_transactions_for_transport,
         submit_transactions_for_transport, submit_transactions_sequential,
     },
@@ -76,7 +78,8 @@ use crate::{
     transport::{
         build_transport_plan, configured_helius_sender_endpoint,
         configured_helius_sender_endpoints_for_profile, configured_jito_bundle_endpoints,
-        configured_provider_region, configured_shared_region,
+        configured_jito_bundle_endpoints_for_profile, configured_provider_region,
+        configured_shared_region,
         configured_standard_rpc_submit_endpoints, default_endpoint_profile,
         default_endpoint_profile_for_provider, estimate_transaction_count,
         helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
@@ -99,11 +102,11 @@ use axum::{
     http::{HeaderMap, Response, StatusCode, header},
     routing::{get, post},
 };
-use futures_util::future::join_all;
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
     sync::{Arc, Mutex, OnceLock},
@@ -126,11 +129,67 @@ struct WarmControlState {
     last_warm_success_at_ms: Option<u128>,
     current_reason: String,
     last_error: Option<String>,
-    selected_providers: Vec<String>,
+    selected_routes: Vec<WarmRouteSelection>,
     browser_active: bool,
     continuous_active: bool,
     in_flight_requests: usize,
     warm_pass_in_flight: bool,
+    warm_targets: HashMap<String, WarmTargetStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WarmRouteSelection {
+    provider: String,
+    endpoint_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum WarmTargetHealth {
+    Healthy,
+    RateLimited,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WarmTargetStatus {
+    id: String,
+    category: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    label: String,
+    target: String,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_attempt_at_ms: Option<u64>,
+    status: WarmTargetHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_success_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_rate_limited_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_rate_limit_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone)]
+enum WarmAttemptResult {
+    Success,
+    RateLimited(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct WarmTargetAttempt {
+    id: String,
+    category: String,
+    provider: Option<String>,
+    label: String,
+    target: String,
+    result: WarmAttemptResult,
 }
 
 #[derive(Deserialize, Default)]
@@ -139,11 +198,20 @@ struct WarmActivityRequest {
     #[serde(rename = "creationProvider")]
     creation_provider: Option<String>,
     #[serde(default)]
+    #[serde(rename = "creationEndpointProfile")]
+    creation_endpoint_profile: Option<String>,
+    #[serde(default)]
     #[serde(rename = "buyProvider")]
     buy_provider: Option<String>,
     #[serde(default)]
+    #[serde(rename = "buyEndpointProfile")]
+    buy_endpoint_profile: Option<String>,
+    #[serde(default)]
     #[serde(rename = "sellProvider")]
     sell_provider: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "sellEndpointProfile")]
+    sell_endpoint_profile: Option<String>,
 }
 
 struct WarmInFlightGuard {
@@ -155,6 +223,177 @@ impl Drop for WarmInFlightGuard {
         let mut warm = self.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         warm.in_flight_requests = warm.in_flight_requests.saturating_sub(1);
     }
+}
+
+fn build_warm_target_id(category: &str, provider: Option<&str>, target: &str) -> String {
+    match provider.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(provider) => format!("{category}:{provider}:{target}"),
+        None => format!("{category}:{target}"),
+    }
+}
+
+fn build_warm_target_attempt(
+    category: &str,
+    provider: Option<&str>,
+    label: &str,
+    target: impl Into<String>,
+    result: WarmAttemptResult,
+) -> WarmTargetAttempt {
+    let target = target.into();
+    WarmTargetAttempt {
+        id: build_warm_target_id(category, provider, &target),
+        category: category.to_string(),
+        provider: provider.map(ToString::to_string),
+        label: label.to_string(),
+        target,
+        result,
+    }
+}
+
+fn set_all_warm_targets_inactive(warm: &mut WarmControlState) {
+    for target in warm.warm_targets.values_mut() {
+        target.active = false;
+    }
+}
+
+fn apply_warm_target_attempts(
+    warm: &mut WarmControlState,
+    attempts: &[WarmTargetAttempt],
+    attempt_at_ms: u64,
+) {
+    let active_ids = attempts
+        .iter()
+        .map(|attempt| attempt.id.clone())
+        .collect::<HashSet<_>>();
+    for target in warm.warm_targets.values_mut() {
+        target.active = active_ids.contains(&target.id);
+    }
+    for attempt in attempts {
+        let entry = warm
+            .warm_targets
+            .entry(attempt.id.clone())
+            .or_insert_with(|| WarmTargetStatus {
+                id: attempt.id.clone(),
+                category: attempt.category.clone(),
+                provider: attempt.provider.clone(),
+                label: attempt.label.clone(),
+                target: attempt.target.clone(),
+                active: true,
+                last_attempt_at_ms: None,
+                status: WarmTargetHealth::Error,
+                last_success_at_ms: None,
+                last_rate_limited_at_ms: None,
+                last_rate_limit_message: None,
+                last_error: None,
+                consecutive_failures: 0,
+            });
+        entry.category = attempt.category.clone();
+        entry.provider = attempt.provider.clone();
+        entry.label = attempt.label.clone();
+        entry.target = attempt.target.clone();
+        entry.active = true;
+        entry.last_attempt_at_ms = Some(attempt_at_ms);
+        match &attempt.result {
+            WarmAttemptResult::Success => {
+                entry.status = WarmTargetHealth::Healthy;
+                entry.last_success_at_ms = Some(attempt_at_ms);
+                entry.last_rate_limited_at_ms = None;
+                entry.last_rate_limit_message = None;
+                entry.last_error = None;
+                entry.consecutive_failures = 0;
+            }
+            WarmAttemptResult::RateLimited(message) => {
+                entry.status = WarmTargetHealth::RateLimited;
+                entry.last_success_at_ms = Some(attempt_at_ms);
+                entry.last_rate_limited_at_ms = Some(attempt_at_ms);
+                entry.last_rate_limit_message = Some(message.clone());
+                entry.last_error = None;
+                entry.consecutive_failures = 0;
+            }
+            WarmAttemptResult::Error(error) => {
+                entry.status = WarmTargetHealth::Error;
+                entry.last_rate_limited_at_ms = None;
+                entry.last_rate_limit_message = None;
+                entry.last_error = Some(error.clone());
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            }
+        }
+    }
+    prune_stale_warm_targets_after_attempt(warm, &active_ids, attempt_at_ms);
+}
+
+fn collect_warm_targets(warm: &WarmControlState, category: &str) -> Vec<WarmTargetStatus> {
+    let mut targets = warm
+        .warm_targets
+        .values()
+        .filter(|target| target.category == category)
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .active
+            .cmp(&left.active)
+            .then(left.provider.cmp(&right.provider))
+            .then(left.label.cmp(&right.label))
+            .then(left.target.cmp(&right.target))
+    });
+    targets
+}
+
+fn payload_warm_targets(
+    warm: &WarmControlState,
+    category: &str,
+    active: bool,
+) -> Vec<WarmTargetStatus> {
+    let mut targets = collect_warm_targets(warm, category);
+    if !active {
+        for target in &mut targets {
+            target.active = false;
+        }
+    }
+    targets
+}
+
+fn effective_suspend_at_ms(
+    warm: &WarmControlState,
+    active: bool,
+    reason: &str,
+    now_ms: u128,
+) -> Option<u64> {
+    if let Some(value) = warm.last_suspend_at_ms {
+        return Some(value as u64);
+    }
+    if active || reason != "suspended-idle" || warm.last_activity_at_ms == 0 {
+        return None;
+    }
+    let idle_timeout_ms = u128::from(configured_idle_warm_timeout_ms());
+    let suspended_at_ms = warm
+        .last_activity_at_ms
+        .saturating_add(idle_timeout_ms)
+        .min(now_ms);
+    Some(suspended_at_ms.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Remove warm-target rows not included in the latest pass once their last attempt is older than this.
+const WARM_TARGET_STALE_RETENTION_MS: u64 = 60 * 60 * 1000;
+const RECENT_WARM_SUCCESS_REUSE_MS: u64 = 30 * 1000;
+
+fn prune_stale_warm_targets_after_attempt(
+    warm: &mut WarmControlState,
+    current_attempt_ids: &HashSet<String>,
+    now_ms: u64,
+) {
+    warm.warm_targets.retain(|id, target| {
+        if current_attempt_ids.contains(id) {
+            return true;
+        }
+        match target.last_attempt_at_ms {
+            None => false,
+            Some(last_attempt_ms) => {
+                now_ms.saturating_sub(last_attempt_ms) <= WARM_TARGET_STALE_RETENTION_MS
+            }
+        }
+    });
 }
 
 #[derive(Serialize)]
@@ -437,7 +676,7 @@ fn configured_continuous_warm_interval_ms() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value >= 1_000)
-        .unwrap_or(10_000)
+        .unwrap_or(50_000)
 }
 
 fn configured_idle_warm_timeout_ms() -> u64 {
@@ -445,7 +684,7 @@ fn configured_idle_warm_timeout_ms() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value >= 1_000)
-        .unwrap_or(30_000)
+        .unwrap_or(75_000)
 }
 
 fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
@@ -464,7 +703,44 @@ fn normalize_warm_provider(provider: &str) -> Option<String> {
     }
 }
 
-fn configured_active_warm_providers() -> Vec<String> {
+fn normalize_warm_endpoint_profile(provider: &str, endpoint_profile: &str) -> String {
+    let normalized_provider = match normalize_warm_provider(provider) {
+        Some(value) => value,
+        None => return String::new(),
+    };
+    if normalized_provider == "standard-rpc" {
+        return String::new();
+    }
+    let trimmed = endpoint_profile.trim();
+    if trimmed.is_empty() {
+        return default_endpoint_profile_for_provider(&normalized_provider);
+    }
+    crate::endpoint_profile::parse_config_endpoint_profile(trimmed)
+        .unwrap_or_else(|_| default_endpoint_profile_for_provider(&normalized_provider))
+}
+
+fn push_unique_warm_route(
+    values: &mut Vec<WarmRouteSelection>,
+    provider: &str,
+    endpoint_profile: &str,
+) {
+    let Some(provider) = normalize_warm_provider(provider) else {
+        return;
+    };
+    let endpoint_profile = normalize_warm_endpoint_profile(&provider, endpoint_profile);
+    if values
+        .iter()
+        .any(|entry| entry.provider == provider && entry.endpoint_profile == endpoint_profile)
+    {
+        return;
+    }
+    values.push(WarmRouteSelection {
+        provider,
+        endpoint_profile,
+    });
+}
+
+fn configured_active_warm_routes() -> Vec<WarmRouteSelection> {
     let config = read_persistent_config();
     let active_preset_id = config
         .get("defaults")
@@ -480,52 +756,93 @@ fn configured_active_warm_providers() -> Vec<String> {
                 .find(|item| item.get("id").and_then(Value::as_str) == Some(active_preset_id))
                 .or_else(|| items.first())
         });
-    let mut providers = Vec::new();
+    let mut routes = Vec::new();
     for key in ["creationSettings", "buySettings", "sellSettings"] {
-        if let Some(provider) = preset
-            .and_then(|value| value.get(key))
+        let settings = preset.and_then(|value| value.get(key));
+        let provider = settings
             .and_then(|value| value.get("provider"))
             .and_then(Value::as_str)
-            .and_then(normalize_warm_provider)
-        {
-            push_unique_string(&mut providers, &provider);
-        }
+            .unwrap_or_default();
+        let endpoint_profile = settings
+            .and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        push_unique_warm_route(&mut routes, provider, endpoint_profile);
     }
-    if providers.is_empty() {
-        providers.push("helius-sender".to_string());
+    if routes.is_empty() {
+        push_unique_warm_route(&mut routes, "helius-sender", "");
     }
-    providers
+    routes
 }
 
-fn merged_warm_providers(selected: &[String]) -> Vec<String> {
-    let mut providers = configured_active_warm_providers();
-    for provider in selected {
-        push_unique_string(&mut providers, provider);
+fn merged_warm_routes(selected: &[WarmRouteSelection]) -> Vec<WarmRouteSelection> {
+    let mut routes = configured_active_warm_routes();
+    for route in selected {
+        push_unique_warm_route(&mut routes, &route.provider, &route.endpoint_profile);
     }
-    providers
+    routes
 }
 
-fn activity_providers(payload: &WarmActivityRequest) -> Vec<String> {
+fn warm_route_providers(routes: &[WarmRouteSelection]) -> Vec<String> {
     let mut providers = Vec::new();
-    for value in [
-        payload.creation_provider.as_deref(),
-        payload.buy_provider.as_deref(),
-        payload.sell_provider.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(provider) = normalize_warm_provider(value) {
-            push_unique_string(&mut providers, &provider);
-        }
+    for route in routes {
+        push_unique_string(&mut providers, &route.provider);
     }
     providers
 }
 
-fn mark_operator_activity(state: &Arc<AppState>, providers: Vec<String>) -> bool {
+fn activity_routes(payload: &WarmActivityRequest) -> Vec<WarmRouteSelection> {
+    let mut routes = Vec::new();
+    for (provider, endpoint_profile) in [
+        (
+            payload.creation_provider.as_deref(),
+            payload.creation_endpoint_profile.as_deref(),
+        ),
+        (
+            payload.buy_provider.as_deref(),
+            payload.buy_endpoint_profile.as_deref(),
+        ),
+        (
+            payload.sell_provider.as_deref(),
+            payload.sell_endpoint_profile.as_deref(),
+        ),
+    ] {
+        if let Some(provider) = provider {
+            push_unique_warm_route(&mut routes, provider, endpoint_profile.unwrap_or_default());
+        }
+    }
+    routes
+}
+
+fn startup_warm_routes(payload: &WarmActivityRequest) -> Vec<WarmRouteSelection> {
+    let routes = activity_routes(payload);
+    if routes.is_empty() {
+        configured_active_warm_routes()
+    } else {
+        routes
+    }
+}
+
+fn primary_standard_rpc_warm_endpoint(main_rpc_url: &str) -> String {
+    configured_standard_rpc_submit_endpoints()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| main_rpc_url.to_string())
+}
+
+fn warm_succeeded_recently(warm: &WarmControlState, now_ms: u128) -> bool {
+    warm.last_error.is_none()
+        && warm.last_warm_success_at_ms.is_some_and(|last_success_at_ms| {
+            now_ms.saturating_sub(last_success_at_ms) <= u128::from(RECENT_WARM_SUCCESS_REUSE_MS)
+        })
+}
+
+fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>) -> bool {
     let now = current_time_ms();
     let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let should_trigger_immediate_rewarm = !warm_gate_state(&warm, now, 0).0;
+    let route_matches_current = routes.is_empty() || routes == warm.selected_routes;
+    let should_trigger_immediate_rewarm =
+        !warm_gate_state(&warm, now, 0).0 && !(route_matches_current && warm_succeeded_recently(&warm, now));
     warm.last_activity_at_ms = now;
     warm.browser_active = true;
     if should_trigger_immediate_rewarm {
@@ -534,8 +851,8 @@ fn mark_operator_activity(state: &Arc<AppState>, providers: Vec<String>) -> bool
         warm.continuous_active = true;
     }
     warm.current_reason = "active-operator-activity".to_string();
-    if !providers.is_empty() {
-        warm.selected_providers = providers;
+    if !routes.is_empty() {
+        warm.selected_routes = routes;
     }
     should_trigger_immediate_rewarm
 }
@@ -579,11 +896,43 @@ fn warm_gate_state(
     (false, false, "suspended-idle".to_string())
 }
 
+const IDLE_BACKGROUND_REQUEST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const ENGINE_BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool {
+    if !configured_idle_warm_suspend_enabled() {
+        return true;
+    }
+    if warm.in_flight_requests > 0 {
+        return true;
+    }
+    if warm.last_activity_at_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(warm.last_activity_at_ms) <= u128::from(configured_idle_warm_timeout_ms())
+}
+
+fn engine_background_requests_active(state: &Arc<AppState>) -> bool {
+    let now_ms = current_time_ms();
+    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    background_request_gate_active(&warm, now_ms)
+}
+
+fn idle_suspended_without_inflight(state: &Arc<AppState>, follow_active_jobs: u64) -> bool {
+    let now_ms = current_time_ms();
+    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (active, _, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
+    !active && reason == "suspended-idle" && warm.in_flight_requests == 0
+}
+
 fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
     let now_ms = current_time_ms();
     let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (active, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
-    let selected_providers = merged_warm_providers(&warm.selected_providers);
+    let selected_routes = merged_warm_routes(&warm.selected_routes);
+    let selected_providers = warm_route_providers(&selected_routes);
+    let state_targets = payload_warm_targets(&warm, "state", active);
+    let endpoint_targets = payload_warm_targets(&warm, "endpoint", active);
     json!({
         "startupEnabled": configured_startup_warm_enabled(),
         "continuousEnabled": configured_continuous_warm_enabled(),
@@ -600,10 +949,12 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         "lastActivityAtMs": if warm.last_activity_at_ms > 0 { Some(warm.last_activity_at_ms as u64) } else { None },
         "idleForMs": if warm.last_activity_at_ms > 0 { Some(now_ms.saturating_sub(warm.last_activity_at_ms) as u64) } else { None },
         "lastResumeAtMs": warm.last_resume_at_ms.map(|value| value as u64),
-        "lastSuspendAtMs": warm.last_suspend_at_ms.map(|value| value as u64),
+        "lastSuspendAtMs": effective_suspend_at_ms(&warm, active, &reason, now_ms),
         "lastWarmAttemptAtMs": warm.last_warm_attempt_at_ms.map(|value| value as u64),
         "lastWarmSuccessAtMs": warm.last_warm_success_at_ms.map(|value| value as u64),
         "lastError": warm.last_error.clone(),
+        "stateTargets": state_targets,
+        "endpointTargets": endpoint_targets,
     })
 }
 
@@ -618,10 +969,10 @@ async fn follow_active_jobs_count() -> u64 {
 
 async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let follow_active_jobs = follow_active_jobs_count().await;
-    let providers = {
+    let (routes, attempt_started_at_ms) = {
         let now_ms = current_time_ms();
         let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let providers = merged_warm_providers(&warm.selected_providers);
+        let routes = merged_warm_routes(&warm.selected_routes);
         let (should_warm, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
         if should_warm != warm.continuous_active {
             if should_warm {
@@ -634,6 +985,7 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
         warm.continuous_active = should_warm;
         warm.current_reason = reason;
         if !should_warm {
+            set_all_warm_targets_inactive(&mut warm);
             return;
         }
         if warm.warm_pass_in_flight {
@@ -641,47 +993,123 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
         }
         warm.warm_pass_in_flight = true;
         warm.last_warm_attempt_at_ms = Some(now_ms);
-        providers
+        (routes, now_ms as u64)
     };
 
     let main_rpc_url = configured_rpc_url();
     let warm_rpc_url = configured_warm_rpc_url(&main_rpc_url);
     let mut success_count = 0usize;
     let mut errors = Vec::new();
+    let mut attempts = Vec::new();
 
-    match prewarm_rpc_endpoint(&warm_rpc_url).await {
+    let warm_rpc_result = prewarm_rpc_endpoint(&warm_rpc_url).await;
+    match &warm_rpc_result {
         Ok(()) => success_count += 1,
         Err(error) => errors.push(format!("warm-rpc: {error}")),
     }
-    match fetch_fee_market_snapshot(&main_rpc_url).await {
-        Ok(_) => success_count += 1,
+    attempts.push(build_warm_target_attempt(
+        "state",
+        None,
+        "Warm RPC",
+        warm_rpc_url.clone(),
+        match warm_rpc_result {
+            Ok(()) => WarmAttemptResult::Success,
+            Err(error) => WarmAttemptResult::Error(error),
+        },
+    ));
+
+    let fee_market_result = fetch_fee_market_snapshot(&main_rpc_url)
+        .await
+        .map(|_| ());
+    match &fee_market_result {
+        Ok(()) => success_count += 1,
         Err(error) => errors.push(format!("fee-market: {error}")),
     }
-    if providers.iter().any(|provider| provider == "standard-rpc") {
-        let mut endpoints = configured_standard_rpc_submit_endpoints();
-        endpoints.push(main_rpc_url.clone());
-        for endpoint in endpoints {
-            match prewarm_rpc_endpoint(&endpoint).await {
-                Ok(()) => success_count += 1,
-                Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
+    attempts.push(build_warm_target_attempt(
+        "state",
+        None,
+        "Fee Market",
+        main_rpc_url.clone(),
+        match fee_market_result {
+            Ok(()) => WarmAttemptResult::Success,
+            Err(error) => WarmAttemptResult::Error(error),
+        },
+    ));
+
+    if routes.iter().any(|route| route.provider == "standard-rpc") {
+        let endpoint = primary_standard_rpc_warm_endpoint(&main_rpc_url);
+        let result = prewarm_rpc_endpoint(&endpoint).await;
+        match &result {
+            Ok(()) => success_count += 1,
+            Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
+        }
+        attempts.push(build_warm_target_attempt(
+            "endpoint",
+            Some("standard-rpc"),
+            "Standard RPC",
+            endpoint,
+            match result {
+                Ok(()) => WarmAttemptResult::Success,
+                Err(error) => WarmAttemptResult::Error(error),
+            },
+        ));
+    }
+    if routes.iter().any(|route| route.provider == "helius-sender") {
+        let mut seen = HashSet::new();
+        for route in routes.iter().filter(|route| route.provider == "helius-sender") {
+            for endpoint in
+                configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
+            {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let result = prewarm_helius_sender_endpoint(&endpoint).await;
+                match &result {
+                    Ok(()) => success_count += 1,
+                    Err(error) => errors.push(format!("helius-sender {}: {}", endpoint, error)),
+                }
+                attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("helius-sender"),
+                    "Helius Sender",
+                    endpoint,
+                    match result {
+                        Ok(()) => WarmAttemptResult::Success,
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
             }
         }
     }
-    if providers.iter().any(|provider| provider == "helius-sender") {
-        for endpoint in configured_helius_sender_endpoints_for_profile(
-            &default_endpoint_profile_for_provider("helius-sender"),
-        ) {
-            match prewarm_rpc_endpoint(&endpoint).await {
-                Ok(()) => success_count += 1,
-                Err(error) => errors.push(format!("helius-sender {}: {}", endpoint, error)),
-            }
-        }
-    }
-    if providers.iter().any(|provider| provider == "jito-bundle") {
-        for endpoint in configured_jito_bundle_endpoints() {
-            match prewarm_jito_bundle_endpoint(&endpoint).await {
-                Ok(()) => success_count += 1,
-                Err(error) => errors.push(format!("jito-bundle {}: {}", endpoint.name, error)),
+    if routes.iter().any(|route| route.provider == "jito-bundle") {
+        let mut seen = HashSet::new();
+        for route in routes.iter().filter(|route| route.provider == "jito-bundle") {
+            for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.send.clone()) {
+                    continue;
+                }
+                let target = endpoint.name.clone();
+                let result = prewarm_jito_bundle_endpoint(&endpoint).await;
+                match &result {
+                    Ok(JitoWarmResult::Warmed) => success_count += 1,
+                    Ok(JitoWarmResult::RateLimited(_)) => {}
+                    Err(error) => {
+                        errors.push(format!("jito-bundle {}: {}", endpoint.name, error))
+                    }
+                }
+                attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("jito-bundle"),
+                    "Jito Bundle",
+                    target,
+                    match result {
+                        Ok(JitoWarmResult::Warmed) => WarmAttemptResult::Success,
+                        Ok(JitoWarmResult::RateLimited(message)) => {
+                            WarmAttemptResult::RateLimited(message)
+                        }
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
             }
         }
     }
@@ -689,6 +1117,7 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let now_ms = current_time_ms();
     let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     warm.warm_pass_in_flight = false;
+    apply_warm_target_attempts(&mut warm, &attempts, attempt_started_at_ms);
     if success_count > 0 {
         warm.last_warm_success_at_ms = Some(now_ms);
         warm.last_error = None;
@@ -1196,8 +1625,13 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
 ];
 const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "veryhigh";
 const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
-const FEE_MARKET_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
+const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 6_000;
+const DEFAULT_WALLET_STATUS_REFRESH_INTERVAL_MS: u64 = 30_000;
 const FEE_MARKET_MAX_AGE: Duration = Duration::from_secs(15);
+const JITO_TIP_STREAM_ENDPOINT: &str = "wss://bundles.jito.wtf/api/v1/bundles/tip_stream";
+const JITO_TIP_STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const JITO_TIP_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Default, Clone, Serialize)]
 struct FeeMarketSnapshot {
@@ -1219,6 +1653,7 @@ impl FeeMarketSnapshot {
     }
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Clone, Serialize)]
 struct AutoFeeActionReport {
     enabled: bool,
@@ -1248,31 +1683,10 @@ struct AutoFeeResolutionSummary {
 
 fn action_priority_estimate(snapshot: &FeeMarketSnapshot, action: &str) -> (Option<u64>, String) {
     match action {
-        "creation" => {
-            if let Some(value) = snapshot.helius_launch_priority_lamports {
-                (Some(value), "launch-template".to_string())
-            } else if let Some(value) = snapshot.helius_priority_lamports {
-                (Some(value), "generic".to_string())
-            } else {
-                (None, "missing".to_string())
-            }
-        }
-        "buy" | "sell" => {
-            if let Some(value) = snapshot.helius_trade_priority_lamports {
-                (Some(value), "trade-template".to_string())
-            } else if let Some(value) = snapshot.helius_priority_lamports {
-                (Some(value), "generic".to_string())
-            } else {
-                (None, "missing".to_string())
-            }
-        }
-        _ => {
-            if let Some(value) = snapshot.helius_priority_lamports {
-                (Some(value), "generic".to_string())
-            } else {
-                (None, "missing".to_string())
-            }
-        }
+        "creation" | "buy" | "sell" | _ => snapshot
+            .helius_launch_priority_lamports
+            .map(|value| (Some(value), "launch-template".to_string()))
+            .unwrap_or((None, "missing".to_string())),
     }
 }
 
@@ -1333,6 +1747,30 @@ fn cache_fee_market_snapshot(
     }
 }
 
+fn update_cached_fee_market_snapshot<F>(
+    rpc_url: &str,
+    helius_priority_level: &str,
+    jito_tip_percentile: &str,
+    updater: F,
+) where
+    F: FnOnce(&mut FeeMarketSnapshot),
+{
+    if let Ok(mut cache) = fee_market_cache().lock() {
+        let entry = cache
+            .entry(fee_market_cache_key(
+                rpc_url,
+                helius_priority_level,
+                jito_tip_percentile,
+            ))
+            .or_insert_with(|| CachedFeeMarketSnapshot {
+                snapshot: FeeMarketSnapshot::default(),
+                fetched_at: Instant::now(),
+            });
+        updater(&mut entry.snapshot);
+        entry.fetched_at = Instant::now();
+    }
+}
+
 fn shared_fee_market_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -1348,11 +1786,14 @@ fn auto_fee_helius_priority_level() -> String {
         .unwrap_or_else(|_| DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL.to_string());
     let trimmed = value.trim().to_lowercase();
     match trimmed.as_str() {
-        "none" | "low" | "medium" | "high" => trimmed,
-        "veryhigh" | "very_high" | "very-high" => "veryHigh".to_string(),
-        "unsafemax" | "unsafe_max" | "unsafe-max" => "unsafeMax".to_string(),
+        "none" => "Default".to_string(),
+        "low" => "Low".to_string(),
+        "medium" => "Medium".to_string(),
+        "high" => "High".to_string(),
+        "veryhigh" | "very_high" | "very-high" => "VeryHigh".to_string(),
+        "unsafemax" | "unsafe_max" | "unsafe-max" => "UnsafeMax".to_string(),
         "recommended" => "recommended".to_string(),
-        _ => "veryHigh".to_string(),
+        _ => "VeryHigh".to_string(),
     }
 }
 
@@ -1370,11 +1811,36 @@ fn auto_fee_jito_tip_percentile() -> String {
     }
 }
 
+fn configured_helius_priority_refresh_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("LAUNCHDECK_HELIUS_PRIORITY_REFRESH_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS),
+    )
+}
+
+fn configured_wallet_status_refresh_interval_ms() -> u64 {
+    std::env::var("LAUNCHDECK_WALLET_STATUS_REFRESH_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WALLET_STATUS_REFRESH_INTERVAL_MS)
+}
+
 fn lamports_to_priority_fee_micro_lamports(priority_fee_lamports: u64) -> u64 {
     if priority_fee_lamports == 0 {
         0
     } else {
         priority_fee_lamports
+    }
+}
+
+fn provider_required_tip_lamports(provider: &str) -> Option<u64> {
+    match provider.trim() {
+        "helius-sender" | "jito-bundle" => Some(200_000),
+        _ => None,
     }
 }
 
@@ -1407,6 +1873,67 @@ fn normalize_estimate_to_lamports(value: Option<&Value>) -> Option<u64> {
     }
 }
 
+fn jito_tip_percentile_value<'a>(sample: &'a Value, jito_tip_percentile: &str) -> Option<&'a Value> {
+    match jito_tip_percentile {
+        "p25" => sample
+            .get("p25")
+            .or_else(|| sample.get("percentile25"))
+            .or_else(|| sample.get("tipFloor25"))
+            .or_else(|| sample.get("landed_tips_25th_percentile")),
+        "p50" => sample
+            .get("p50")
+            .or_else(|| sample.get("percentile50"))
+            .or_else(|| sample.get("tipFloor50"))
+            .or_else(|| sample.get("landed_tips_50th_percentile")),
+        "p75" => sample
+            .get("p75")
+            .or_else(|| sample.get("percentile75"))
+            .or_else(|| sample.get("tipFloor75"))
+            .or_else(|| sample.get("landed_tips_75th_percentile")),
+        "p95" => sample
+            .get("p95")
+            .or_else(|| sample.get("percentile95"))
+            .or_else(|| sample.get("tipFloor95"))
+            .or_else(|| sample.get("landed_tips_95th_percentile")),
+        _ => sample
+            .get("p99")
+            .or_else(|| sample.get("percentile99"))
+            .or_else(|| sample.get("tipFloor99"))
+            .or_else(|| sample.get("landed_tips_99th_percentile")),
+    }
+}
+
+fn extract_jito_tip_floor_lamports(payload: &Value, jito_tip_percentile: &str) -> Option<u64> {
+    if let Some(value) = normalize_estimate_to_lamports(jito_tip_percentile_value(
+        payload,
+        jito_tip_percentile,
+    )) {
+        return Some(value);
+    }
+    if let Some(value) = payload
+        .get("params")
+        .and_then(|params| params.get("result"))
+        .and_then(|result| extract_jito_tip_floor_lamports(result, jito_tip_percentile))
+    {
+        return Some(value);
+    }
+    for key in ["data", "result", "value"] {
+        if let Some(value) = payload
+            .get(key)
+            .and_then(|child| extract_jito_tip_floor_lamports(child, jito_tip_percentile))
+        {
+            return Some(value);
+        }
+    }
+    payload
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find_map(|entry| extract_jito_tip_floor_lamports(entry, jito_tip_percentile))
+        })
+}
+
 fn parse_auto_fee_cap_lamports(value: &str) -> Option<u64> {
     parse_sol_decimal_to_lamports(value).filter(|lamports| *lamports > 0)
 }
@@ -1416,6 +1943,24 @@ fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u
         Some(cap) if cap > 0 => estimate_lamports.min(cap),
         _ => estimate_lamports,
     }
+}
+
+fn priority_price_micro_lamports_to_sol_equivalent(
+    compute_unit_price_micro_lamports: u64,
+) -> String {
+    let total_lamports = (u128::from(compute_unit_price_micro_lamports)
+        * u128::from(PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT))
+        / 1_000_000;
+    format_lamports_to_sol_decimal(total_lamports.min(u128::from(u64::MAX)) as u64)
+}
+
+fn format_priority_price_note(compute_unit_price_micro_lamports: u64) -> String {
+    format!(
+        "{} micro-lamports/CU (~{} SOL at {} CU)",
+        compute_unit_price_micro_lamports,
+        priority_price_micro_lamports_to_sol_equivalent(compute_unit_price_micro_lamports),
+        PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT
+    )
 }
 
 const FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS: [&str; 8] = [
@@ -1429,24 +1974,15 @@ const FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS: [&str; 8] = [
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 ];
 
-const FEE_TEMPLATE_TRADE_ACCOUNT_KEYS: [&str; 8] = [
-    "ComputeBudget111111111111111111111111111111",
-    "11111111111111111111111111111111",
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-    "So11111111111111111111111111111111111111112",
-];
-
 fn helius_fee_estimate_options(helius_priority_level: &str) -> Value {
     if helius_priority_level == "recommended" {
         json!({
+            "priorityLevel": "Medium",
             "recommended": true
         })
     } else {
         json!({
+            "priorityLevel": helius_priority_level,
             "includeAllPriorityFeeLevels": true
         })
     }
@@ -1458,6 +1994,11 @@ fn parse_helius_priority_estimate_result(result: &Value, helius_priority_level: 
             "recommended" => result
                 .get("priorityFeeEstimate")
                 .or_else(|| result.get("recommended")),
+            "Default" => result
+                .get("priorityFeeEstimate")
+                .or_else(|| result.get("recommended"))
+                .or_else(|| result.get("priorityFeeLevels").and_then(|levels| levels.get("medium")))
+                .or_else(|| result.get("priorityFeeLevels").and_then(|levels| levels.get("Medium"))),
             selected_level => result
                 .get("priorityFeeLevels")
                 .and_then(|levels| levels.get(selected_level)),
@@ -1498,6 +2039,7 @@ async fn fetch_helius_priority_estimate(
                 .collect(),
         );
     }
+    record_outbound_provider_http_request();
     let payload = client
         .post(rpc_url)
         .json(&json!({
@@ -1522,105 +2064,188 @@ async fn fetch_helius_priority_estimate(
     ))
 }
 
-async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
-    let helius_priority_level = auto_fee_helius_priority_level();
-    let jito_tip_percentile = auto_fee_jito_tip_percentile();
-    let client = shared_fee_market_http_client();
-    let helius_generic_request = fetch_helius_priority_estimate(
-        &client,
+fn compiled_transaction_serialized_base58(
+    transaction: &CompiledTransaction,
+) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    let bytes = BASE64
+        .decode(&transaction.serializedBase64)
+        .map_err(|error| format!("Failed to decode compiled transaction: {error}"))?;
+    Ok(bs58::encode(bytes).into_string())
+}
+
+async fn fetch_helius_priority_estimate_for_serialized_transaction(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    helius_priority_level: &str,
+    request_id: &str,
+    serialized_transaction: &str,
+) -> Result<Option<u64>, String> {
+    record_outbound_provider_http_request();
+    let payload = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "getPriorityFeeEstimate",
+            "params": [{
+                "transaction": serialized_transaction,
+                "options": helius_fee_estimate_options(helius_priority_level)
+            }]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Helius serialized priority estimate request failed: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Failed to decode Helius serialized fee estimate: {error}"))?;
+    if let Some(error) = payload.get("error") {
+        return Err(format!("Helius serialized priority estimate failed: {error}"));
+    }
+    let result = payload.get("result").unwrap_or(&payload);
+    Ok(parse_helius_priority_estimate_result(
+        result,
+        helius_priority_level,
+    ))
+}
+
+async fn estimate_serialized_launch_priority_fee(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    transport_plan: &crate::transport::TransportPlan,
+    wallet_secret: &[u8],
+    creator_public_key: &str,
+) -> Result<Option<u64>, String> {
+    let mut probe_config = config.clone();
+    probe_config.tx.computeUnitPriceMicroLamports = Some(0);
+    probe_config.execution.priorityFeeSol.clear();
+    probe_config.execution.buyPriorityFeeSol.clear();
+    probe_config.execution.sellPriorityFeeSol.clear();
+
+    let native = try_compile_native_launchpad(
         rpc_url,
-        &helius_priority_level,
-        "launchdeck-helius-priority-estimate-generic",
-        None,
-    );
-    let helius_launch_request = fetch_helius_priority_estimate(
+        &probe_config,
+        transport_plan,
+        wallet_secret,
+        now_timestamp_string(),
+        creator_public_key.to_string(),
+        Some("Rust serialized fee probe".to_string()),
+        true,
+    )
+    .await?
+    .ok_or_else(|| {
+        format!(
+            "Native {} compile is unavailable for serialized priority estimation.",
+            config.launchpad
+        )
+    })?;
+
+    let launch_transaction = native
+        .creation_transactions
+        .iter()
+        .find(|transaction| transaction.label == "launch")
+        .or_else(|| {
+            native
+                .compiled_transactions
+                .iter()
+                .find(|transaction| transaction.label == "launch")
+        })
+        .or_else(|| native.creation_transactions.first())
+        .or_else(|| native.compiled_transactions.first())
+        .ok_or_else(|| "No compiled launch transaction was available for fee estimation.".to_string())?;
+    let serialized_base58 = compiled_transaction_serialized_base58(launch_transaction)?;
+    fetch_helius_priority_estimate_for_serialized_transaction(
+        shared_fee_market_http_client(),
+        rpc_url,
+        &auto_fee_helius_priority_level(),
+        "launchdeck-helius-priority-estimate-serialized-launch",
+        &serialized_base58,
+    )
+    .await
+}
+
+fn helius_sender_ping_endpoint_url(endpoint_url: &str) -> String {
+    let trimmed = endpoint_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/fast") {
+        return format!("{prefix}/ping");
+    }
+    if trimmed.ends_with("/ping") {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}/ping")
+}
+
+async fn prewarm_helius_sender_endpoint(rpc_url: &str) -> Result<(), String> {
+    let ping_url = helius_sender_ping_endpoint_url(rpc_url);
+    let response = shared_fee_market_http_client()
+        .get(&ping_url)
+        .send()
+        .await
+        .map_err(|error| format!("Sender ping request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("(body unavailable)"));
+        return Err(format!("Sender ping failed with status {status}: {body}"));
+    }
+    Ok(())
+}
+
+async fn fetch_helius_priority_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let client = shared_fee_market_http_client();
+    let helius_launch_priority_lamports = fetch_helius_priority_estimate(
         &client,
         rpc_url,
         &helius_priority_level,
         "launchdeck-helius-priority-estimate-launch-template",
         Some(&FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS),
-    );
-    let helius_trade_request = fetch_helius_priority_estimate(
-        &client,
-        rpc_url,
-        &helius_priority_level,
-        "launchdeck-helius-priority-estimate-trade-template",
-        Some(&FEE_TEMPLATE_TRADE_ACCOUNT_KEYS),
-    );
-    let jito_request = client
-        .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
-        .send();
-    let (
-        helius_generic_response,
-        helius_launch_response,
-        helius_trade_response,
-        jito_response,
-    ) = tokio::join!(
-        helius_generic_request,
-        helius_launch_request,
-        helius_trade_request,
-        jito_request
-    );
-
-    let helius_priority_lamports = helius_generic_response?;
-    let helius_launch_priority_lamports = helius_launch_response.unwrap_or(None);
-    let helius_trade_priority_lamports = helius_trade_response.unwrap_or(None);
-
-    let jito_tip_p99_lamports = match jito_response {
-        Ok(response) => {
-            let payload = response
-                .json::<Value>()
-                .await
-                .map_err(|error| format!("Failed to decode Jito tip floor: {error}"))?;
-            let sample = payload
-                .as_array()
-                .and_then(|entries| entries.first())
-                .unwrap_or(&payload);
-            normalize_estimate_to_lamports(
-                match jito_tip_percentile.as_str() {
-                    "p25" => sample
-                        .get("p25")
-                        .or_else(|| sample.get("percentile25"))
-                        .or_else(|| sample.get("tipFloor25"))
-                        .or_else(|| sample.get("landed_tips_25th_percentile")),
-                    "p50" => sample
-                        .get("p50")
-                        .or_else(|| sample.get("percentile50"))
-                        .or_else(|| sample.get("tipFloor50"))
-                        .or_else(|| sample.get("landed_tips_50th_percentile")),
-                    "p75" => sample
-                        .get("p75")
-                        .or_else(|| sample.get("percentile75"))
-                        .or_else(|| sample.get("tipFloor75"))
-                        .or_else(|| sample.get("landed_tips_75th_percentile")),
-                    "p95" => sample
-                        .get("p95")
-                        .or_else(|| sample.get("percentile95"))
-                        .or_else(|| sample.get("tipFloor95"))
-                        .or_else(|| sample.get("landed_tips_95th_percentile")),
-                    _ => sample
-                        .get("p99")
-                        .or_else(|| sample.get("percentile99"))
-                        .or_else(|| sample.get("tipFloor99"))
-                        .or_else(|| sample.get("landed_tips_99th_percentile")),
-                },
-            )
-        }
-        Err(error) => return Err(format!("Jito tip floor request failed: {error}")),
-    };
-
-    let snapshot = FeeMarketSnapshot {
-        helius_priority_lamports,
+    )
+    .await
+    .unwrap_or(None);
+    Ok(FeeMarketSnapshot {
+        helius_priority_lamports: None,
         helius_launch_priority_lamports,
-        helius_trade_priority_lamports,
-        jito_tip_p99_lamports,
-    };
-    cache_fee_market_snapshot(
-        rpc_url,
-        &helius_priority_level,
+        helius_trade_priority_lamports: None,
+        jito_tip_p99_lamports: None,
+    })
+}
+
+async fn fetch_jito_tip_floor_live() -> Result<Option<u64>, String> {
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    let response = shared_fee_market_http_client()
+        .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
+        .send()
+        .await
+        .map_err(|error| format!("Jito tip floor request failed: {error}"))?;
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Failed to decode Jito tip floor: {error}"))?;
+    Ok(extract_jito_tip_floor_lamports(
+        &payload,
         &jito_tip_percentile,
-        &snapshot,
+    ))
+}
+
+async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    let (helius_snapshot, jito_tip_p99_lamports) = tokio::join!(
+        fetch_helius_priority_snapshot_live(rpc_url),
+        fetch_jito_tip_floor_live()
     );
+    let helius_snapshot = helius_snapshot?;
+    let snapshot = FeeMarketSnapshot {
+        helius_priority_lamports: helius_snapshot.helius_priority_lamports,
+        helius_launch_priority_lamports: helius_snapshot.helius_launch_priority_lamports,
+        helius_trade_priority_lamports: helius_snapshot.helius_trade_priority_lamports,
+        jito_tip_p99_lamports: jito_tip_p99_lamports?,
+    };
+    cache_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile, &snapshot);
     Ok(snapshot)
 }
 
@@ -1635,11 +2260,152 @@ async fn fetch_fee_market_snapshot(rpc_url: &str) -> Result<FeeMarketSnapshot, S
     fetch_fee_market_snapshot_live(rpc_url).await
 }
 
-fn spawn_fee_market_snapshot_refresh_task(rpc_url: String) {
+fn update_cached_jito_tip_snapshot(rpc_url: &str, jito_tip_lamports: Option<u64>) {
+    let helius_priority_level = auto_fee_helius_priority_level();
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    update_cached_fee_market_snapshot(
+        rpc_url,
+        &helius_priority_level,
+        &jito_tip_percentile,
+        |cached| {
+            cached.jito_tip_p99_lamports = jito_tip_lamports;
+        },
+    );
+}
+
+async fn open_jito_tip_stream_socket() -> Result<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    String,
+> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(JITO_TIP_STREAM_ENDPOINT),
+    )
+    .await
+    .map_err(|_| "Timed out connecting to Jito tip stream.".to_string())?
+    .map(|(stream, _)| stream)
+    .map_err(|error| format!("Failed to connect to Jito tip stream: {error}"))
+}
+
+async fn consume_jito_tip_stream_updates(
+    state: &Arc<AppState>,
+    rpc_url: &str,
+) -> Result<(), String> {
+    let jito_tip_percentile = auto_fee_jito_tip_percentile();
+    let mut ws = open_jito_tip_stream_socket().await?;
+    let idle_timeout = JITO_TIP_STREAM_IDLE_TIMEOUT;
+    let mut last_message_at = Instant::now();
+    loop {
+        if !engine_background_requests_active(state) {
+            return Ok(());
+        }
+        let message = tokio::select! {
+            message = ws.next() => message,
+            _ = tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL) => {
+                if last_message_at.elapsed() >= idle_timeout {
+                    return Err("Timed out waiting for Jito tip stream update.".to_string());
+                }
+                continue;
+            }
+        };
+        let Some(message) = message else {
+            return Err("Jito tip stream closed.".to_string());
+        };
+        let message = message.map_err(|error| format!("Jito tip stream read failed: {error}"))?;
+        last_message_at = Instant::now();
+        match message {
+            tokio_tungstenite::tungstenite::protocol::Message::Text(text) => {
+                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                    if let Some(value) =
+                        extract_jito_tip_floor_lamports(&payload, &jito_tip_percentile)
+                    {
+                        update_cached_jito_tip_snapshot(rpc_url, Some(value));
+                    }
+                }
+            }
+            tokio_tungstenite::tungstenite::protocol::Message::Binary(bytes) => {
+                if let Ok(payload) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(value) =
+                        extract_jito_tip_floor_lamports(&payload, &jito_tip_percentile)
+                    {
+                        update_cached_jito_tip_snapshot(rpc_url, Some(value));
+                    }
+                }
+            }
+            tokio_tungstenite::tungstenite::protocol::Message::Ping(payload) => {
+                ws.send(tokio_tungstenite::tungstenite::protocol::Message::Pong(
+                    payload,
+                ))
+                .await
+                .map_err(|error| format!("Jito tip stream pong failed: {error}"))?;
+            }
+            tokio_tungstenite::tungstenite::protocol::Message::Pong(_) => {}
+            tokio_tungstenite::tungstenite::protocol::Message::Frame(_) => {}
+            tokio_tungstenite::tungstenite::protocol::Message::Close(_) => {
+                return Err("Jito tip stream closed.".to_string());
+            }
+        }
+    }
+}
+
+fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String) {
+    let helius_rpc_url = rpc_url.clone();
+    let helius_state = state.clone();
     tokio::spawn(async move {
         loop {
-            let _ = fetch_fee_market_snapshot_live(&rpc_url).await;
-            tokio::time::sleep(FEE_MARKET_REFRESH_INTERVAL).await;
+            if engine_background_requests_active(&helius_state) {
+                let helius_priority_level = auto_fee_helius_priority_level();
+                let jito_tip_percentile = auto_fee_jito_tip_percentile();
+                if let Ok(snapshot) = fetch_helius_priority_snapshot_live(&helius_rpc_url).await {
+                    update_cached_fee_market_snapshot(
+                        &helius_rpc_url,
+                        &helius_priority_level,
+                        &jito_tip_percentile,
+                        |cached| {
+                            cached.helius_priority_lamports = snapshot.helius_priority_lamports;
+                            cached.helius_launch_priority_lamports =
+                                snapshot.helius_launch_priority_lamports;
+                            cached.helius_trade_priority_lamports = None;
+                        },
+                    );
+                }
+                tokio::time::sleep(configured_helius_priority_refresh_interval()).await;
+            } else {
+                tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
+            }
+        }
+    });
+    let jito_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if engine_background_requests_active(&jito_state) {
+                if let Ok(jito_tip_p99_lamports) = fetch_jito_tip_floor_live().await {
+                    update_cached_jito_tip_snapshot(&rpc_url, jito_tip_p99_lamports);
+                }
+                let _ = consume_jito_tip_stream_updates(&jito_state, &rpc_url).await;
+                tokio::time::sleep(JITO_TIP_STREAM_RECONNECT_DELAY).await;
+            } else {
+                tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
+            }
+        }
+    });
+}
+
+fn spawn_engine_blockhash_refresh_task(
+    state: Arc<AppState>,
+    rpc_url: String,
+    commitment: &'static str,
+) {
+    tokio::spawn(async move {
+        loop {
+            if engine_background_requests_active(&state) {
+                let _ = refresh_latest_blockhash_cache(&rpc_url, commitment).await;
+                tokio::time::sleep(ENGINE_BLOCKHASH_REFRESH_INTERVAL).await;
+            } else {
+                tokio::time::sleep(IDLE_BACKGROUND_REQUEST_POLL_INTERVAL).await;
+            }
         }
     });
 }
@@ -1648,6 +2414,8 @@ async fn resolve_auto_execution_fees(
     rpc_url: &str,
     normalized: &mut NormalizedConfig,
     transport_plan: &crate::transport::TransportPlan,
+    wallet_secret: &[u8],
+    creator_public_key: &str,
 ) -> Result<AutoFeeResolutionSummary, String> {
     let needs_auto = normalized.execution.autoGas
         || normalized.execution.buyAutoGas
@@ -1700,6 +2468,45 @@ async fn resolve_auto_execution_fees(
         });
     }
 
+    let serialized_launch_priority_estimate = if normalized.execution.autoGas
+        || normalized.execution.buyAutoGas
+        || normalized.execution.sellAutoGas
+    {
+        match estimate_serialized_launch_priority_fee(
+            rpc_url,
+            normalized,
+            transport_plan,
+            wallet_secret,
+            creator_public_key,
+        )
+        .await
+        {
+            Ok(Some(estimate)) => {
+                notes.push(format!(
+                    "Priority auto-fee uses Helius serialized launch estimation and applies the launch-derived compute-unit price across creation, buy, and sell ({}).",
+                    format_priority_price_note(estimate)
+                ));
+                Some(estimate)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                notes.push(format!(
+                    "Serialized launch priority estimation was unavailable; auto-fee fell back to cached Helius account-pattern estimates: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let priority_estimate_for_action = |action: &str| -> (Option<u64>, String) {
+        if let Some(estimate) = serialized_launch_priority_estimate {
+            (Some(estimate), "serialized-launch".to_string())
+        } else {
+            action_priority_estimate(&market, action)
+        }
+    };
+
     if normalized.execution.autoGas {
         let cap_lamports = parse_auto_fee_cap_lamports(
             if !normalized.execution.maxPriorityFeeSol.trim().is_empty() {
@@ -1720,7 +2527,7 @@ async fn resolve_auto_execution_fees(
             || (provider == "jito-bundle");
 
         if uses_priority {
-            let (estimated, source) = action_priority_estimate(&market, "creation");
+            let (estimated, source) = priority_estimate_for_action("creation");
             creation_report.prioritySource = source;
             creation_report.priorityEstimateLamports = estimated;
             let estimated = estimated.ok_or_else(|| {
@@ -1728,7 +2535,8 @@ async fn resolve_auto_execution_fees(
                     .to_string()
             })?;
             let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
-            normalized.execution.priorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            normalized.execution.priorityFeeSol =
+                priority_price_micro_lamports_to_sol_equivalent(resolved);
             normalized.tx.computeUnitPriceMicroLamports =
                 Some(lamports_to_priority_fee_micro_lamports(resolved) as i64);
             creation_report.resolvedPriorityLamports = Some(resolved);
@@ -1745,14 +2553,21 @@ async fn resolve_auto_execution_fees(
                 "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
-                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
+                && resolved > 0
+                && resolved < minimum_tip_lamports
+            {
+                if cap_lamports.is_some()
+                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
+                {
                     return Err(
-                        "Creation max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
-                            .to_string(),
+                        format!(
+                            "Creation max auto fee is below the {} minimum tip of 0.0002 SOL.",
+                            provider
+                        ),
                     );
                 }
-                resolved = 200_000;
+                resolved = minimum_tip_lamports;
             }
             normalized.execution.tipSol = format_lamports_to_sol_decimal(resolved);
             normalized.tx.jitoTipLamports = resolved as i64;
@@ -1765,14 +2580,14 @@ async fn resolve_auto_execution_fees(
         }
 
         notes.push(format!(
-            "Creation auto fee resolved{}: priority={} SOL | tip={} SOL",
+            "Creation auto fee resolved{}: priority price={} | tip={} SOL",
             cap_lamports
                 .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
                 .unwrap_or_default(),
             if normalized.execution.priorityFeeSol.trim().is_empty() {
                 "off".to_string()
             } else {
-                normalized.execution.priorityFeeSol.clone()
+                format_priority_price_note(creation_report.resolvedPriorityLamports.unwrap_or_default())
             },
             if normalized.execution.tipSol.trim().is_empty() {
                 "off".to_string()
@@ -1796,14 +2611,15 @@ async fn resolve_auto_execution_fees(
         let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
 
         if uses_priority {
-            let (estimated, source) = action_priority_estimate(&market, "buy");
+            let (estimated, source) = priority_estimate_for_action("buy");
             buy_report.prioritySource = source;
             buy_report.priorityEstimateLamports = estimated;
             let estimated = estimated.ok_or_else(|| {
                 "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
             })?;
             let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
-            normalized.execution.buyPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            normalized.execution.buyPriorityFeeSol =
+                priority_price_micro_lamports_to_sol_equivalent(resolved);
             buy_report.resolvedPriorityLamports = Some(resolved);
         } else {
             normalized.execution.buyPriorityFeeSol.clear();
@@ -1817,14 +2633,21 @@ async fn resolve_auto_execution_fees(
                 "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
-                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
+                && resolved > 0
+                && resolved < minimum_tip_lamports
+            {
+                if cap_lamports.is_some()
+                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
+                {
                     return Err(
-                        "Buy max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
-                            .to_string(),
+                        format!(
+                            "Buy max auto fee is below the {} minimum tip of 0.0002 SOL.",
+                            provider
+                        ),
                     );
                 }
-                resolved = 200_000;
+                resolved = minimum_tip_lamports;
             }
             normalized.execution.buyTipSol = format_lamports_to_sol_decimal(resolved);
             buy_report.resolvedTipLamports = Some(resolved);
@@ -1833,14 +2656,14 @@ async fn resolve_auto_execution_fees(
         }
 
         notes.push(format!(
-            "Buy auto fee resolved{}: priority={} SOL | tip={} SOL",
+            "Buy auto fee resolved{}: priority price={} | tip={} SOL",
             cap_lamports
                 .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
                 .unwrap_or_default(),
             if normalized.execution.buyPriorityFeeSol.trim().is_empty() {
                 "off".to_string()
             } else {
-                normalized.execution.buyPriorityFeeSol.clone()
+                format_priority_price_note(buy_report.resolvedPriorityLamports.unwrap_or_default())
             },
             if normalized.execution.buyTipSol.trim().is_empty() {
                 "off".to_string()
@@ -1864,7 +2687,7 @@ async fn resolve_auto_execution_fees(
         let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
 
         if uses_priority {
-            let (estimated, source) = action_priority_estimate(&market, "sell");
+            let (estimated, source) = priority_estimate_for_action("sell");
             sell_report.prioritySource = source;
             sell_report.priorityEstimateLamports = estimated;
             let estimated = estimated.ok_or_else(|| {
@@ -1872,7 +2695,8 @@ async fn resolve_auto_execution_fees(
                     .to_string()
             })?;
             let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
-            normalized.execution.sellPriorityFeeSol = format_lamports_to_sol_decimal(resolved);
+            normalized.execution.sellPriorityFeeSol =
+                priority_price_micro_lamports_to_sol_equivalent(resolved);
             sell_report.resolvedPriorityLamports = Some(resolved);
         } else {
             normalized.execution.sellPriorityFeeSol.clear();
@@ -1886,14 +2710,21 @@ async fn resolve_auto_execution_fees(
                 "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
             })?;
             let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if provider == "helius-sender" && resolved > 0 && resolved < 200_000 {
-                if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < 200_000 {
+            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
+                && resolved > 0
+                && resolved < minimum_tip_lamports
+            {
+                if cap_lamports.is_some()
+                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
+                {
                     return Err(
-                        "Sell max auto fee is below the Helius Sender minimum tip of 0.0002 SOL."
-                            .to_string(),
+                        format!(
+                            "Sell max auto fee is below the {} minimum tip of 0.0002 SOL.",
+                            provider
+                        ),
                     );
                 }
-                resolved = 200_000;
+                resolved = minimum_tip_lamports;
             }
             normalized.execution.sellTipSol = format_lamports_to_sol_decimal(resolved);
             sell_report.resolvedTipLamports = Some(resolved);
@@ -1902,14 +2733,14 @@ async fn resolve_auto_execution_fees(
         }
 
         notes.push(format!(
-            "Sell auto fee resolved{}: priority={} SOL | tip={} SOL",
+            "Sell auto fee resolved{}: priority price={} | tip={} SOL",
             cap_lamports
                 .map(|cap| format!(" with cap {} SOL", format_lamports_to_sol_decimal(cap)))
                 .unwrap_or_default(),
             if normalized.execution.sellPriorityFeeSol.trim().is_empty() {
                 "off".to_string()
             } else {
-                normalized.execution.sellPriorityFeeSol.clone()
+                format_priority_price_note(sell_report.resolvedPriorityLamports.unwrap_or_default())
             },
             if normalized.execution.sellTipSol.trim().is_empty() {
                 "off".to_string()
@@ -2288,6 +3119,9 @@ fn build_bootstrap_fast_payload(
         "startupWarm": {
             "enabled": configured_startup_warm_enabled(),
         },
+        "uiRefresh": {
+            "walletStatusIntervalMs": configured_wallet_status_refresh_interval_ms(),
+        },
         "regionRouting": build_region_routing_payload(),
         "config": read_persistent_config(),
     }))
@@ -2329,6 +3163,9 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
         .and_then(|value| value.get("activeJobs"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    if idle_suspended_without_inflight(state, follow_active_jobs) {
+        clear_outbound_provider_http_traffic();
+    }
     json!({
         "ok": true,
         "service": "launchdeck-engine",
@@ -2343,6 +3180,7 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
         },
         "warm": warm_state_payload(state, follow_active_jobs),
         "runtimeWorkers": runtime_workers,
+        "rpcTraffic": rpc_traffic_snapshot(),
     })
 }
 
@@ -2560,6 +3398,8 @@ async fn execute_engine_action_payload(
         &rpc_url,
         &mut normalized,
         &transport_plan,
+        &wallet_secret,
+        &creator_public_key,
     )
     .await
     .map_err(|error| {
@@ -4601,7 +5441,10 @@ async fn api_pump_global_warm() -> Result<Json<Value>, (StatusCode, Json<Value>)
     })))
 }
 
-async fn api_startup_warm() -> Json<Value> {
+async fn api_startup_warm(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<WarmActivityRequest>,
+) -> Json<Value> {
     let started_at_ms = current_time_ms();
     if !configured_startup_warm_enabled() {
         return Json(attach_timing(
@@ -4618,76 +5461,330 @@ async fn api_startup_warm() -> Json<Value> {
     }
     let main_rpc_url = configured_rpc_url();
     let rpc_url = configured_warm_rpc_url(&main_rpc_url);
-    let helius_sender_endpoints =
-        configured_helius_sender_endpoints_for_profile(&default_endpoint_profile_for_provider(
-            "helius-sender",
-        ));
-    let (lookup_tables, pump_global, bonk_state, fee_market, sender_prewarm) = tokio::join!(
+    let selected_routes = startup_warm_routes(&payload);
+    {
+        let mut warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        warm.selected_routes = selected_routes.clone();
+    }
+    let (lookup_tables, pump_global, bonk_state, fee_market) = tokio::join!(
         warm_default_lookup_tables(&rpc_url),
         warm_pump_global_state(&rpc_url),
         warm_bonk_state(&rpc_url),
         fetch_fee_market_snapshot(&main_rpc_url),
-        async {
-            join_all(
-                helius_sender_endpoints
-                    .iter()
-                    .map(|endpoint| async move { (endpoint.clone(), prewarm_rpc_endpoint(endpoint).await) }),
-            )
-            .await
-        },
     );
+    let lookup_tables_payload = match lookup_tables {
+        Ok(loaded) => json!({
+            "ok": true,
+            "loaded": loaded,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+        }),
+    };
+    let pump_global_payload = match pump_global {
+        Ok(()) => json!({
+            "ok": true,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+        }),
+    };
+    let bonk_state_payload = match bonk_state {
+        Ok(payload) => payload,
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+        }),
+    };
+    let fee_market_payload = match fee_market {
+        Ok(snapshot) => json!({
+            "ok": true,
+            "heliusPriorityLamports": snapshot.helius_priority_lamports,
+            "heliusLaunchPriorityLamports": snapshot.launch_priority_lamports(),
+            "heliusTradePriorityLamports": snapshot.trade_priority_lamports(),
+            "jitoTipP99Lamports": snapshot.jito_tip_p99_lamports,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "error": error,
+        }),
+    };
+    let mut startup_endpoint_attempts = Vec::new();
+    if selected_routes.iter().any(|route| route.provider == "standard-rpc") {
+        let endpoint = primary_standard_rpc_warm_endpoint(&main_rpc_url);
+        let result = prewarm_rpc_endpoint(&endpoint).await;
+        startup_endpoint_attempts.push(build_warm_target_attempt(
+            "endpoint",
+            Some("standard-rpc"),
+            "Standard RPC",
+            endpoint,
+            match result {
+                Ok(()) => WarmAttemptResult::Success,
+                Err(error) => WarmAttemptResult::Error(error),
+            },
+        ));
+    }
+    if selected_routes.iter().any(|route| route.provider == "helius-sender") {
+        let mut seen = HashSet::new();
+        for route in selected_routes
+            .iter()
+            .filter(|route| route.provider == "helius-sender")
+        {
+            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let result = prewarm_helius_sender_endpoint(&endpoint).await;
+                startup_endpoint_attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("helius-sender"),
+                    "Helius Sender",
+                    endpoint,
+                    match result {
+                        Ok(()) => WarmAttemptResult::Success,
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
+    if selected_routes.iter().any(|route| route.provider == "jito-bundle") {
+        let mut seen = HashSet::new();
+        for route in selected_routes
+            .iter()
+            .filter(|route| route.provider == "jito-bundle")
+        {
+            for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.send.clone()) {
+                    continue;
+                }
+                let target = endpoint.name.clone();
+                let result = prewarm_jito_bundle_endpoint(&endpoint).await;
+                startup_endpoint_attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("jito-bundle"),
+                    "Jito Bundle",
+                    target,
+                    match result {
+                        Ok(JitoWarmResult::Warmed) => WarmAttemptResult::Success,
+                        Ok(JitoWarmResult::RateLimited(message)) => {
+                            WarmAttemptResult::RateLimited(message)
+                        }
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
+    let startup_endpoint_payload = startup_endpoint_attempts
+        .iter()
+        .map(|attempt| {
+            json!({
+                "provider": attempt.provider,
+                "label": attempt.label,
+                "target": attempt.target,
+                "ok": matches!(attempt.result, WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)),
+                "rateLimited": matches!(attempt.result, WarmAttemptResult::RateLimited(_)),
+                "error": match &attempt.result {
+                    WarmAttemptResult::Success => None::<String>,
+                    WarmAttemptResult::RateLimited(message) => Some(message.clone()),
+                    WarmAttemptResult::Error(error) => Some(error.clone()),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let startup_state_entries = vec![
+        (
+            "Lookup tables",
+            lookup_tables_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            lookup_tables_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        (
+            "Pump global",
+            pump_global_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            pump_global_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        (
+            "Bonk state",
+            bonk_state_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            bonk_state_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        (
+            "Fee market",
+            fee_market_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            fee_market_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+    ];
+    let startup_state_total = startup_state_entries.len();
+    let startup_state_healthy = startup_state_entries
+        .iter()
+        .filter(|(_, ok, _)| *ok)
+        .count();
+    let startup_state_failures = startup_state_entries
+        .iter()
+        .filter(|(_, ok, _)| !*ok)
+        .map(|(label, _, error)| {
+            json!({
+                "label": label,
+                "error": error.clone().unwrap_or_else(|| "startup warm target failed".to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let startup_endpoint_total = startup_endpoint_payload.len();
+    let startup_endpoint_healthy = startup_endpoint_payload
+        .iter()
+        .filter(|entry| entry.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        .count();
+    let startup_endpoint_failures = startup_endpoint_payload
+        .iter()
+        .filter(|entry| !entry.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        .map(|entry| {
+            json!({
+                "label": entry.get("label").and_then(Value::as_str).unwrap_or("Endpoint warm"),
+                "error": entry.get("error").and_then(Value::as_str).unwrap_or("startup warm target failed"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut startup_attempts = vec![
+        build_warm_target_attempt(
+            "state",
+            None,
+            "Lookup tables",
+            rpc_url.clone(),
+            match lookup_tables_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                true => WarmAttemptResult::Success,
+                false => WarmAttemptResult::Error(
+                    lookup_tables_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup warm target failed")
+                        .to_string(),
+                ),
+            },
+        ),
+        build_warm_target_attempt(
+            "state",
+            None,
+            "Pump global",
+            rpc_url.clone(),
+            match pump_global_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                true => WarmAttemptResult::Success,
+                false => WarmAttemptResult::Error(
+                    pump_global_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup warm target failed")
+                        .to_string(),
+                ),
+            },
+        ),
+        build_warm_target_attempt(
+            "state",
+            None,
+            "Bonk state",
+            rpc_url.clone(),
+            match bonk_state_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                true => WarmAttemptResult::Success,
+                false => WarmAttemptResult::Error(
+                    bonk_state_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup warm target failed")
+                        .to_string(),
+                ),
+            },
+        ),
+        build_warm_target_attempt(
+            "state",
+            None,
+            "Fee Market",
+            main_rpc_url.clone(),
+            match fee_market_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                true => WarmAttemptResult::Success,
+                false => WarmAttemptResult::Error(
+                    fee_market_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup warm target failed")
+                        .to_string(),
+                ),
+            },
+        ),
+    ];
+    startup_attempts.extend(startup_endpoint_attempts.iter().cloned());
+    let attempt_at_ms = current_time_ms() as u64;
+    {
+        let mut warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        apply_warm_target_attempts(&mut warm, &startup_attempts, attempt_at_ms);
+        warm.last_warm_attempt_at_ms = Some(u128::from(attempt_at_ms));
+        if startup_attempts.iter().any(|attempt| {
+            matches!(
+                attempt.result,
+                WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)
+            )
+        }) {
+            warm.last_warm_success_at_ms = Some(u128::from(attempt_at_ms));
+            warm.last_error = None;
+        } else {
+            warm.last_error = Some("startup warm failed".to_string());
+        }
+    }
     Json(attach_timing(
         json!({
             "ok": true,
-            "lookupTables": match lookup_tables {
-                Ok(loaded) => json!({
-                    "ok": true,
-                    "loaded": loaded,
-                }),
-                Err(error) => json!({
-                    "ok": false,
-                    "error": error,
-                }),
+            "startupWarm": {
+                "enabled": true,
+                "stateTargets": {
+                    "total": startup_state_total,
+                    "healthy": startup_state_healthy,
+                    "failing": startup_state_total.saturating_sub(startup_state_healthy),
+                },
+                "endpointTargets": {
+                    "total": startup_endpoint_total,
+                    "healthy": startup_endpoint_healthy,
+                    "failing": startup_endpoint_total.saturating_sub(startup_endpoint_healthy),
+                    "label": "Endpoint warm",
+                },
+                "stateFailures": startup_state_failures,
+                "endpointFailures": startup_endpoint_failures,
             },
-            "pumpGlobal": match pump_global {
-                Ok(()) => json!({
-                    "ok": true,
-                }),
-                Err(error) => json!({
-                    "ok": false,
-                    "error": error,
-                }),
-            },
-            "bonkState": match bonk_state {
-                Ok(payload) => payload,
-                Err(error) => json!({
-                    "ok": false,
-                    "error": error,
-                }),
-            },
-            "feeMarket": match fee_market {
-                Ok(snapshot) => json!({
-                    "ok": true,
-                    "heliusPriorityLamports": snapshot.helius_priority_lamports,
-                    "heliusLaunchPriorityLamports": snapshot.helius_launch_priority_lamports,
-                    "heliusTradePriorityLamports": snapshot.helius_trade_priority_lamports,
-                    "jitoTipP99Lamports": snapshot.jito_tip_p99_lamports,
-                }),
-                Err(error) => json!({
-                    "ok": false,
-                    "error": error,
-                }),
-            },
-            "heliusSender": sender_prewarm
-                .into_iter()
-                .map(|(endpoint, result)| {
-                    json!({
-                        "endpoint": endpoint,
-                        "ok": result.is_ok(),
-                        "error": result.err(),
-                    })
-                })
-                .collect::<Vec<_>>(),
+            "lookupTables": lookup_tables_payload,
+            "pumpGlobal": pump_global_payload,
+            "bonkState": bonk_state_payload,
+            "feeMarket": fee_market_payload,
+            "endpointResults": startup_endpoint_payload,
         }),
         started_at_ms,
     ))
@@ -4732,7 +5829,7 @@ async fn api_warm_activity(
     Json(payload): Json<WarmActivityRequest>,
 ) -> Json<Value> {
     let started_at_ms = current_time_ms();
-    let should_rewarm_now = mark_operator_activity(&state, activity_providers(&payload));
+    let should_rewarm_now = mark_operator_activity(&state, activity_routes(&payload));
     if should_rewarm_now {
         execute_continuous_warm_pass(&state).await;
     }
@@ -4741,6 +5838,7 @@ async fn api_warm_activity(
         json!({
             "ok": true,
             "warm": warm_state_payload(&state, follow_active_jobs),
+            "rpcTraffic": rpc_traffic_snapshot(),
         }),
         started_at_ms,
     ))
@@ -5600,12 +6698,53 @@ mod tests {
             ..WarmControlState::default()
         });
 
-        let immediate = mark_operator_activity(&state, vec!["standard-rpc".to_string()]);
+        let immediate = mark_operator_activity(
+            &state,
+            vec![WarmRouteSelection {
+                provider: "standard-rpc".to_string(),
+                endpoint_profile: String::new(),
+            }],
+        );
         let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         assert!(immediate);
         assert_eq!(warm.current_reason, "active-operator-activity");
-        assert_eq!(warm.selected_providers, vec!["standard-rpc".to_string()]);
+        assert_eq!(
+            warm.selected_routes,
+            vec![WarmRouteSelection {
+                provider: "standard-rpc".to_string(),
+                endpoint_profile: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn activity_routes_include_profiles_and_normalize_aliases() {
+        let routes = activity_routes(&WarmActivityRequest {
+            creation_provider: Some("helius-sender".to_string()),
+            creation_endpoint_profile: Some("fra,ams".to_string()),
+            buy_provider: Some("jito-bundle".to_string()),
+            buy_endpoint_profile: Some("ny".to_string()),
+            sell_provider: Some("standard-rpc".to_string()),
+            sell_endpoint_profile: Some("eu".to_string()),
+        });
+        assert_eq!(
+            routes,
+            vec![
+                WarmRouteSelection {
+                    provider: "helius-sender".to_string(),
+                    endpoint_profile: "fra,ams".to_string(),
+                },
+                WarmRouteSelection {
+                    provider: "jito-bundle".to_string(),
+                    endpoint_profile: "ewr".to_string(),
+                },
+                WarmRouteSelection {
+                    provider: "standard-rpc".to_string(),
+                    endpoint_profile: String::new(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -5622,6 +6761,212 @@ mod tests {
         assert_eq!(
             payload.get("reason").and_then(Value::as_str),
             Some("suspended-idle")
+        );
+    }
+
+    #[test]
+    fn warm_state_payload_derives_immediate_suspend_telemetry() {
+        let idle_timeout_ms = u128::from(configured_idle_warm_timeout_ms());
+        let idle_ms = idle_timeout_ms + 5_000;
+        let now_ms = current_time_ms();
+        let mut warm_targets = HashMap::new();
+        warm_targets.insert(
+            "state:https://warm".to_string(),
+            WarmTargetStatus {
+                id: "state:https://warm".to_string(),
+                category: "state".to_string(),
+                provider: None,
+                label: "Warm RPC".to_string(),
+                target: "https://warm".to_string(),
+                active: true,
+                last_attempt_at_ms: Some(10),
+                status: WarmTargetHealth::Healthy,
+                last_success_at_ms: Some(10),
+                last_rate_limited_at_ms: None,
+                last_rate_limit_message: None,
+                last_error: None,
+                consecutive_failures: 0,
+            },
+        );
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(idle_ms),
+            continuous_active: true,
+            warm_targets,
+            ..WarmControlState::default()
+        });
+
+        let payload = warm_state_payload(&state, 0);
+        assert_eq!(payload.get("active").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            payload.get("lastSuspendAtMs").and_then(Value::as_u64),
+            Some((now_ms.saturating_sub(idle_ms).saturating_add(idle_timeout_ms)) as u64)
+        );
+        let state_targets = payload
+            .get("stateTargets")
+            .and_then(Value::as_array)
+            .expect("stateTargets array");
+        assert_eq!(
+            state_targets[0].get("active").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn warm_state_payload_includes_per_target_telemetry() {
+        let mut warm_targets = HashMap::new();
+        warm_targets.insert(
+            "state:https://warm".to_string(),
+            WarmTargetStatus {
+                id: "state:https://warm".to_string(),
+                category: "state".to_string(),
+                provider: None,
+                label: "Warm RPC".to_string(),
+                target: "https://warm".to_string(),
+                active: true,
+                last_attempt_at_ms: Some(10),
+                status: WarmTargetHealth::Healthy,
+                last_success_at_ms: Some(10),
+                last_rate_limited_at_ms: None,
+                last_rate_limit_message: None,
+                last_error: None,
+                consecutive_failures: 0,
+            },
+        );
+        warm_targets.insert(
+            "endpoint:standard-rpc:https://send".to_string(),
+            WarmTargetStatus {
+                id: "endpoint:standard-rpc:https://send".to_string(),
+                category: "endpoint".to_string(),
+                provider: Some("standard-rpc".to_string()),
+                label: "Standard RPC".to_string(),
+                target: "https://send".to_string(),
+                active: true,
+                last_attempt_at_ms: Some(20),
+                status: WarmTargetHealth::Error,
+                last_success_at_ms: None,
+                last_rate_limited_at_ms: None,
+                last_rate_limit_message: None,
+                last_error: Some("timeout".to_string()),
+                consecutive_failures: 2,
+            },
+        );
+        let state = test_state(WarmControlState {
+            warm_targets,
+            ..WarmControlState::default()
+        });
+
+        let payload = warm_state_payload(&state, 0);
+        let state_targets = payload
+            .get("stateTargets")
+            .and_then(Value::as_array)
+            .expect("stateTargets array");
+        let endpoint_targets = payload
+            .get("endpointTargets")
+            .and_then(Value::as_array)
+            .expect("endpointTargets array");
+
+        assert_eq!(state_targets.len(), 1);
+        assert_eq!(
+            state_targets[0].get("label").and_then(Value::as_str),
+            Some("Warm RPC")
+        );
+        assert_eq!(endpoint_targets.len(), 1);
+        assert_eq!(
+            endpoint_targets[0].get("provider").and_then(Value::as_str),
+            Some("standard-rpc")
+        );
+        assert_eq!(
+            endpoint_targets[0]
+                .get("lastError")
+                .and_then(Value::as_str),
+            Some("timeout")
+        );
+        assert_eq!(
+            endpoint_targets[0].get("status").and_then(Value::as_str),
+            Some("error")
+        );
+    }
+
+    #[test]
+    fn warm_target_telemetry_prunes_stale_entries_after_retention() {
+        let mut warm = WarmControlState::default();
+        apply_warm_target_attempts(
+            &mut warm,
+            &[build_warm_target_attempt(
+                "state",
+                None,
+                "Warm RPC",
+                "https://warm.example/rpc",
+                WarmAttemptResult::Success,
+            )],
+            1_000,
+        );
+        assert_eq!(warm.warm_targets.len(), 1);
+        let later_ms = 1_000 + WARM_TARGET_STALE_RETENTION_MS + 60_000;
+        apply_warm_target_attempts(&mut warm, &[], later_ms);
+        assert!(
+            warm.warm_targets.is_empty(),
+            "stale target should be removed after retention"
+        );
+    }
+
+    #[test]
+    fn warm_target_telemetry_marks_rate_limited_targets_as_degraded() {
+        let mut warm = WarmControlState::default();
+        apply_warm_target_attempts(
+            &mut warm,
+            &[build_warm_target_attempt(
+                "endpoint",
+                Some("jito-bundle"),
+                "Jito Bundle",
+                "frankfurt.mainnet.block-engine.jito.wtf",
+                WarmAttemptResult::RateLimited("rate limit exceeded".to_string()),
+            )],
+            5_000,
+        );
+        let payload = warm_state_payload(&test_state(warm), 0);
+        let endpoint_targets = payload
+            .get("endpointTargets")
+            .and_then(Value::as_array)
+            .expect("endpointTargets array");
+        assert_eq!(
+            endpoint_targets[0].get("status").and_then(Value::as_str),
+            Some("rate-limited")
+        );
+        assert_eq!(
+            endpoint_targets[0]
+                .get("lastRateLimitMessage")
+                .and_then(Value::as_str),
+            Some("rate limit exceeded")
+        );
+        assert_eq!(
+            endpoint_targets[0]
+                .get("lastRateLimitedAtMs")
+                .and_then(Value::as_u64),
+            Some(5_000)
+        );
+        assert_eq!(
+            endpoint_targets[0]
+                .get("lastSuccessAtMs")
+                .and_then(Value::as_u64),
+            Some(5_000)
+        );
+        assert!(endpoint_targets[0].get("lastError").is_none());
+    }
+
+    #[test]
+    fn helius_sender_ping_endpoint_rewrites_fast_path() {
+        assert_eq!(
+            helius_sender_ping_endpoint_url("http://fra-sender.helius-rpc.com/fast"),
+            "http://fra-sender.helius-rpc.com/ping"
+        );
+        assert_eq!(
+            helius_sender_ping_endpoint_url("https://sender.helius-rpc.com/fast"),
+            "https://sender.helius-rpc.com/ping"
+        );
+        assert_eq!(
+            helius_sender_ping_endpoint_url("http://ams-sender.helius-rpc.com/ping"),
+            "http://ams-sender.helius-rpc.com/ping"
         );
     }
 
@@ -5682,16 +7027,14 @@ async fn main() {
         auth_token: configured_auth_token(),
         runtime: Arc::new(RuntimeRegistry::new(configured_runtime_state_path())),
         warm: Arc::new(Mutex::new(WarmControlState {
-            selected_providers: configured_active_warm_providers(),
+            selected_routes: configured_active_warm_routes(),
             current_reason: "idle-awaiting-browser-activity".to_string(),
             ..WarmControlState::default()
         })),
     });
-    spawn_fee_market_snapshot_refresh_task(rpc_url.clone());
-    spawn_blockhash_refresh_task(rpc_url.clone(), "processed");
-    spawn_blockhash_refresh_task(rpc_url.clone(), "confirmed");
+    spawn_fee_market_snapshot_refresh_task(state.clone(), rpc_url.clone());
+    spawn_engine_blockhash_refresh_task(state.clone(), rpc_url, "confirmed");
     spawn_continuous_warm_task(state.clone());
-    spawn_blockhash_refresh_task(rpc_url, "finalized");
     let restored_workers = restore_workers(&state.runtime).await;
     let app = Router::new()
         .route("/health", get(health))

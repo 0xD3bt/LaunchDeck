@@ -45,7 +45,7 @@ This mode is best treated as a latency tool, not the default choice. Operators s
 
 How it works:
 
-- same-time buys are sent alongside the launch flow
+- same-time sniper buys are sent alongside the launch flow
 - Bonk `usd1` same-time sniper buys compile as atomic swap-and-buy transactions
 - if a buy lands before the creation transaction, it fails
 - same-time literally sends the launch path and selected buys at the same time
@@ -73,12 +73,12 @@ How it works:
 - the daemon watches launch-relative block progress
 - the action fires when the configured confirmed-block target is observed
 - because it waits for observed launch state, it is safer than `Same Time` when your priority is execution safety rather than raw speed
-- the current config surface supports a wider range than the older docs; use the current UI limits instead of the stale `0-5` value from older text
+- the exact allowed block-offset range is enforced by the current UI and backend validation
 
 ### Additional Sniper Behavior
 
 - each sniper row is wallet-specific
-- same-time buys can optionally retry once through the daemon
+- same-time sniper buys can optionally retry once through the daemon
 - Bagsapp same-time sniper compilation happens after launch submission because the trade route needs the live mint
 - if you are unsure which trigger to use, benchmark your own end-to-end latency and start with `On Confirmed Block`
 - for buy-side timing, `On Confirmed Block` is the most conservative currently shipped option; confirmation-gated execution exists on supported sell-side follow actions instead

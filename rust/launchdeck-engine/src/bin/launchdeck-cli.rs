@@ -4,6 +4,8 @@ mod bags_native;
 mod bonk_native;
 #[path = "../config.rs"]
 mod config;
+#[path = "../endpoint_profile.rs"]
+mod endpoint_profile;
 #[path = "../fs_utils.rs"]
 mod fs_utils;
 #[path = "../helper_worker.rs"]

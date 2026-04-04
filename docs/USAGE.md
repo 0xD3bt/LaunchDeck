@@ -8,7 +8,7 @@ Make sure you have:
 
 - configured `SOLANA_RPC_URL`
 - configured `SOLANA_WS_URL`
-- set `USER_REGION` to your nearest region so region-aware providers can fan out across that region's endpoints instead of relying on one pinned host
+- set `USER_REGION` to your nearest regional group or explicit metro list so region-aware providers can fan out across that selected endpoint set instead of relying on one pinned host
 - imported at least one wallet through `SOLANA_PRIVATE_KEY*`
 - started LaunchDeck with `npm start`
 
@@ -140,7 +140,7 @@ This is separate from snipers:
 
 ## Snipers
 
-The sniper UI lets you configure snipe buys per wallet.
+The sniper UI lets you configure sniper buys per wallet.
 
 Each sniper row can control:
 

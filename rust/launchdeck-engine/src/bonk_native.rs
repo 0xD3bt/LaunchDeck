@@ -151,6 +151,10 @@ struct HelperUsd1QuoteMetrics {
     #[serde(default)]
     routeSetupFetchMs: u64,
     #[serde(default)]
+    superAltLocalSnapshotHits: u64,
+    #[serde(default)]
+    superAltRpcRefreshes: u64,
+    #[serde(default)]
     expansionQuoteCalls: u64,
     #[serde(default)]
     binarySearchQuoteCalls: u64,
@@ -278,11 +282,13 @@ fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<St
         && metrics.routeSetupLocalHits == 0
         && metrics.routeSetupCacheHits == 0
         && metrics.routeSetupCacheMisses == 0
+        && metrics.superAltLocalSnapshotHits == 0
+        && metrics.superAltRpcRefreshes == 0
     {
         return None;
     }
     Some(format!(
-        "USD1 quote metrics: calls={} total={}ms avg={:.1}ms quote-cache-hits={} route-setup(local/ttl/miss)={}/{}/{} route-setup-fetch={}ms search(expansion/binary/buffer iters)={}/{}/{}/{}",
+        "USD1 quote metrics: calls={} total={}ms avg={:.1}ms quote-cache-hits={} route-setup(local/ttl/miss)={}/{}/{} route-setup-fetch={}ms super-alt(local/rpc-refresh)={}/{} search(expansion/binary/buffer iters)={}/{}/{}/{}",
         metrics.quoteCalls,
         metrics.quoteTotalMs,
         metrics.averageQuoteMs,
@@ -291,6 +297,8 @@ fn render_usd1_quote_metrics_note(metrics: &HelperUsd1QuoteMetrics) -> Option<St
         metrics.routeSetupCacheHits,
         metrics.routeSetupCacheMisses,
         metrics.routeSetupFetchMs,
+        metrics.superAltLocalSnapshotHits,
+        metrics.superAltRpcRefreshes,
         metrics.expansionQuoteCalls,
         metrics.binarySearchQuoteCalls,
         metrics.bufferQuoteCalls,

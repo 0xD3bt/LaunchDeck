@@ -1,7 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use futures_util::{SinkExt, StreamExt, future::join_all, stream::FuturesUnordered};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_sdk::transaction::VersionedTransaction;
@@ -265,6 +265,7 @@ fn cache_blockhash(
 }
 
 async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
+    crate::observability::record_outbound_provider_http_request();
     let response = shared_http_client()
         .post(rpc_url)
         .json(&json!({
@@ -395,6 +396,15 @@ pub async fn fetch_latest_blockhash_cached(
         last_valid_block_height,
     );
     Ok((blockhash, last_valid_block_height))
+}
+
+pub async fn refresh_latest_blockhash_cache(
+    rpc_url: &str,
+    commitment: &str,
+) -> Result<(), String> {
+    let (blockhash, last_valid_block_height) = fetch_latest_blockhash(rpc_url, commitment).await?;
+    cache_blockhash(rpc_url, commitment, blockhash, last_valid_block_height);
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -2233,10 +2243,100 @@ async fn jito_request(endpoint: &str, method: &str, params: Value) -> Result<Val
     Ok(payload.get("result").cloned().unwrap_or(Value::Null))
 }
 
-pub async fn prewarm_jito_bundle_endpoint(endpoint: &JitoBundleEndpoint) -> Result<(), String> {
-    jito_request(&endpoint.status, "getTipAccounts", json!([]))
+fn jito_tip_accounts_endpoint(endpoint: &JitoBundleEndpoint) -> String {
+    fn derive_base(url: &str) -> Option<String> {
+        let trimmed = url.trim().trim_end_matches('/');
+        for suffix in ["/api/v1/bundles", "/api/v1/getBundleStatuses"] {
+            if let Some(prefix) = trimmed.strip_suffix(suffix) {
+                return Some(prefix.to_string());
+            }
+        }
+        None
+    }
+
+    let base = derive_base(&endpoint.send)
+        .or_else(|| derive_base(&endpoint.status))
+        .unwrap_or_else(|| endpoint.send.trim().trim_end_matches('/').to_string());
+    format!("{base}/api/v1/getTipAccounts")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JitoWarmResult {
+    Warmed,
+    RateLimited(String),
+}
+
+fn jito_error_message_from_body(body: &str, fallback: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn jito_error_is_rate_limited(status: StatusCode, body: &str) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("rate limit") || lower.contains("rate-limited")
+}
+
+pub async fn prewarm_jito_bundle_endpoint(
+    endpoint: &JitoBundleEndpoint,
+) -> Result<JitoWarmResult, String> {
+    let tip_accounts_endpoint = jito_tip_accounts_endpoint(endpoint);
+    let response = shared_http_client()
+        .post(&tip_accounts_endpoint)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTipAccounts",
+            "params": [],
+        }))
+        .send()
         .await
-        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if jito_error_is_rate_limited(status, &body) {
+        return Ok(JitoWarmResult::RateLimited(jito_error_message_from_body(
+            &body,
+            "Jito endpoint is reachable but rate-limited.",
+        )));
+    }
+    if !status.is_success() {
+        return Err(jito_error_message_from_body(
+            &body,
+            &format!("Jito bundle request failed with status {}.", status),
+        ));
+    }
+    let payload: Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if let Some(error) = payload.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Jito request failed.")
+            .to_string();
+        if jito_error_is_rate_limited(status, &message) {
+            return Ok(JitoWarmResult::RateLimited(message));
+        }
+        return Err(message);
+    }
+    Ok(JitoWarmResult::Warmed)
 }
 
 pub async fn send_transactions_bundle(
@@ -2495,7 +2595,12 @@ pub async fn confirm_submitted_transactions_for_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        routing::post,
+    };
     use serde_json::json;
     use std::{net::SocketAddr, sync::Arc};
     use tokio::sync::Mutex;
@@ -2665,6 +2770,64 @@ mod tests {
             axum::serve(listener, app).await.expect("serve sender app");
         });
         addr
+    }
+
+    async fn start_jito_rate_limited_server(message: &'static str) -> SocketAddr {
+        async fn handler(State(message): State<&'static str>) -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "message": message }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/api/v1/getTipAccounts", post(handler))
+            .with_state(message);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind jito rate-limited listener");
+        let addr = listener.local_addr().expect("read local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve jito rate-limited app");
+        });
+        addr
+    }
+
+    #[test]
+    fn jito_tip_accounts_endpoint_uses_documented_path() {
+        let endpoint = JitoBundleEndpoint {
+            name: "frankfurt.mainnet.block-engine.jito.wtf".to_string(),
+            send: "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles".to_string(),
+            status:
+                "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses"
+                    .to_string(),
+        };
+        assert_eq!(
+            jito_tip_accounts_endpoint(&endpoint),
+            "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/getTipAccounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn jito_prewarm_classifies_rate_limited_endpoint_as_reachable() {
+        let addr = start_jito_rate_limited_server("rate limit exceeded").await;
+        let endpoint = JitoBundleEndpoint {
+            name: "local-jito".to_string(),
+            send: format!("http://{addr}/api/v1/bundles"),
+            status: format!("http://{addr}/api/v1/getBundleStatuses"),
+        };
+        assert_eq!(
+            prewarm_jito_bundle_endpoint(&endpoint)
+                .await
+                .expect("rate-limited warm should not hard fail"),
+            JitoWarmResult::RateLimited("rate limit exceeded".to_string())
+        );
     }
 
     #[tokio::test]

@@ -4396,9 +4396,7 @@ async fn main() {
     }
     spawn_watch_endpoint_health_monitor(state.clone());
     spawn_wallet_precheck_monitor(state.clone());
-    spawn_blockhash_refresh_task(state.rpc_url.clone(), "processed");
     spawn_blockhash_refresh_task(state.rpc_url.clone(), "confirmed");
-    spawn_blockhash_refresh_task(state.rpc_url.clone(), "finalized");
     let _ = state
         .store
         .update_supervision(

@@ -2,6 +2,8 @@
 
 This page documents the launchpads exposed in LaunchDeck and separates the supported paths from the experimental ones.
 
+Treat this page as the most explicit public support matrix for launchpad behavior. Other pages such as `README.md` and `ARCHITECTURE.md` summarize the same surface more briefly.
+
 ## Support Summary
 
 ### Supported
@@ -11,7 +13,7 @@ This page documents the launchpads exposed in LaunchDeck and separates the suppo
 
 ### Experimental
 
-- `bagsapp`
+- `bagsapp` when Bags credentials are configured
 
 If you want the most predictable path, start with Pump or Bonk before trying Bagsapp.
 
@@ -21,13 +23,18 @@ Status: `supported`
 
 Pump is the most native launch path in LaunchDeck today.
 
-Supported modes:
+Supported Pump coverage:
 
 - `regular`
 - `cashback`
 - `agent-custom`
 - `agent-unlocked`
 - `agent-locked`
+- immediate dev buy
+- same-time sniper buys
+- delayed sniper buys
+- snipe sells
+- automatic dev sell
 
 Current Pump characteristics:
 
@@ -102,7 +109,7 @@ Supported Bonk coverage:
 - quote asset `usd1`
 - immediate dev buy
 - same-time sniper buys
-- snipe buys
+- delayed sniper buys
 - snipe sells
 - automatic dev sell
 
@@ -114,7 +121,7 @@ Current Bonk characteristics:
 - `bonkers` routes through the Bonkers path on Raydium LaunchLab
 - `usd1` uses a pinned Raydium `SOL -> USD1` route pool for top-up behavior when the wallet needs USD1 before buying
 - `usd1` same-time sniper buys are assembled as atomic swap-and-buy transactions
-- same-time buys use launch-first safeguards so the buy path does not outrun the creation path
+- same-time sniper buys use launch-first safeguards so the buy path does not outrun the creation path
 - immediate dev buy on `usd1` attempts atomic launch-plus-buy assembly and can fall back to split transactions if the combined message is too large
 
 ### Bonk Restrictions
@@ -127,7 +134,7 @@ Current Bonk characteristics:
 
 ## Bagsapp
 
-Status: `experimental`
+Status: `experimental` (`configured-required` until Bags credentials are present; `unverified` once enabled)
 
 Bagsapp is available when Bags credentials are configured, but it is still experimental in this repo.
 
@@ -141,7 +148,7 @@ Current Bags behavior includes:
 - linked identity when the selected LaunchDeck wallet belongs to the authenticated Bags account
 - immediate dev buy
 - same-time sniper buys
-- snipe buys
+- delayed sniper buys
 - snipe sells
 - automatic dev sell
 - LaunchDeck fee-split UI mapped into Bags fee-claimer rows
@@ -166,4 +173,4 @@ Choose `pump` if you want the most native LaunchDeck path.
 
 Choose `bonk` if you want the supported Bonk and Bonkers path, including `usd1` and follow automation.
 
-Choose `bagsapp` only if you are comfortable using an experimental path.
+Choose `bagsapp` only if you are comfortable using an experimental path and have Bags credentials configured.

@@ -9,10 +9,11 @@ use std::{env, fs};
 
 const PRESET_IDS: [&str; 3] = ["preset1", "preset2", "preset3"];
 const DEFAULT_PROVIDER: &str = "helius-sender";
-const DEFAULT_CREATION_TIP_SOL: &str = "0.01";
-const DEFAULT_TRADE_PRIORITY_FEE_SOL: &str = "0.009";
-const DEFAULT_TRADE_TIP_SOL: &str = "0.01";
-const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "90";
+const DEFAULT_CREATION_PRIORITY_FEE_SOL: &str = "0.000001";
+const DEFAULT_CREATION_TIP_SOL: &str = "0.0002";
+const DEFAULT_TRADE_PRIORITY_FEE_SOL: &str = "0.000001";
+const DEFAULT_TRADE_TIP_SOL: &str = "0.0002";
+const DEFAULT_TRADE_SLIPPAGE_PERCENT: &str = "20";
 const DEFAULT_DEV_BUY_AMOUNTS: [&str; 3] = ["0.5", "1", "2"];
 
 fn configured_track_send_block_height_env_enabled() -> bool {
@@ -108,7 +109,7 @@ fn creation_settings(
     json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
         "tipSol": normalize_decimal_string(tip_sol, DEFAULT_CREATION_TIP_SOL),
-        "priorityFeeSol": normalize_decimal_string(priority_fee_sol, "0.001"),
+        "priorityFeeSol": normalize_decimal_string(priority_fee_sol, DEFAULT_CREATION_PRIORITY_FEE_SOL),
         "autoFee": auto_fee,
         "maxFeeSol": max_fee_sol.trim(),
         "devBuySol": normalize_decimal_string(dev_buy_sol, ""),
@@ -699,6 +700,31 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn default_persistent_config_uses_safe_sender_baseline() {
+        let config = create_default_persistent_config();
+        let presets = config["presets"]["items"]
+            .as_array()
+            .expect("preset items array");
+        assert_eq!(presets.len(), 3);
+        for preset in presets {
+            assert_eq!(preset["creationSettings"]["provider"], "helius-sender");
+            assert_eq!(preset["creationSettings"]["priorityFeeSol"], "0.000001");
+            assert_eq!(preset["creationSettings"]["tipSol"], "0.0002");
+            assert_eq!(preset["creationSettings"]["autoFee"], false);
+            assert_eq!(preset["buySettings"]["provider"], "helius-sender");
+            assert_eq!(preset["buySettings"]["priorityFeeSol"], "0.000001");
+            assert_eq!(preset["buySettings"]["tipSol"], "0.0002");
+            assert_eq!(preset["buySettings"]["slippagePercent"], "20");
+            assert_eq!(preset["buySettings"]["autoFee"], false);
+            assert_eq!(preset["sellSettings"]["provider"], "helius-sender");
+            assert_eq!(preset["sellSettings"]["priorityFeeSol"], "0.000001");
+            assert_eq!(preset["sellSettings"]["tipSol"], "0.0002");
+            assert_eq!(preset["sellSettings"]["slippagePercent"], "20");
+            assert_eq!(preset["sellSettings"]["autoFee"], false);
+        }
+    }
+
+    #[test]
     fn normalizes_new_shape_and_strips_legacy_policy_and_endpoint_profile_fields() {
         let normalized = normalize_persistent_config(json!({
             "defaults": {
@@ -729,7 +755,7 @@ mod tests {
                     },
                     "sellSettings": {
                         "provider": "helius-sender",
-                        "endpointProfile": "west",
+                        "endpointProfile": "fra",
                         "policy": "fast",
                         "priorityFeeSol": "0.01",
                         "tipSol": "0.02",
@@ -783,7 +809,7 @@ mod tests {
                     "label": "P1",
                     "execution": {
                         "provider": "jito-bundle",
-                        "endpointProfile": "west",
+                        "endpointProfile": "ams",
                         "policy": "fast"
                     }
                 }]

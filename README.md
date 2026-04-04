@@ -30,6 +30,7 @@ Why this is the current recommended stack:
 
 - `LAUNCHDECK_WARM_RPC_URL` offloads startup warmup and block-height observation away from your main execution RPC
 - Shyft is a good fit for that warm path because you can use a free API key there
+- startup and keep-warm also hit each Helius Sender host’s HTTP `/ping` (derived from `/fast`) and report per-target status in the UI runtime indicator
 - Helius dev tier gives a very noticeable improvement in watcher performance and live execution quality versus a bare-minimum free setup
 
 If you have Helius dev tier and your websocket endpoint supports it, also enable:
@@ -84,7 +85,7 @@ Verified and Rust-native for:
 - `agent-locked`
 - immediate dev buy
 - same-time sniper buys
-- snipe buys
+- delayed sniper buys
 - snipe sells
 - automatic dev sell
 
@@ -99,7 +100,7 @@ Verified for:
 - quote assets `sol` and `usd1`
 - immediate dev buy
 - same-time sniper buys
-- snipe buys
+- delayed sniper buys
 - snipe sells
 - automatic dev sell
 
@@ -122,7 +123,7 @@ Available behavior today includes:
 - linked Bags identity when the selected LaunchDeck wallet belongs to the authenticated Bags account
 - immediate dev buy
 - same-time sniper buys
-- snipe buy and snipe sell execution
+- delayed sniper buys and snipe sells
 - automatic dev sell
 
 See `docs/LAUNCHPADS.md` for the exact support matrix and restrictions.
@@ -146,7 +147,7 @@ Most operators only need to set:
 - `SOLANA_WS_URL`
 - `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height observation off your main RPC
 - `SOLANA_PRIVATE_KEY` or `SOLANA_PRIVATE_KEY*`
-- `USER_REGION` for region-aware providers; this is usually better than pinning one specific sender or bundle endpoint because LaunchDeck can fan out across the endpoints in that region
+- `USER_REGION` for region-aware providers; use a regional group such as `us`, `eu`, or `asia`, or explicit metros such as `fra`, `ams`, or `slc` (comma-separated metros are also supported). This is usually better than pinning one specific sender or bundle endpoint because LaunchDeck can fan out across the selected route set.
 
 Optional but common:
 
@@ -217,7 +218,7 @@ Important rules:
 - `Standard RPC` always submits with `skipPreflight=true` and `maxRetries=0`
 - `Standard RPC` can fan out to `SOLANA_RPC_URL` plus optional extra submit endpoints from `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
 - `Jito Bundle` uses bundle submission and status polling
-- private relay integrations such as `bloxroute`, `astralane`, and `hello moon` are planned next
+- legacy provider names such as `auto`, `helius`, `jito`, `astralane`, `bloxroute`, and `hellomoon` are migrated for compatibility when old saved configs are loaded, but they are not live provider IDs in the current runtime
 
 The UI collects intent, but the engine is the final source of truth for what gets applied to each transaction.
 
