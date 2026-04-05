@@ -632,7 +632,7 @@
             </div>
           </div>
           <div id="meta" class="meta muted"></div>
-          <pre id="output" class="console">Ready.</pre>
+          <pre id="output" class="console"></pre>
         </div>
         </section>
 
@@ -647,9 +647,16 @@
             <div class="reports-terminal-button-group">
               <button id="reports-transactions-button" type="button" class="preset-chip compact reports-terminal-chip active">Transactions</button>
               <button id="reports-launches-button" type="button" class="preset-chip compact reports-terminal-chip">Launches</button>
-              <button id="reports-active-jobs-button" type="button" class="preset-chip compact reports-terminal-chip">Active Jobs</button>
+              <button id="reports-active-jobs-button" type="button" class="preset-chip compact reports-terminal-chip">Jobs</button>
+              <button id="reports-active-logs-button" type="button" class="preset-chip compact reports-terminal-chip">Logs</button>
             </div>
-            <button id="reports-refresh-button" type="button" class="preset-chip compact reports-terminal-chip">Refresh</button>
+            <button
+              id="reports-refresh-button"
+              type="button"
+              class="preset-chip compact reports-terminal-chip reports-terminal-chip-icon icon-chip-button"
+              title="Refresh dashboard"
+              aria-label="Refresh dashboard"
+            >&#8635;</button>
           </div>
         </div>
         <div class="reports-terminal-body">
@@ -698,13 +705,24 @@
                   </div>
                   <span class="settings-section-pill">Creation</span>
                   </div>
-                  <div class="settings-grid settings-grid-four settings-route-grid">
+                  <div class="settings-route-stack">
+                  <div class="settings-grid settings-route-grid settings-grid-creation-compact">
                   <label>
                     <span>Route</span>
                     <select name="creationProvider" id="provider-select">
                       <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="hellomoon">Hello Moon QUIC</option>
                       <option value="standard-rpc">Standard RPC</option>
                       <option value="jito-bundle">Jito Bundle</option>
+                    </select>
+                  </label>
+                  <label class="settings-mev-mode-field settings-mev-mode-field-compact">
+                    <span>MEV</span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <select name="creationMevMode" id="creation-mev-mode-select">
+                      <option value="off" selected>Off</option>
+                      <option value="reduced">Reduced</option>
+                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
                     </select>
                   </label>
                   <label class="settings-fee-field">
@@ -723,17 +741,16 @@
                     </span>
                     <div class="field-error" data-error-for="creationTipSol"></div>
                   </label>
-                  <div class="settings-route-meta">
-                    <input name="creationAutoFeeEnabled" id="creation-auto-fee-input" type="checkbox" hidden>
-                    <button type="button" id="creation-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, LaunchDeck fetches fresh priority and Jito tip estimates for this row based on the selected route. Manual priority and tip inputs are ignored until Auto Fee is turned off. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
-                    <label class="settings-auto-fee-cap settings-fee-field">
-                      <span>Max Fee</span>
-                      <span class="settings-fee-input-wrap">
-                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                        <input name="creationMaxFeeSol" id="creation-max-fee-input" type="text" placeholder="recommended">
-                      </span>
-                      <div class="field-error" data-error-for="creationMaxFeeSol"></div>
-                    </label>
+                  <input name="creationAutoFeeEnabled" id="creation-auto-fee-input" type="checkbox" hidden>
+                  <button type="button" id="creation-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, LaunchDeck fetches fresh priority and Jito tip estimates for this row based on the selected route. Manual priority and tip inputs are ignored until Auto Fee is turned off. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <label class="settings-auto-fee-cap settings-fee-field">
+                    <span>Max Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="creationMaxFeeSol" id="creation-max-fee-input" type="text" placeholder="recommended">
+                    </span>
+                    <div class="field-error" data-error-for="creationMaxFeeSol"></div>
+                  </label>
                   </div>
                   </div>
                 </section>
@@ -746,14 +763,30 @@
                   </div>
                   <span class="settings-section-pill">Buy</span>
                   </div>
-                  <div class="settings-grid settings-grid-five settings-route-grid">
+                  <div class="settings-route-stack">
+                  <div class="settings-grid settings-route-grid settings-grid-trade-compact">
                   <label>
                     <span>Route</span>
                     <select name="buyProvider" id="buy-provider-select">
                       <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="hellomoon">Hello Moon QUIC</option>
                       <option value="standard-rpc">Standard RPC</option>
                       <option value="jito-bundle">Jito Bundle</option>
                     </select>
+                  </label>
+                  <label class="settings-mev-mode-field settings-mev-mode-field-compact">
+                    <span>MEV</span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <select name="buyMevMode" id="buy-mev-mode-select">
+                      <option value="off" selected>Off</option>
+                      <option value="reduced">Reduced</option>
+                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Slippage (%)</span>
+                    <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
+                    <div class="field-error" data-error-for="buySlippagePercent"></div>
                   </label>
                   <label class="settings-fee-field">
                     <span>Priority Fee</span>
@@ -771,25 +804,20 @@
                     </span>
                     <div class="field-error" data-error-for="buyTipSol"></div>
                   </label>
-                  <label>
-                    <span>Slippage (%)</span>
-                    <input name="buySlippagePercent" id="buy-slippage-input" type="text" placeholder="90">
-                    <div class="field-error" data-error-for="buySlippagePercent"></div>
+                  <input name="buyAutoFeeEnabled" id="buy-auto-fee-input" type="checkbox" hidden>
+                  <button type="button" id="buy-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, buy-side fees use fresh provider-aware estimates. For standard RPC this means auto priority fee. For Helius Sender and Jito it also resolves a tip when that path supports one. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <label class="settings-auto-fee-cap settings-fee-field">
+                    <span>Max Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="buyMaxFeeSol" id="buy-max-fee-input" type="text" placeholder="recommended">
+                    </span>
+                    <div class="field-error" data-error-for="buyMaxFeeSol"></div>
                   </label>
-                  <div class="settings-route-meta">
-                    <input name="buyAutoFeeEnabled" id="buy-auto-fee-input" type="checkbox" hidden>
-                    <button type="button" id="buy-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, buy-side fees use fresh provider-aware estimates. For standard RPC this means auto priority fee. For Helius Sender and Jito it also resolves a tip when that path supports one. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
-                    <label class="settings-auto-fee-cap settings-fee-field">
-                      <span>Max Fee</span>
-                      <span class="settings-fee-input-wrap">
-                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                        <input name="buyMaxFeeSol" id="buy-max-fee-input" type="text" placeholder="recommended">
-                      </span>
-                      <div class="field-error" data-error-for="buyMaxFeeSol"></div>
-                    </label>
                   </div>
-                  </div>
+                  <div id="buy-hellomoon-mev-warning" class="modal-warning settings-provider-warning" hidden></div>
                   <div id="buy-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
+                  </div>
                 </section>
 
                 <section class="settings-row-group">
@@ -800,14 +828,30 @@
                   </div>
                   <span class="settings-section-pill">Sell</span>
                   </div>
-                  <div class="settings-grid settings-grid-five settings-route-grid">
+                  <div class="settings-route-stack">
+                  <div class="settings-grid settings-route-grid settings-grid-trade-compact">
                   <label>
                     <span>Route</span>
                     <select name="sellProvider" id="sell-provider-select">
                       <option value="helius-sender" selected>Helius Sender</option>
+                      <option value="hellomoon">Hello Moon QUIC</option>
                       <option value="standard-rpc">Standard RPC</option>
                       <option value="jito-bundle">Jito Bundle</option>
                     </select>
+                  </label>
+                  <label class="settings-mev-mode-field settings-mev-mode-field-compact">
+                    <span>MEV</span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <select name="sellMevMode" id="sell-mev-mode-select">
+                      <option value="off" selected>Off</option>
+                      <option value="reduced">Reduced</option>
+                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Slippage (%)</span>
+                    <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
+                    <div class="field-error" data-error-for="sellSlippagePercent"></div>
                   </label>
                   <label class="settings-fee-field">
                     <span>Priority Fee</span>
@@ -825,25 +869,20 @@
                     </span>
                     <div class="field-error" data-error-for="sellTipSol"></div>
                   </label>
-                  <label>
-                    <span>Slippage (%)</span>
-                    <input name="sellSlippagePercent" id="sell-slippage-input" type="text" placeholder="90">
-                    <div class="field-error" data-error-for="sellSlippagePercent"></div>
+                  <input name="sellAutoFeeEnabled" id="sell-auto-fee-input" type="checkbox" hidden>
+                  <button type="button" id="sell-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, sell-side fees are resolved from live fee market data for the selected route. This keeps snipe sells and dev auto-sells aligned with current conditions without editing the manual fee boxes. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <label class="settings-auto-fee-cap settings-fee-field">
+                    <span>Max Fee</span>
+                    <span class="settings-fee-input-wrap">
+                      <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
+                      <input name="sellMaxFeeSol" id="sell-max-fee-input" type="text" placeholder="recommended">
+                    </span>
+                    <div class="field-error" data-error-for="sellMaxFeeSol"></div>
                   </label>
-                  <div class="settings-route-meta">
-                    <input name="sellAutoFeeEnabled" id="sell-auto-fee-input" type="checkbox" hidden>
-                    <button type="button" id="sell-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, sell-side fees are resolved from live fee market data for the selected route. This keeps snipe sells and dev auto-sells aligned with current conditions without editing the manual fee boxes. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
-                    <label class="settings-auto-fee-cap settings-fee-field">
-                      <span>Max Fee</span>
-                      <span class="settings-fee-input-wrap">
-                        <span class="settings-input-prefix" aria-hidden="true"><img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo"></span>
-                        <input name="sellMaxFeeSol" id="sell-max-fee-input" type="text" placeholder="recommended">
-                      </span>
-                      <div class="field-error" data-error-for="sellMaxFeeSol"></div>
-                    </label>
                   </div>
-                  </div>
+                  <div id="sell-hellomoon-mev-warning" class="modal-warning settings-provider-warning" hidden></div>
                   <div id="sell-standard-rpc-warning" class="modal-warning settings-provider-warning" hidden></div>
+                  </div>
                 </section>
               </div>
             </section>

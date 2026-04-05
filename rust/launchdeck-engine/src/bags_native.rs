@@ -163,6 +163,8 @@ struct HelperTxConfig<'a> {
     computeUnitPriceMicroLamports: u64,
     tipLamports: u64,
     tipAccount: &'a str,
+    jitodontfront: bool,
+    singleBundleTipLastTx: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -395,13 +397,23 @@ fn helper_tx_config(
     compute_unit_price_micro_lamports: u64,
     tip_lamports: u64,
     tip_account: &str,
+    jitodontfront: bool,
+    single_bundle_tip_last_tx: bool,
 ) -> HelperTxConfig<'_> {
     HelperTxConfig {
-        computeUnitLimit: compute_unit_limit.unwrap_or_else(configured_default_launch_compute_unit_limit),
+        computeUnitLimit: compute_unit_limit
+            .unwrap_or_else(configured_default_launch_compute_unit_limit),
         computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
         tipLamports: tip_lamports,
         tipAccount: tip_account,
+        jitodontfront,
+        singleBundleTipLastTx: single_bundle_tip_last_tx,
     }
+}
+
+fn uses_single_bundle_tip_last_tx(provider: &str, mev_mode: &str) -> bool {
+    provider.trim().eq_ignore_ascii_case("hellomoon")
+        && mev_mode.trim().eq_ignore_ascii_case("secure")
 }
 
 fn bags_setup_jito_tip_cap_lamports() -> u64 {
@@ -461,6 +473,23 @@ fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, Str
 fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
     let percent = parse_decimal_u64(slippage_percent, 2, "slippage percent")?;
     Ok(percent.min(10_000))
+}
+
+fn follow_tip_lamports_for_provider(provider: &str, tip_sol: &str, label: &str) -> Result<u64, String> {
+    let tip_lamports = parse_decimal_u64(tip_sol, 9, label)?;
+    if provider.trim().eq_ignore_ascii_case("hellomoon") {
+        if tip_sol.trim().is_empty() {
+            return Err(format!(
+                "{label} cannot be empty when using Hello Moon for follow / snipe / auto-sell."
+            ));
+        }
+        if tip_lamports < 1_000_000 {
+            return Err(format!(
+                "{label} must be at least 0.001 SOL when using Hello Moon for follow / snipe / auto-sell."
+            ));
+        }
+    }
+    Ok(tip_lamports)
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
@@ -644,6 +673,8 @@ pub async fn try_compile_native_bags(
                 .unwrap_or_default(),
             fee_estimate.setupJitoTipLamports,
             &config.tx.jitoTipAccount,
+            config.execution.jitodontfront,
+            uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode),
         ),
         "mode": config.mode,
         "imageLocalPath": config.imageLocalPath,
@@ -758,6 +789,8 @@ pub async fn prepare_native_bags_send(
                 .unwrap_or_default(),
             fee_estimate.setupJitoTipLamports,
             &config.tx.jitoTipAccount,
+            config.execution.jitodontfront,
+            uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode),
         ),
         "mode": config.mode,
         "imageLocalPath": config.imageLocalPath,
@@ -898,6 +931,8 @@ pub async fn compile_launch_transaction(
                 .unwrap_or_default(),
             tip_lamports,
             &config.tx.jitoTipAccount,
+            config.execution.jitodontfront,
+            uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode),
         ),
         "metadataUri": metadata_uri,
         "mint": mint,
@@ -940,8 +975,14 @@ pub async fn compile_follow_buy_transaction(
         "txConfig": helper_tx_config(
             Some(configured_default_sniper_buy_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
-            parse_decimal_u64(&execution.buyTipSol, 9, "buy tip")?,
+            follow_tip_lamports_for_provider(
+                &execution.buyProvider,
+                &execution.buyTipSol,
+                "buy tip",
+            )?,
             jito_tip_account,
+            execution.buyJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.buyProvider, &execution.buyMevMode),
         ),
     }))
     .await?;
@@ -996,8 +1037,14 @@ pub async fn compile_follow_sell_transaction(
         "txConfig": helper_tx_config(
             Some(configured_default_dev_auto_sell_compute_unit_limit()),
             priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
-            parse_decimal_u64(&execution.sellTipSol, 9, "sell tip")?,
+            follow_tip_lamports_for_provider(
+                &execution.sellProvider,
+                &execution.sellTipSol,
+                "sell tip",
+            )?,
             jito_tip_account,
+            execution.sellJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.sellProvider, &execution.sellMevMode),
         ),
     }))
     .await?;

@@ -182,13 +182,13 @@ Operational meaning:
 
 For the best current setup:
 
-- use Helius for `SOLANA_RPC_URL`
-- use Helius for `SOLANA_WS_URL`
+- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
+- use Helius standard websocket for `SOLANA_WS_URL`
 - use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `helius-sender` as the provider
 - enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and LaunchDeck is watching through a Helius websocket endpoint
 
-Helius dev tier is strongly recommended here because it gives a major improvement in realtime watcher quality and follow execution behavior compared with a bare-minimum setup.
+Helius dev tier is strongly recommended here because it gives a major improvement in realtime watcher quality and follow execution behavior compared with a bare-minimum setup, especially if you run multiple snipes or watcher-heavy follow automation.
 
 The daemon now persists both watcher health and watcher mode so reports and follow-job state show whether a market-cap action used the enhanced Helius path or the standard websocket fallback.
 

@@ -22,13 +22,30 @@ Optional but common:
 
 Current recommended operator stack:
 
-- use Helius for `SOLANA_RPC_URL`
-- use the matching Helius websocket for `SOLANA_WS_URL`
+- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
+- use Helius standard websocket for `SOLANA_WS_URL`
 - use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- use `helius-sender` as the creation, buy, and sell provider
+- use `helius-sender` or `hellomoon` as the creation, buy, and sell provider
 - if you have Helius dev tier and websocket support for it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
 
-LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recommended if you want materially better watcher behavior, lower-latency execution, and a better overall operator experience.
+LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recommended if you want materially better watcher behavior, lower-latency execution, and a better overall operator experience. If you plan to run multiple snipes, delayed follow actions, or watcher-heavy automation, lower Helius tiers are more likely to rate-limit you.
+
+Hello Moon note:
+
+- `hellomoon` is a recommended alternate low-latency provider path
+- it requires a Lunar Lander API key from Hello Moon
+- request access through the [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) or the [Hello Moon Discord](https://discord.com/invite/HelloMoon)
+
+Recommended `.env` shape:
+
+```bash
+SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
+LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true
+```
+
+Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
 
 ## Environment Variable Categories
 
@@ -38,10 +55,17 @@ LaunchDeck can run on a lower-cost setup, but Helius dev tier is strongly recomm
   Main RPC used for reads, confirmations, and general runtime behavior.
 - `SOLANA_WS_URL`
   Websocket endpoint used by realtime watchers. This matters for follow actions, sniper timing, and daemon health.
+- recommended default pairing:
+  - `SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
+  - `SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY`
+- put your Helius key immediately after `api-key=`
 - `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
   Optional comma-separated extra submit endpoints used only for `standard-rpc` send fanout. `SOLANA_RPC_URL` remains the primary read/confirm RPC; these extra endpoints are used only to fan out the same signed payload in parallel on the optimized standard-RPC transport path. We suggest setting your shyft rpc in this slot.
 - `LAUNCHDECK_WARM_RPC_URL`
   Optional alternate RPC used for startup warmup and block-height observation. Leave it blank to reuse `SOLANA_RPC_URL`.
+- recommended default:
+  - `LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY`
+- put your Shyft key immediately after `api_key=`
 - `USER_REGION`
   Default region for providers that support endpoint profiles. Use a regional group (`global`, `us`, `eu`, `asia`) or pin Helius Sender metros: `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`. You can comma-separate metros (e.g. `fra,ams`). `ny` is accepted and normalized to `ewr` (Newark / Jito `ny.`). The old `west` aggregate is removed; use `us`, `eu`, or explicit metros instead.
 
@@ -52,9 +76,10 @@ Recommended practice:
 - set `USER_REGION` to your nearest regional group or explicit metro list instead of pinning one sender or bundle endpoint
 - profile and metro fanout are usually faster and more reliable because LaunchDeck can send across the selected endpoint set instead of depending on a single host
 - use provider-specific region overrides only when one provider needs a different region than your shared default
-- for most operators, use Helius for both `SOLANA_RPC_URL` and `SOLANA_WS_URL` because it is currently the fastest and best-supported overall setup in LaunchDeck
+- for most operators, use Helius Gatekeeper HTTP (`https://beta.helius-rpc.com/?api-key=...`) for `SOLANA_RPC_URL`
+- use Helius standard websocket (`wss://mainnet.helius-rpc.com/?api-key=...`) for `SOLANA_WS_URL` so LaunchDeck can use Helius `transactionSubscribe` watchers when enabled
 - for `LAUNCHDECK_WARM_RPC_URL`, a separate [Shyft](https://shyft.to/) RPC with a free API key is a good default so startup warm and block-height reads do not consume your main execution RPC budget
-- if you care about maximum performance, Helius dev tier is strongly recommended rather than treating the free tier as your long-term production setup
+- if you care about maximum performance, or plan to run multiple snipes / follow actions, Helius dev tier is strongly recommended rather than treating the free tier as your long-term production setup
 
 If you omit `SOLANA_WS_URL`, LaunchDeck cannot do its best realtime follow behavior.
 
@@ -66,7 +91,7 @@ Standard RPC transport note:
 - this path currently forces `skipPreflight=true` and `maxRetries=0`
 
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE`
-  Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers whenever the current follow job is using a Helius websocket watch endpoint. Recommended only for Helius dev-tier users; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
+  Enables the enhanced Helius `transactionSubscribe` path for slot, signature, and market watchers whenever the current follow job is using a Helius websocket watch endpoint. Recommended when `SOLANA_WS_URL` points at Helius standard websocket and your Helius plan supports `transactionSubscribe`; otherwise leave it `false` and LaunchDeck will stay on the standard websocket watcher path.
 
 Watch endpoint vs execution provider:
 
@@ -136,7 +161,7 @@ How these settings fit together:
 - `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` controls whether send/confirm block-height snapshots are captured by default
 - `LAUNCHDECK_TRACK_SEND_BLOCK_HEIGHT` should effectively stay off in `off`, stay off by default in `light`, and may be enabled in `full` when deeper diagnostics are wanted
 - `LAUNCHDECK_WARM_RPC_URL` is used for startup warm, continuous keep-warm probes, and block-height observation so those reads can be separated from your main execution RPC
-- for most operators, the best practical split is Helius for `SOLANA_RPC_URL` and `SOLANA_WS_URL`, plus Shyft for `LAUNCHDECK_WARM_RPC_URL`
+- for most operators, the best practical split is Helius Gatekeeper HTTP for `SOLANA_RPC_URL`, Helius standard websocket for `SOLANA_WS_URL`, plus Shyft for `LAUNCHDECK_WARM_RPC_URL`
 - follow `targetBlockOffset > 0` actions now use a post-confirmation shared offset worker rather than the old always-active shared follow block-height polling path
 - `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS` controls the real `getBlockHeight` polling cadence for that offset worker
 - `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER` is an env-only low-request alternative that trades accuracy for fewer RPC reads
@@ -171,7 +196,7 @@ How these settings fit together:
 
 Practical note:
 
-- the current recommended auto-fee default is `veryHigh` plus `p99`, then cap cost in the UI with a max auto-fee value if needed
+- the current recommended auto-fee default is `high` plus `p99`, then cap cost in the UI with a max auto-fee value if needed
 - current shipped compute-unit defaults are `340000` launch, `180000` agent setup, `175000` follow-up, `120000` sniper buy, `145000` automatic dev sell, and `90000` Bonk `usd1` top-up
 - helper worker mode keeps one Node helper process alive for repeated Bonk/Bags requests
 - if a helper worker transport call fails or times out, LaunchDeck falls back to restarting the helper and retrying instead of permanently requiring worker mode
@@ -246,12 +271,18 @@ Default paths:
 
 - `USER_REGION_HELIUS_SENDER`
   Provider-specific override for Helius Sender region.
+- `USER_REGION_HELLOMOON`
+  Provider-specific override for Hello Moon QUIC region.
 - `USER_REGION_JITO_BUNDLE`
   Provider-specific override for Jito Bundle region.
 - `HELIUS_SENDER_ENDPOINT`
   Explicit Sender endpoint override.
 - `HELIUS_SENDER_BASE_URL`
   Alternate Sender base URL.
+- `HELLOMOON_QUIC_ENDPOINT`
+  Explicit Hello Moon QUIC endpoint override (`host:port`).
+- `HELLOMOON_MEV_PROTECT`
+  Enables Hello Moon QUIC MEV protection on the connection.
 - `JITO_BUNDLE_BASE_URLS`
   Comma-separated Jito bundle base URLs.
 - `JITO_SEND_BUNDLE_ENDPOINT`
@@ -290,7 +321,11 @@ Behavior:
 - `HELLOMOON_API_KEY`
 - `HELLOMOON_RPC_URL`
 
-Only Bagsapp is part of the current operator-facing UI flow here. The other variables exist for surrounding integration paths and compatibility.
+`HELLOMOON_API_KEY` enables the shipped Hello Moon QUIC execution provider. `HELLOMOON_RPC_URL` remains a compatibility variable for generic RPC usage, but the recommended Hello Moon setup in LaunchDeck is:
+
+- Hello Moon QUIC for execution
+- Shyft for `SOLANA_RPC_URL` or `LAUNCHDECK_WARM_RPC_URL` if you want a low-friction confirmation / warm split
+- optional `HELLOMOON_MEV_PROTECT=true` when you want Hello Moon's connection-level MEV filtering
 
 ## Persisted UI Configuration
 

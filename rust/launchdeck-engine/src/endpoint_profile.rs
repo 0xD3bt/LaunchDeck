@@ -36,8 +36,8 @@ fn canonicalize_comma_metro_list(s: &str) -> Result<String, String> {
                     .to_string(),
             );
         }
-        let metro = metro_token_canonical(&part)
-            .ok_or_else(|| format!("unknown metro token '{part}'"))?;
+        let metro =
+            metro_token_canonical(&part).ok_or_else(|| format!("unknown metro token '{part}'"))?;
         if seen.insert(metro) {
             out.push(metro.to_string());
         }

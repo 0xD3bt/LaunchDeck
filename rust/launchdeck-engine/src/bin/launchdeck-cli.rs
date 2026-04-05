@@ -1,3 +1,5 @@
+#[path = "../app_logs.rs"]
+mod app_logs;
 #[path = "../bags_native.rs"]
 mod bags_native;
 #[path = "../bonk_native.rs"]
@@ -18,6 +20,8 @@ mod observability;
 mod paths;
 #[path = "../providers.rs"]
 mod providers;
+#[path = "../provider_tip.rs"]
+mod provider_tip;
 #[path = "../pump_native.rs"]
 mod pump_native;
 #[path = "../report.rs"]

@@ -42,6 +42,15 @@ pub fn provider_registry() -> Vec<ProviderMeta> {
             supportsEndpointProfiles: true,
         },
         ProviderMeta {
+            id: "hellomoon",
+            label: "Hello Moon QUIC",
+            verified: true,
+            supportsSingle: true,
+            supportsSequential: true,
+            supportsBundle: true,
+            supportsEndpointProfiles: true,
+        },
+        ProviderMeta {
             id: "jito-bundle",
             label: "Jito Bundle",
             verified: true,
@@ -66,19 +75,32 @@ pub fn provider_availability_registry() -> BTreeMap<String, ProviderAvailability
     let solana_rpc_configured = env::var("SOLANA_RPC_URL")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
+    let hellomoon_api_key_configured = env::var("HELLOMOON_API_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
     provider_registry()
         .into_iter()
         .map(|provider| {
-            let reason = if provider.id == "helius-sender" && !solana_rpc_configured {
-                "Using the default Helius Sender endpoint with the localhost RPC fallback; set SOLANA_RPC_URL for a dedicated confirmation RPC.".to_string()
-            } else {
-                String::new()
+            let (available, reason) = match provider.id {
+                "helius-sender" if !solana_rpc_configured => (
+                    true,
+                    "Using the default Helius Sender endpoint with the localhost RPC fallback; set SOLANA_RPC_URL for a dedicated confirmation RPC.".to_string(),
+                ),
+                "hellomoon" if !hellomoon_api_key_configured => (
+                    false,
+                    "Set HELLOMOON_API_KEY to enable Hello Moon QUIC submission.".to_string(),
+                ),
+                "hellomoon" if !solana_rpc_configured => (
+                    true,
+                    "Hello Moon QUIC is configured, but SOLANA_RPC_URL is still recommended for confirmations; Shyft is a good pairing here.".to_string(),
+                ),
+                _ => (true, String::new()),
             };
             (
                 provider.id.to_string(),
                 ProviderAvailability {
                     provider: provider.id.to_string(),
-                    available: true,
+                    available,
                     verified: provider.verified,
                     supportState: if provider.verified {
                         "verified".to_string()

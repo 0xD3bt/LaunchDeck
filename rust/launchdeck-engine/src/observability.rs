@@ -113,10 +113,8 @@ fn record_outbound_provider_http_request_metered() {
 }
 
 use crate::{
-    fs_utils::atomic_write,
-    paths,
-    reports_browser::record_persisted_report_payload,
-    transport::TransportPlan,
+    app_logs::record_info, fs_utils::atomic_write, paths,
+    reports_browser::record_persisted_report_payload, transport::TransportPlan,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +140,14 @@ pub fn log_event(event: &str, trace_id: &str, payload: Value) {
         "traceId": trace_id,
         "payload": payload,
     });
+    record_info(
+        "engine.trace",
+        event.to_string(),
+        Some(json!({
+            "traceId": trace_id,
+            "payload": line.get("payload").cloned().unwrap_or(Value::Null),
+        })),
+    );
     println!("{line}");
 }
 
@@ -287,6 +293,12 @@ mod tests {
             skipPreflight: true,
             maxRetries: 0,
             standardRpcSubmitEndpoints: vec![],
+            helloMoonApiKeyConfigured: false,
+            helloMoonMevProtect: false,
+            helloMoonQuicEndpoint: None,
+            helloMoonQuicEndpoints: vec![],
+            helloMoonBundleEndpoint: None,
+            helloMoonBundleEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -338,6 +350,12 @@ mod tests {
             skipPreflight: true,
             maxRetries: 0,
             standardRpcSubmitEndpoints: vec![],
+            helloMoonApiKeyConfigured: false,
+            helloMoonMevProtect: false,
+            helloMoonQuicEndpoint: None,
+            helloMoonQuicEndpoints: vec![],
+            helloMoonBundleEndpoint: None,
+            helloMoonBundleEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -396,6 +414,12 @@ mod tests {
             skipPreflight: true,
             maxRetries: 0,
             standardRpcSubmitEndpoints: vec![],
+            helloMoonApiKeyConfigured: false,
+            helloMoonMevProtect: false,
+            helloMoonQuicEndpoint: None,
+            helloMoonQuicEndpoints: vec![],
+            helloMoonBundleEndpoint: None,
+            helloMoonBundleEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -455,6 +479,12 @@ mod tests {
             skipPreflight: true,
             maxRetries: 0,
             standardRpcSubmitEndpoints: vec![],
+            helloMoonApiKeyConfigured: false,
+            helloMoonMevProtect: false,
+            helloMoonQuicEndpoint: None,
+            helloMoonQuicEndpoints: vec![],
+            helloMoonBundleEndpoint: None,
+            helloMoonBundleEndpoints: vec![],
             heliusSenderEndpoint: Some("https://sender.helius-rpc.com/fast".to_string()),
             heliusSenderEndpoints: vec!["https://sender.helius-rpc.com/fast".to_string()],
             watchEndpoint: Some("wss://mainnet.helius-rpc.com/?api-key=test".to_string()),
@@ -478,9 +508,11 @@ mod tests {
             .and_then(|value| value.to_str())
             .expect("file name");
         let cached_after = list_persisted_reports("newest");
-        assert!(cached_after.iter().any(|entry| {
-            entry.fileName == file_name && entry.mint == "mint-cache-test"
-        }));
+        assert!(
+            cached_after
+                .iter()
+                .any(|entry| { entry.fileName == file_name && entry.mint == "mint-cache-test" })
+        );
 
         unsafe {
             std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");

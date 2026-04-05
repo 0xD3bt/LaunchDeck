@@ -1,6 +1,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use crate::{
+    app_logs::{record_error, record_info},
     config::{NormalizedExecution, NormalizedFollowLaunch},
     fs_utils::{atomic_write, quarantine_corrupt_file},
     report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
@@ -718,7 +719,11 @@ impl FollowDaemonStore {
                 || existing.followLaunch.snipes.len() != request.followLaunch.snipes.len()
                 || existing.followLaunch.devAutoSell.is_some()
                     != request.followLaunch.devAutoSell.is_some()
-                || existing.deferredSetup.as_ref().map(|value| value.transactions.len()).unwrap_or(0)
+                || existing
+                    .deferredSetup
+                    .as_ref()
+                    .map(|value| value.transactions.len())
+                    .unwrap_or(0)
                     != request.deferredSetupTransactions.len()
             {
                 return Err(format!(
@@ -1045,7 +1050,9 @@ impl FollowDaemonStore {
     pub async fn recover_jobs_for_restart(&self) -> Result<Vec<FollowJobRecord>, String> {
         let mut state = self.inner.write().await;
         let now = now_ms();
-        state.jobs.retain(|job| !should_prune_job_on_restart(job, now));
+        state
+            .jobs
+            .retain(|job| !should_prune_job_on_restart(job, now));
         let mut recovered = Vec::new();
         for job in &mut state.jobs {
             if matches!(job.state, FollowJobState::Running) {
@@ -1174,25 +1181,84 @@ impl FollowDaemonClient {
     {
         let url = format!("{}/{}", self.baseUrl, path.trim_start_matches('/'));
         let mut request = self.client.request(method, url);
+        let method_name = request
+            .try_clone()
+            .map(|request| {
+                request
+                    .build()
+                    .map(|built| built.method().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         if let Some(token) = &self.authToken {
             request = request.header("x-launchdeck-engine-auth", token);
         }
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().await.map_err(|error| error.to_string())?;
+        let response = request.send().await.map_err(|error| {
+            let message = error.to_string();
+            record_error(
+                "follow-client",
+                format!("Follow daemon request failed: {}", path),
+                Some(serde_json::json!({
+                    "baseUrl": self.baseUrl,
+                    "path": path,
+                    "method": method_name,
+                    "message": message,
+                })),
+            );
+            message
+        })?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(format!(
+            let message = format!(
                 "Follow daemon request failed with status {}: {}",
                 status, body
-            ));
+            );
+            record_error(
+                "follow-client",
+                format!("Follow daemon request rejected: {}", path),
+                Some(serde_json::json!({
+                    "baseUrl": self.baseUrl,
+                    "path": path,
+                    "method": method_name,
+                    "status": status.as_u16(),
+                    "body": body,
+                })),
+            );
+            return Err(message);
         }
-        response
-            .json::<TResponse>()
-            .await
-            .map_err(|error| error.to_string())
+        let parsed = response.json::<TResponse>().await.map_err(|error| {
+            let message = error.to_string();
+            record_error(
+                "follow-client",
+                format!("Follow daemon response decode failed: {}", path),
+                Some(serde_json::json!({
+                    "baseUrl": self.baseUrl,
+                    "path": path,
+                    "method": method_name,
+                    "message": message,
+                })),
+            );
+            message
+        })?;
+        if matches!(
+            path,
+            "/jobs/reserve" | "/jobs/arm" | "/jobs/cancel" | "/jobs/stop-all"
+        ) {
+            record_info(
+                "follow-client",
+                format!("Follow daemon request succeeded: {}", path),
+                Some(serde_json::json!({
+                    "baseUrl": self.baseUrl,
+                    "path": path,
+                    "method": method_name,
+                })),
+            );
+        }
+        Ok(parsed)
     }
 
     pub async fn health(&self) -> Result<FollowDaemonHealth, String> {

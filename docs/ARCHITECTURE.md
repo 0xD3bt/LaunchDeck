@@ -135,6 +135,7 @@ LaunchDeck uses explicit provider choices rather than hidden provider fallback.
 Current providers:
 
 - `helius-sender`
+- `hellomoon`
 - `standard-rpc`
 - `jito-bundle`
 
@@ -159,6 +160,7 @@ Examples:
 
 - `standard-rpc` ignores tip
 - `helius-sender` hard-fails if Sender requirements are not satisfied
+- `hellomoon` hard-fails if QUIC requirements are not satisfied
 - `jito-bundle` may drop creation priority in some multi-transaction launch flows
 
 ## Engine-Owned Decisions

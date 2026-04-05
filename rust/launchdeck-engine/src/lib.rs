@@ -1,8 +1,10 @@
 #![allow(non_snake_case, dead_code)]
 
+pub mod app_logs;
 pub mod bags_native;
 pub mod bonk_native;
 pub mod config;
+pub mod crypto;
 pub mod endpoint_profile;
 pub mod follow;
 pub mod fs_utils;
@@ -13,6 +15,7 @@ pub mod launchpads;
 pub mod observability;
 pub mod paths;
 pub mod providers;
+pub mod provider_tip;
 pub mod pump_native;
 pub mod report;
 pub mod reports_browser;

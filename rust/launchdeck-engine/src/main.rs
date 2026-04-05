@@ -1,6 +1,8 @@
+mod app_logs;
 mod bags_native;
 mod bonk_native;
 mod config;
+mod crypto;
 mod endpoint_profile;
 mod follow;
 mod fs_utils;
@@ -11,6 +13,7 @@ mod launchpads;
 mod observability;
 mod paths;
 mod providers;
+mod provider_tip;
 mod pump_native;
 mod report;
 mod reports_browser;
@@ -24,16 +27,20 @@ mod vamp;
 mod wallet;
 
 use crate::{
+    app_logs::{list_error_logs, list_live_logs, record_error, record_info, record_warn},
     bags_native::{
         PreparedBagsSendArtifacts, compile_launch_transaction as compile_bags_launch_transaction,
         prepare_native_bags_send, summarize_transactions as summarize_bags_transactions,
+    },
+    bonk_native::{
+        derive_canonical_pool_id as derive_bonk_canonical_pool_id,
+        predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount, warm_bonk_state,
     },
     config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
         FollowJobResponse, FollowReserveRequest, FollowStopAllRequest, build_action_records,
-        should_use_post_setup_creator_vault_for_buy,
-        should_use_post_setup_creator_vault_for_sell,
+        should_use_post_setup_creator_vault_for_buy, should_use_post_setup_creator_vault_for_sell,
     },
     fs_utils::atomic_write,
     image_library::{
@@ -45,17 +52,15 @@ use crate::{
     },
     launchpads::launchpad_registry,
     observability::{
-        clear_outbound_provider_http_traffic, log_event, new_trace_context,
-        persist_launch_report, record_outbound_provider_http_request, rpc_traffic_snapshot,
+        clear_outbound_provider_http_traffic, log_event, new_trace_context, persist_launch_report,
+        record_outbound_provider_http_request, rpc_traffic_snapshot,
         update_persisted_launch_report,
     },
     providers::{provider_availability_registry, provider_registry},
-    bonk_native::{
-        derive_canonical_pool_id as derive_bonk_canonical_pool_id,
-        predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount,
-        warm_bonk_state,
+    provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports},
+    pump_native::{
+        predict_dev_buy_token_amount, warm_default_lookup_tables, warm_pump_global_state,
     },
-    pump_native::{predict_dev_buy_token_amount, warm_default_lookup_tables, warm_pump_global_state},
     report::{
         BenchmarkMode, ExecutionTimings, FollowJobTimings, LaunchReport,
         build_benchmark_timing_groups, build_report, configured_benchmark_mode, render_report,
@@ -63,11 +68,11 @@ use crate::{
     },
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
     rpc::{
-        CompiledTransaction, confirm_submitted_transactions_for_transport,
-        confirm_transactions_with_websocket_fallback, configured_warm_rpc_url,
-        fetch_current_block_height, refresh_latest_blockhash_cache, JitoWarmResult,
-        send_transactions_bundle, simulate_transactions, prewarm_jito_bundle_endpoint,
-        prewarm_rpc_endpoint, submit_independent_transactions_for_transport,
+        CompiledTransaction, JitoWarmResult, configured_warm_rpc_url,
+        confirm_submitted_transactions_for_transport, confirm_transactions_with_websocket_fallback,
+        fetch_current_block_height, prewarm_hellomoon_quic_endpoint, prewarm_jito_bundle_endpoint,
+        prewarm_rpc_endpoint, refresh_latest_blockhash_cache, send_transactions_bundle,
+        simulate_transactions, submit_independent_transactions_for_transport,
         submit_transactions_for_transport, submit_transactions_sequential,
     },
     runtime::{
@@ -77,12 +82,13 @@ use crate::{
     strategies::strategy_registry,
     transport::{
         build_transport_plan, configured_helius_sender_endpoint,
-        configured_helius_sender_endpoints_for_profile, configured_jito_bundle_endpoints,
+        configured_helius_sender_endpoints_for_profile, configured_hellomoon_mev_protect,
+        configured_hellomoon_quic_endpoints_for_profile, configured_jito_bundle_endpoints,
         configured_jito_bundle_endpoints_for_profile, configured_provider_region,
-        configured_shared_region,
-        configured_standard_rpc_submit_endpoints, default_endpoint_profile,
-        default_endpoint_profile_for_provider, estimate_transaction_count,
-        helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
+        configured_shared_region, configured_standard_rpc_submit_endpoints,
+        default_endpoint_profile, default_endpoint_profile_for_provider,
+        estimate_transaction_count, helius_sender_endpoint_override_active,
+        jito_bundle_endpoint_override_active, resolved_helius_priority_fee_rpc_url,
     },
     ui_bridge::{build_raw_config_from_form, quote_from_form, upload_metadata_from_form},
     ui_config::{
@@ -220,7 +226,10 @@ struct WarmInFlightGuard {
 
 impl Drop for WarmInFlightGuard {
     fn drop(&mut self) {
-        let mut warm = self.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut warm = self
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         warm.in_flight_requests = warm.in_flight_requests.saturating_sub(1);
     }
 }
@@ -287,6 +296,9 @@ fn apply_warm_target_attempts(
                 last_error: None,
                 consecutive_failures: 0,
             });
+        let previous_status = entry.status.clone();
+        let previous_error = entry.last_error.clone();
+        let previous_rate_limit_message = entry.last_rate_limit_message.clone();
         entry.category = attempt.category.clone();
         entry.provider = attempt.provider.clone();
         entry.label = attempt.label.clone();
@@ -301,6 +313,18 @@ fn apply_warm_target_attempts(
                 entry.last_rate_limit_message = None;
                 entry.last_error = None;
                 entry.consecutive_failures = 0;
+                if previous_status != WarmTargetHealth::Healthy {
+                    record_info(
+                        "warm",
+                        format!("{} warm target recovered", entry.label),
+                        Some(json!({
+                            "provider": entry.provider,
+                            "target": entry.target,
+                            "category": entry.category,
+                            "status": "healthy",
+                        })),
+                    );
+                }
             }
             WarmAttemptResult::RateLimited(message) => {
                 entry.status = WarmTargetHealth::RateLimited;
@@ -309,6 +333,21 @@ fn apply_warm_target_attempts(
                 entry.last_rate_limit_message = Some(message.clone());
                 entry.last_error = None;
                 entry.consecutive_failures = 0;
+                if previous_status != WarmTargetHealth::RateLimited
+                    || previous_rate_limit_message.as_deref() != Some(message.as_str())
+                {
+                    record_warn(
+                        "warm",
+                        format!("{} warm target rate-limited", entry.label),
+                        Some(json!({
+                            "provider": entry.provider,
+                            "target": entry.target,
+                            "category": entry.category,
+                            "status": "rate-limited",
+                            "message": message,
+                        })),
+                    );
+                }
             }
             WarmAttemptResult::Error(error) => {
                 entry.status = WarmTargetHealth::Error;
@@ -316,6 +355,22 @@ fn apply_warm_target_attempts(
                 entry.last_rate_limit_message = None;
                 entry.last_error = Some(error.clone());
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                if previous_status != WarmTargetHealth::Error
+                    || previous_error.as_deref() != Some(error.as_str())
+                {
+                    record_error(
+                        "warm",
+                        format!("{} warm target failed", entry.label),
+                        Some(json!({
+                            "provider": entry.provider,
+                            "target": entry.target,
+                            "category": entry.category,
+                            "status": "error",
+                            "message": error,
+                            "consecutiveFailures": entry.consecutive_failures,
+                        })),
+                    );
+                }
             }
         }
     }
@@ -525,6 +580,12 @@ struct ReportsQuery {
 }
 
 #[derive(Deserialize, Default)]
+struct LogsQuery {
+    view: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
 struct ReportViewQuery {
     id: Option<String>,
 }
@@ -698,7 +759,7 @@ fn push_unique_string(values: &mut Vec<String>, candidate: &str) {
 fn normalize_warm_provider(provider: &str) -> Option<String> {
     let normalized = provider.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "helius-sender" | "standard-rpc" | "jito-bundle" => Some(normalized),
+        "helius-sender" | "hellomoon" | "standard-rpc" | "jito-bundle" => Some(normalized),
         _ => None,
     }
 }
@@ -752,7 +813,8 @@ fn configured_active_warm_routes() -> Vec<WarmRouteSelection> {
         .and_then(|value| value.get("items"))
         .and_then(Value::as_array)
         .and_then(|items| {
-            items.iter()
+            items
+                .iter()
                 .find(|item| item.get("id").and_then(Value::as_str) == Some(active_preset_id))
                 .or_else(|| items.first())
         });
@@ -832,17 +894,23 @@ fn primary_standard_rpc_warm_endpoint(main_rpc_url: &str) -> String {
 
 fn warm_succeeded_recently(warm: &WarmControlState, now_ms: u128) -> bool {
     warm.last_error.is_none()
-        && warm.last_warm_success_at_ms.is_some_and(|last_success_at_ms| {
-            now_ms.saturating_sub(last_success_at_ms) <= u128::from(RECENT_WARM_SUCCESS_REUSE_MS)
-        })
+        && warm
+            .last_warm_success_at_ms
+            .is_some_and(|last_success_at_ms| {
+                now_ms.saturating_sub(last_success_at_ms)
+                    <= u128::from(RECENT_WARM_SUCCESS_REUSE_MS)
+            })
 }
 
 fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>) -> bool {
     let now = current_time_ms();
-    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let route_matches_current = routes.is_empty() || routes == warm.selected_routes;
-    let should_trigger_immediate_rewarm =
-        !warm_gate_state(&warm, now, 0).0 && !(route_matches_current && warm_succeeded_recently(&warm, now));
+    let should_trigger_immediate_rewarm = !warm_gate_state(&warm, now, 0).0
+        && !(route_matches_current && warm_succeeded_recently(&warm, now));
     warm.last_activity_at_ms = now;
     warm.browser_active = true;
     if should_trigger_immediate_rewarm {
@@ -859,7 +927,10 @@ fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>
 
 fn mark_in_flight_engine_request(state: &Arc<AppState>) -> WarmInFlightGuard {
     let now = current_time_ms();
-    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     warm.in_flight_requests = warm.in_flight_requests.saturating_add(1);
     warm.last_activity_at_ms = now;
     warm.browser_active = true;
@@ -883,7 +954,11 @@ fn warm_gate_state(
         return (true, true, "active-follow-jobs".to_string());
     }
     if !configured_idle_warm_suspend_enabled() {
-        return (true, warm.last_activity_at_ms > 0, "active-continuous-warm".to_string());
+        return (
+            true,
+            warm.last_activity_at_ms > 0,
+            "active-continuous-warm".to_string(),
+        );
     }
     if warm.last_activity_at_ms == 0 {
         return (false, false, "idle-awaiting-browser-activity".to_string());
@@ -914,20 +989,29 @@ fn background_request_gate_active(warm: &WarmControlState, now_ms: u128) -> bool
 
 fn engine_background_requests_active(state: &Arc<AppState>) -> bool {
     let now_ms = current_time_ms();
-    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     background_request_gate_active(&warm, now_ms)
 }
 
 fn idle_suspended_without_inflight(state: &Arc<AppState>, follow_active_jobs: u64) -> bool {
     let now_ms = current_time_ms();
-    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (active, _, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
     !active && reason == "suspended-idle" && warm.in_flight_requests == 0
 }
 
 fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
     let now_ms = current_time_ms();
-    let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (active, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
     let selected_routes = merged_warm_routes(&warm.selected_routes);
     let selected_providers = warm_route_providers(&selected_routes);
@@ -971,9 +1055,13 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     let follow_active_jobs = follow_active_jobs_count().await;
     let (routes, attempt_started_at_ms) = {
         let now_ms = current_time_ms();
-        let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let routes = merged_warm_routes(&warm.selected_routes);
-        let (should_warm, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
+        let (should_warm, browser_active, reason) =
+            warm_gate_state(&warm, now_ms, follow_active_jobs);
         if should_warm != warm.continuous_active {
             if should_warm {
                 warm.last_resume_at_ms = Some(now_ms);
@@ -1018,9 +1106,7 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
         },
     ));
 
-    let fee_market_result = fetch_fee_market_snapshot(&main_rpc_url)
-        .await
-        .map(|_| ());
+    let fee_market_result = fetch_fee_market_snapshot(&main_rpc_url).await.map(|_| ());
     match &fee_market_result {
         Ok(()) => success_count += 1,
         Err(error) => errors.push(format!("fee-market: {error}")),
@@ -1056,9 +1142,11 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     }
     if routes.iter().any(|route| route.provider == "helius-sender") {
         let mut seen = HashSet::new();
-        for route in routes.iter().filter(|route| route.provider == "helius-sender") {
-            for endpoint in
-                configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
+        for route in routes
+            .iter()
+            .filter(|route| route.provider == "helius-sender")
+        {
+            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
             {
                 if !seen.insert(endpoint.clone()) {
                     continue;
@@ -1081,9 +1169,39 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
             }
         }
     }
+    if routes.iter().any(|route| route.provider == "hellomoon") {
+        let mut seen = HashSet::new();
+        let mev_protect = configured_hellomoon_mev_protect();
+        for route in routes.iter().filter(|route| route.provider == "hellomoon") {
+            for endpoint in configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
+            {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let result = prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await;
+                match &result {
+                    Ok(()) => success_count += 1,
+                    Err(error) => errors.push(format!("hellomoon {}: {}", endpoint, error)),
+                }
+                attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("hellomoon"),
+                    "Hello Moon QUIC",
+                    endpoint,
+                    match result {
+                        Ok(()) => WarmAttemptResult::Success,
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
     if routes.iter().any(|route| route.provider == "jito-bundle") {
         let mut seen = HashSet::new();
-        for route in routes.iter().filter(|route| route.provider == "jito-bundle") {
+        for route in routes
+            .iter()
+            .filter(|route| route.provider == "jito-bundle")
+        {
             for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
                 if !seen.insert(endpoint.send.clone()) {
                     continue;
@@ -1093,9 +1211,7 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
                 match &result {
                     Ok(JitoWarmResult::Warmed) => success_count += 1,
                     Ok(JitoWarmResult::RateLimited(_)) => {}
-                    Err(error) => {
-                        errors.push(format!("jito-bundle {}: {}", endpoint.name, error))
-                    }
+                    Err(error) => errors.push(format!("jito-bundle {}: {}", endpoint.name, error)),
                 }
                 attempts.push(build_warm_target_attempt(
                     "endpoint",
@@ -1115,7 +1231,10 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     }
 
     let now_ms = current_time_ms();
-    let mut warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut warm = state
+        .warm
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     warm.warm_pass_in_flight = false;
     apply_warm_target_attempts(&mut warm, &attempts, attempt_started_at_ms);
     if success_count > 0 {
@@ -1130,8 +1249,10 @@ fn spawn_continuous_warm_task(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             execute_continuous_warm_pass(&state).await;
-            tokio::time::sleep(Duration::from_millis(configured_continuous_warm_interval_ms()))
-                .await;
+            tokio::time::sleep(Duration::from_millis(
+                configured_continuous_warm_interval_ms(),
+            ))
+            .await;
         }
     });
 }
@@ -1427,7 +1548,8 @@ fn refresh_report_benchmark(report: &mut Value) {
         report["benchmark"] = Value::Null;
         return;
     }
-    let timings = sanitize_execution_timings_for_mode(&parse_report_execution_timings(report), mode);
+    let timings =
+        sanitize_execution_timings_for_mode(&parse_report_execution_timings(report), mode);
     if let Some(execution) = report.get_mut("execution") {
         execution["timings"] = serde_json::to_value(&timings).unwrap_or_else(|_| json!({}));
     }
@@ -1458,7 +1580,8 @@ fn refresh_report_benchmark(report: &mut Value) {
             })
         })
         .collect::<Vec<_>>();
-    let timing_groups = build_benchmark_timing_groups(&timings, parse_follow_job_timings(report).as_ref());
+    let timing_groups =
+        build_benchmark_timing_groups(&timings, parse_follow_job_timings(report).as_ref());
     report["benchmark"] = json!({
         "mode": mode.as_str(),
         "timings": timings,
@@ -1527,7 +1650,10 @@ fn split_same_time_snipes(
         })
         .collect::<Vec<_>>();
     deferred.enabled = !deferred.snipes.is_empty()
-        || deferred.devAutoSell.as_ref().is_some_and(|sell| sell.enabled);
+        || deferred
+            .devAutoSell
+            .as_ref()
+            .is_some_and(|sell| sell.enabled);
     (same_time, deferred)
 }
 
@@ -1623,7 +1749,19 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
-const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "veryhigh";
+const HELLOMOON_TIP_ACCOUNTS: [&str; 10] = [
+    "moon17L6BgxXRX5uHKudAmqVF96xia9h8ygcmG2sL3F",
+    "moon26Sek222Md7ZydcAGxoKG832DK36CkLrS3PQY4c",
+    "moon7fwyajcVstMoBnVy7UBcTx87SBtNoGGAaH2Cb8V",
+    "moonBtH9HvLHjLqi9ivyrMVKgFUsSfrz9BwQ9khhn1u",
+    "moonCJg8476LNFLptX1qrK8PdRsA1HD1R6XWyu9MB93",
+    "moonF2sz7qwAtdETnrgxNbjonnhGGjd6r4W4UC9284s",
+    "moonKfftMiGSak3cezvhEqvkPSzwrmQxQHXuspC96yj",
+    "moonQBUKBpkifLcTd78bfxxt4PYLwmJ5admLW6cBBs8",
+    "moonXwpKwoVkMegt5Bc776cSW793X1irL5hHV1vJ3JA",
+    "moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C",
+];
+const DEFAULT_AUTO_FEE_HELIUS_PRIORITY_LEVEL: &str = "high";
 const DEFAULT_AUTO_FEE_JITO_TIP_PERCENTILE: &str = "p99";
 const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const DEFAULT_HELIUS_PRIORITY_REFRESH_INTERVAL_MS: u64 = 6_000;
@@ -1669,6 +1807,8 @@ struct AutoFeeActionReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct AutoFeeReport {
+    #[serde(rename = "jitoTipPercentile")]
+    jito_tip_percentile: String,
     snapshot: FeeMarketSnapshot,
     creation: AutoFeeActionReport,
     buy: AutoFeeActionReport,
@@ -1691,8 +1831,9 @@ fn action_priority_estimate(snapshot: &FeeMarketSnapshot, action: &str) -> (Opti
 }
 
 fn action_tip_estimate(snapshot: &FeeMarketSnapshot) -> (Option<u64>, String) {
+    let percentile = auto_fee_jito_tip_percentile();
     if let Some(value) = snapshot.jito_tip_p99_lamports {
-        (Some(value), "jito-p99".to_string())
+        (Some(value), format!("jito-{percentile}"))
     } else {
         (None, "missing".to_string())
     }
@@ -1709,8 +1850,13 @@ fn fee_market_cache() -> &'static Mutex<HashMap<String, CachedFeeMarketSnapshot>
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn fee_market_cache_key(rpc_url: &str, helius_priority_level: &str, jito_tip_percentile: &str) -> String {
-    format!("{rpc_url}|{helius_priority_level}|{jito_tip_percentile}")
+fn fee_market_cache_key(
+    primary_rpc_url: &str,
+    helius_priority_level: &str,
+    jito_tip_percentile: &str,
+) -> String {
+    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(primary_rpc_url);
+    format!("{primary_rpc_url}|{hel_priority_rpc}|{helius_priority_level}|{jito_tip_percentile}")
 }
 
 fn get_cached_fee_market_snapshot(
@@ -1837,16 +1983,26 @@ fn lamports_to_priority_fee_micro_lamports(priority_fee_lamports: u64) -> u64 {
     }
 }
 
-fn provider_required_tip_lamports(provider: &str) -> Option<u64> {
+fn provider_uses_auto_fee_priority(provider: &str, execution_class: &str, action: &str) -> bool {
     match provider.trim() {
-        "helius-sender" | "jito-bundle" => Some(200_000),
-        _ => None,
+        "standard-rpc" | "helius-sender" | "hellomoon" => true,
+        "jito-bundle" => action != "creation" || execution_class != "bundle",
+        _ => true,
     }
+}
+
+fn provider_uses_auto_fee_tip(provider: &str, action: &str) -> bool {
+    let _ = action;
+    matches!(
+        provider.trim(),
+        "helius-sender" | "hellomoon" | "jito-bundle"
+    )
 }
 
 fn pick_tip_account_for_provider(provider: &str) -> String {
     match provider.trim() {
         "helius-sender" => HELIUS_SENDER_TIP_ACCOUNTS[0].to_string(),
+        "hellomoon" => HELLOMOON_TIP_ACCOUNTS[0].to_string(),
         "jito-bundle" => JITO_TIP_ACCOUNTS[0].to_string(),
         _ => String::new(),
     }
@@ -1873,7 +2029,10 @@ fn normalize_estimate_to_lamports(value: Option<&Value>) -> Option<u64> {
     }
 }
 
-fn jito_tip_percentile_value<'a>(sample: &'a Value, jito_tip_percentile: &str) -> Option<&'a Value> {
+fn jito_tip_percentile_value<'a>(
+    sample: &'a Value,
+    jito_tip_percentile: &str,
+) -> Option<&'a Value> {
     match jito_tip_percentile {
         "p25" => sample
             .get("p25")
@@ -1904,10 +2063,9 @@ fn jito_tip_percentile_value<'a>(sample: &'a Value, jito_tip_percentile: &str) -
 }
 
 fn extract_jito_tip_floor_lamports(payload: &Value, jito_tip_percentile: &str) -> Option<u64> {
-    if let Some(value) = normalize_estimate_to_lamports(jito_tip_percentile_value(
-        payload,
-        jito_tip_percentile,
-    )) {
+    if let Some(value) =
+        normalize_estimate_to_lamports(jito_tip_percentile_value(payload, jito_tip_percentile))
+    {
         return Some(value);
     }
     if let Some(value) = payload
@@ -1925,13 +2083,11 @@ fn extract_jito_tip_floor_lamports(payload: &Value, jito_tip_percentile: &str) -
             return Some(value);
         }
     }
-    payload
-        .as_array()
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find_map(|entry| extract_jito_tip_floor_lamports(entry, jito_tip_percentile))
-        })
+    payload.as_array().and_then(|entries| {
+        entries
+            .iter()
+            .find_map(|entry| extract_jito_tip_floor_lamports(entry, jito_tip_percentile))
+    })
 }
 
 fn parse_auto_fee_cap_lamports(value: &str) -> Option<u64> {
@@ -1943,6 +2099,108 @@ fn cap_auto_fee_lamports(estimate_lamports: u64, cap_lamports: Option<u64>) -> u
         Some(cap) if cap > 0 => estimate_lamports.min(cap),
         _ => estimate_lamports,
     }
+}
+
+const AUTO_FEE_TOTAL_CAP_TIP_BPS: u64 = 7_000;
+const AUTO_FEE_TOTAL_CAP_BPS_DENOMINATOR: u64 = 10_000;
+
+fn resolve_auto_fee_components_with_total_cap(
+    priority_estimate: Option<u64>,
+    tip_estimate: Option<u64>,
+    cap_lamports: Option<u64>,
+    provider: &str,
+    action_label: &str,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let priority_estimate = priority_estimate.map(|value| value.max(1));
+    let has_priority = priority_estimate.is_some();
+    let has_tip = tip_estimate.is_some();
+    let minimum_tip_lamports = provider_required_tip_lamports(provider).unwrap_or(0);
+
+    if let Some(cap) = cap_lamports {
+        if has_priority && has_tip && minimum_tip_lamports > 0 && cap <= minimum_tip_lamports {
+            return Err(format!(
+                "{} max auto fee must be above the {} minimum tip of {} SOL.",
+                action_label,
+                provider,
+                provider_min_tip_sol_label(provider)
+            ));
+        }
+    }
+
+    let resolved_priority = match priority_estimate {
+        Some(estimate) if !has_tip => Some(cap_auto_fee_lamports(estimate, cap_lamports)),
+        Some(estimate) => Some(estimate),
+        None => None,
+    };
+
+    let resolved_tip = match tip_estimate {
+        Some(estimate) if !has_priority => Some(clamp_auto_fee_tip_to_provider_minimum(
+            cap_auto_fee_lamports(estimate, cap_lamports),
+            provider,
+            cap_lamports,
+            action_label,
+        )?),
+        Some(estimate) => Some(estimate.max(minimum_tip_lamports)),
+        None => None,
+    };
+
+    match (resolved_priority, resolved_tip, cap_lamports) {
+        (Some(priority), Some(tip), Some(cap)) => {
+            if u128::from(priority) + u128::from(tip) <= u128::from(cap) {
+                return Ok((Some(priority), Some(tip)));
+            }
+
+            let ratio_tip_budget =
+                cap.saturating_mul(AUTO_FEE_TOTAL_CAP_TIP_BPS) / AUTO_FEE_TOTAL_CAP_BPS_DENOMINATOR;
+            let target_tip_budget = ratio_tip_budget
+                .max(minimum_tip_lamports)
+                .min(cap.saturating_sub(1));
+            let target_priority_budget = cap.saturating_sub(target_tip_budget);
+
+            let mut resolved_priority = priority.min(target_priority_budget);
+            let mut resolved_tip = tip.min(target_tip_budget);
+            let remaining_budget = cap
+                .saturating_sub(resolved_priority)
+                .saturating_sub(resolved_tip);
+
+            if remaining_budget > 0 {
+                if resolved_tip < target_tip_budget {
+                    let extra_priority = (priority.saturating_sub(resolved_priority))
+                        .min(remaining_budget);
+                    resolved_priority = resolved_priority.saturating_add(extra_priority);
+                } else if resolved_priority < target_priority_budget {
+                    let extra_tip = (tip.saturating_sub(resolved_tip)).min(remaining_budget);
+                    resolved_tip = resolved_tip.saturating_add(extra_tip);
+                }
+            }
+
+            Ok((Some(resolved_priority), Some(resolved_tip)))
+        }
+        (priority, tip, _) => Ok((priority, tip)),
+    }
+}
+
+fn clamp_auto_fee_tip_to_provider_minimum(
+    resolved: u64,
+    provider: &str,
+    cap_lamports: Option<u64>,
+    action_label: &str,
+) -> Result<u64, String> {
+    let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider) else {
+        return Ok(resolved);
+    };
+    if resolved >= minimum_tip_lamports {
+        return Ok(resolved);
+    }
+    if cap_lamports.is_some() && cap_lamports.unwrap_or_default() < minimum_tip_lamports {
+        return Err(format!(
+            "{} max auto fee is below the {} minimum tip of {} SOL.",
+            action_label,
+            provider,
+            provider_min_tip_sol_label(provider)
+        ));
+    }
+    Ok(minimum_tip_lamports)
 }
 
 fn priority_price_micro_lamports_to_sol_equivalent(
@@ -1988,21 +2246,41 @@ fn helius_fee_estimate_options(helius_priority_level: &str) -> Value {
     }
 }
 
-fn parse_helius_priority_estimate_result(result: &Value, helius_priority_level: &str) -> Option<u64> {
+fn helius_priority_level_value<'a>(
+    result: &'a Value,
+    helius_priority_level: &str,
+) -> Option<&'a Value> {
+    let levels = result.get("priorityFeeLevels")?;
+    match helius_priority_level.trim().to_ascii_lowercase().as_str() {
+        "default" => levels
+            .get("medium")
+            .or_else(|| levels.get("Medium"))
+            .or_else(|| result.get("priorityFeeEstimate"))
+            .or_else(|| result.get("recommended")),
+        "low" => levels.get("low").or_else(|| levels.get("Low")),
+        "medium" => levels.get("medium").or_else(|| levels.get("Medium")),
+        "high" => levels.get("high").or_else(|| levels.get("High")),
+        "veryhigh" | "very_high" | "very-high" => levels
+            .get("veryHigh")
+            .or_else(|| levels.get("VeryHigh"))
+            .or_else(|| levels.get("veryhigh")),
+        "unsafemax" | "unsafe_max" | "unsafe-max" => levels
+            .get("unsafeMax")
+            .or_else(|| levels.get("UnsafeMax"))
+            .or_else(|| levels.get("unsafemax")),
+        "recommended" => result
+            .get("priorityFeeEstimate")
+            .or_else(|| result.get("recommended")),
+        selected_level => levels.get(selected_level),
+    }
+}
+
+fn parse_helius_priority_estimate_result(
+    result: &Value,
+    helius_priority_level: &str,
+) -> Option<u64> {
     normalize_estimate_to_lamports(
-        match helius_priority_level {
-            "recommended" => result
-                .get("priorityFeeEstimate")
-                .or_else(|| result.get("recommended")),
-            "Default" => result
-                .get("priorityFeeEstimate")
-                .or_else(|| result.get("recommended"))
-                .or_else(|| result.get("priorityFeeLevels").and_then(|levels| levels.get("medium")))
-                .or_else(|| result.get("priorityFeeLevels").and_then(|levels| levels.get("Medium"))),
-            selected_level => result
-                .get("priorityFeeLevels")
-                .and_then(|levels| levels.get(selected_level)),
-        }
+        helius_priority_level_value(result, helius_priority_level)
         .or_else(|| {
             result
                 .get("priorityFeeLevels")
@@ -2019,6 +2297,20 @@ fn parse_helius_priority_estimate_result(result: &Value, helius_priority_level: 
                 .and_then(|levels| levels.get("high"))
         }),
     )
+}
+
+fn sanitized_serialized_priority_probe_config(config: &NormalizedConfig) -> NormalizedConfig {
+    let mut probe_config = config.clone();
+    probe_config.tx.computeUnitPriceMicroLamports = Some(0);
+    probe_config.tx.jitoTipLamports = 0;
+    probe_config.tx.jitoTipAccount.clear();
+    probe_config.execution.priorityFeeSol.clear();
+    probe_config.execution.tipSol.clear();
+    probe_config.execution.buyPriorityFeeSol.clear();
+    probe_config.execution.buyTipSol.clear();
+    probe_config.execution.sellPriorityFeeSol.clear();
+    probe_config.execution.sellTipSol.clear();
+    probe_config
 }
 
 async fn fetch_helius_priority_estimate(
@@ -2101,7 +2393,9 @@ async fn fetch_helius_priority_estimate_for_serialized_transaction(
         .await
         .map_err(|error| format!("Failed to decode Helius serialized fee estimate: {error}"))?;
     if let Some(error) = payload.get("error") {
-        return Err(format!("Helius serialized priority estimate failed: {error}"));
+        return Err(format!(
+            "Helius serialized priority estimate failed: {error}"
+        ));
     }
     let result = payload.get("result").unwrap_or(&payload);
     Ok(parse_helius_priority_estimate_result(
@@ -2117,11 +2411,7 @@ async fn estimate_serialized_launch_priority_fee(
     wallet_secret: &[u8],
     creator_public_key: &str,
 ) -> Result<Option<u64>, String> {
-    let mut probe_config = config.clone();
-    probe_config.tx.computeUnitPriceMicroLamports = Some(0);
-    probe_config.execution.priorityFeeSol.clear();
-    probe_config.execution.buyPriorityFeeSol.clear();
-    probe_config.execution.sellPriorityFeeSol.clear();
+    let probe_config = sanitized_serialized_priority_probe_config(config);
 
     let native = try_compile_native_launchpad(
         rpc_url,
@@ -2153,11 +2443,14 @@ async fn estimate_serialized_launch_priority_fee(
         })
         .or_else(|| native.creation_transactions.first())
         .or_else(|| native.compiled_transactions.first())
-        .ok_or_else(|| "No compiled launch transaction was available for fee estimation.".to_string())?;
+        .ok_or_else(|| {
+            "No compiled launch transaction was available for fee estimation.".to_string()
+        })?;
     let serialized_base58 = compiled_transaction_serialized_base58(launch_transaction)?;
+    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(rpc_url);
     fetch_helius_priority_estimate_for_serialized_transaction(
         shared_fee_market_http_client(),
-        rpc_url,
+        &hel_priority_rpc,
         &auto_fee_helius_priority_level(),
         "launchdeck-helius-priority-estimate-serialized-launch",
         &serialized_base58,
@@ -2194,12 +2487,13 @@ async fn prewarm_helius_sender_endpoint(rpc_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_helius_priority_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+async fn fetch_helius_priority_snapshot_live(primary_rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
     let helius_priority_level = auto_fee_helius_priority_level();
     let client = shared_fee_market_http_client();
+    let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(primary_rpc_url);
     let helius_launch_priority_lamports = fetch_helius_priority_estimate(
         &client,
-        rpc_url,
+        &hel_priority_rpc,
         &helius_priority_level,
         "launchdeck-helius-priority-estimate-launch-template",
         Some(&FEE_TEMPLATE_LAUNCH_ACCOUNT_KEYS),
@@ -2243,9 +2537,14 @@ async fn fetch_fee_market_snapshot_live(rpc_url: &str) -> Result<FeeMarketSnapsh
         helius_priority_lamports: helius_snapshot.helius_priority_lamports,
         helius_launch_priority_lamports: helius_snapshot.helius_launch_priority_lamports,
         helius_trade_priority_lamports: helius_snapshot.helius_trade_priority_lamports,
-        jito_tip_p99_lamports: jito_tip_p99_lamports?,
+        jito_tip_p99_lamports: jito_tip_p99_lamports.unwrap_or(None),
     };
-    cache_fee_market_snapshot(rpc_url, &helius_priority_level, &jito_tip_percentile, &snapshot);
+    cache_fee_market_snapshot(
+        rpc_url,
+        &helius_priority_level,
+        &jito_tip_percentile,
+        &snapshot,
+    );
     Ok(snapshot)
 }
 
@@ -2274,9 +2573,7 @@ fn update_cached_jito_tip_snapshot(rpc_url: &str, jito_tip_lamports: Option<u64>
 }
 
 async fn open_jito_tip_stream_socket() -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
     tokio::time::timeout(
@@ -2351,16 +2648,16 @@ async fn consume_jito_tip_stream_updates(
 }
 
 fn spawn_fee_market_snapshot_refresh_task(state: Arc<AppState>, rpc_url: String) {
-    let helius_rpc_url = rpc_url.clone();
+    let primary_rpc_url = rpc_url.clone();
     let helius_state = state.clone();
     tokio::spawn(async move {
         loop {
             if engine_background_requests_active(&helius_state) {
                 let helius_priority_level = auto_fee_helius_priority_level();
                 let jito_tip_percentile = auto_fee_jito_tip_percentile();
-                if let Ok(snapshot) = fetch_helius_priority_snapshot_live(&helius_rpc_url).await {
+                if let Ok(snapshot) = fetch_helius_priority_snapshot_live(&primary_rpc_url).await {
                     update_cached_fee_market_snapshot(
-                        &helius_rpc_url,
+                        &primary_rpc_url,
                         &helius_priority_level,
                         &jito_tip_percentile,
                         |cached| {
@@ -2420,8 +2717,51 @@ async fn resolve_auto_execution_fees(
     let needs_auto = normalized.execution.autoGas
         || normalized.execution.buyAutoGas
         || normalized.execution.sellAutoGas;
-    let market = fetch_fee_market_snapshot(rpc_url).await?;
     let mut notes = Vec::new();
+    if !needs_auto {
+        return Ok(AutoFeeResolutionSummary {
+            notes,
+            report: AutoFeeReport {
+                jito_tip_percentile: auto_fee_jito_tip_percentile(),
+                snapshot: FeeMarketSnapshot::default(),
+                creation: AutoFeeActionReport {
+                    enabled: normalized.execution.autoGas,
+                    provider: normalized.execution.provider.clone(),
+                    prioritySource: "off".to_string(),
+                    priorityEstimateLamports: None,
+                    resolvedPriorityLamports: None,
+                    tipSource: "off".to_string(),
+                    tipEstimateLamports: None,
+                    resolvedTipLamports: None,
+                    capLamports: None,
+                },
+                buy: AutoFeeActionReport {
+                    enabled: normalized.execution.buyAutoGas,
+                    provider: normalized.execution.buyProvider.clone(),
+                    prioritySource: "off".to_string(),
+                    priorityEstimateLamports: None,
+                    resolvedPriorityLamports: None,
+                    tipSource: "off".to_string(),
+                    tipEstimateLamports: None,
+                    resolvedTipLamports: None,
+                    capLamports: None,
+                },
+                sell: AutoFeeActionReport {
+                    enabled: normalized.execution.sellAutoGas,
+                    provider: normalized.execution.sellProvider.clone(),
+                    prioritySource: "off".to_string(),
+                    priorityEstimateLamports: None,
+                    resolvedPriorityLamports: None,
+                    tipSource: "off".to_string(),
+                    tipEstimateLamports: None,
+                    resolvedTipLamports: None,
+                    capLamports: None,
+                },
+            },
+        });
+    }
+
+    let market = fetch_fee_market_snapshot(rpc_url).await?;
     let mut creation_report = AutoFeeActionReport {
         enabled: normalized.execution.autoGas,
         provider: normalized.execution.provider.clone(),
@@ -2455,18 +2795,6 @@ async fn resolve_auto_execution_fees(
         resolvedTipLamports: None,
         capLamports: None,
     };
-
-    if !needs_auto {
-        return Ok(AutoFeeResolutionSummary {
-            notes,
-            report: AutoFeeReport {
-                snapshot: market,
-                creation: creation_report,
-                buy: buy_report,
-                sell: sell_report,
-            },
-        });
-    }
 
     let serialized_launch_priority_estimate = if normalized.execution.autoGas
         || normalized.execution.buyAutoGas
@@ -2517,24 +2845,37 @@ async fn resolve_auto_execution_fees(
         );
         let provider = normalized.execution.provider.as_str();
         creation_report.capLamports = cap_lamports;
-        let uses_priority = match provider {
-            "standard-rpc" => true,
-            "helius-sender" => true,
-            "jito-bundle" => transport_plan.executionClass != "bundle",
-            _ => true,
-        };
-        let uses_tip = matches!(provider, "helius-sender")
-            || (provider == "jito-bundle");
+        let uses_priority =
+            provider_uses_auto_fee_priority(provider, &transport_plan.executionClass, "creation");
+        let uses_tip = provider_uses_auto_fee_tip(provider, "creation");
+        let (resolved_priority, resolved_tip) = resolve_auto_fee_components_with_total_cap(
+            if uses_priority {
+                let (estimated, source) = priority_estimate_for_action("creation");
+                creation_report.prioritySource = source;
+                creation_report.priorityEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Creation auto fee is enabled but no Helius priority estimate was returned."
+                        .to_string()
+                })?)
+            } else {
+                None
+            },
+            if uses_tip {
+                let (estimated, source) = action_tip_estimate(&market);
+                creation_report.tipSource = source;
+                creation_report.tipEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
+                })?)
+            } else {
+                None
+            },
+            cap_lamports,
+            provider,
+            "Creation",
+        )?;
 
-        if uses_priority {
-            let (estimated, source) = priority_estimate_for_action("creation");
-            creation_report.prioritySource = source;
-            creation_report.priorityEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Creation auto fee is enabled but no Helius priority estimate was returned."
-                    .to_string()
-            })?;
-            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+        if let Some(resolved) = resolved_priority {
             normalized.execution.priorityFeeSol =
                 priority_price_micro_lamports_to_sol_equivalent(resolved);
             normalized.tx.computeUnitPriceMicroLamports =
@@ -2545,30 +2886,7 @@ async fn resolve_auto_execution_fees(
             normalized.tx.computeUnitPriceMicroLamports = Some(0);
         }
 
-        if uses_tip {
-            let (estimated, source) = action_tip_estimate(&market);
-            creation_report.tipSource = source;
-            creation_report.tipEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
-            })?;
-            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
-                && resolved > 0
-                && resolved < minimum_tip_lamports
-            {
-                if cap_lamports.is_some()
-                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
-                {
-                    return Err(
-                        format!(
-                            "Creation max auto fee is below the {} minimum tip of 0.0002 SOL.",
-                            provider
-                        ),
-                    );
-                }
-                resolved = minimum_tip_lamports;
-            }
+        if let Some(resolved) = resolved_tip {
             normalized.execution.tipSol = format_lamports_to_sol_decimal(resolved);
             normalized.tx.jitoTipLamports = resolved as i64;
             normalized.tx.jitoTipAccount = pick_tip_account_for_provider(provider);
@@ -2587,7 +2905,9 @@ async fn resolve_auto_execution_fees(
             if normalized.execution.priorityFeeSol.trim().is_empty() {
                 "off".to_string()
             } else {
-                format_priority_price_note(creation_report.resolvedPriorityLamports.unwrap_or_default())
+                format_priority_price_note(
+                    creation_report.resolvedPriorityLamports.unwrap_or_default(),
+                )
             },
             if normalized.execution.tipSol.trim().is_empty() {
                 "off".to_string()
@@ -2607,17 +2927,36 @@ async fn resolve_auto_execution_fees(
         );
         let provider = normalized.execution.buyProvider.as_str();
         buy_report.capLamports = cap_lamports;
-        let uses_priority = provider != "jito-bundle" || true;
-        let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
+        let uses_priority =
+            provider_uses_auto_fee_priority(provider, &transport_plan.executionClass, "buy");
+        let uses_tip = provider_uses_auto_fee_tip(provider, "buy");
+        let (resolved_priority, resolved_tip) = resolve_auto_fee_components_with_total_cap(
+            if uses_priority {
+                let (estimated, source) = priority_estimate_for_action("buy");
+                buy_report.prioritySource = source;
+                buy_report.priorityEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
+                })?)
+            } else {
+                None
+            },
+            if uses_tip {
+                let (estimated, source) = action_tip_estimate(&market);
+                buy_report.tipSource = source;
+                buy_report.tipEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
+                })?)
+            } else {
+                None
+            },
+            cap_lamports,
+            provider,
+            "Buy",
+        )?;
 
-        if uses_priority {
-            let (estimated, source) = priority_estimate_for_action("buy");
-            buy_report.prioritySource = source;
-            buy_report.priorityEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
-            })?;
-            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+        if let Some(resolved) = resolved_priority {
             normalized.execution.buyPriorityFeeSol =
                 priority_price_micro_lamports_to_sol_equivalent(resolved);
             buy_report.resolvedPriorityLamports = Some(resolved);
@@ -2625,30 +2964,7 @@ async fn resolve_auto_execution_fees(
             normalized.execution.buyPriorityFeeSol.clear();
         }
 
-        if uses_tip {
-            let (estimated, source) = action_tip_estimate(&market);
-            buy_report.tipSource = source;
-            buy_report.tipEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Buy auto fee is enabled but no Jito tip estimate was returned.".to_string()
-            })?;
-            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
-                && resolved > 0
-                && resolved < minimum_tip_lamports
-            {
-                if cap_lamports.is_some()
-                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
-                {
-                    return Err(
-                        format!(
-                            "Buy max auto fee is below the {} minimum tip of 0.0002 SOL.",
-                            provider
-                        ),
-                    );
-                }
-                resolved = minimum_tip_lamports;
-            }
+        if let Some(resolved) = resolved_tip {
             normalized.execution.buyTipSol = format_lamports_to_sol_decimal(resolved);
             buy_report.resolvedTipLamports = Some(resolved);
         } else {
@@ -2683,18 +2999,36 @@ async fn resolve_auto_execution_fees(
         );
         let provider = normalized.execution.sellProvider.as_str();
         sell_report.capLamports = cap_lamports;
-        let uses_priority = provider != "jito-bundle" || true;
-        let uses_tip = provider == "helius-sender" || provider == "jito-bundle";
+        let uses_priority =
+            provider_uses_auto_fee_priority(provider, &transport_plan.executionClass, "sell");
+        let uses_tip = provider_uses_auto_fee_tip(provider, "sell");
+        let (resolved_priority, resolved_tip) = resolve_auto_fee_components_with_total_cap(
+            if uses_priority {
+                let (estimated, source) = priority_estimate_for_action("sell");
+                sell_report.prioritySource = source;
+                sell_report.priorityEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Sell auto fee is enabled but no Helius priority estimate was returned.".to_string()
+                })?)
+            } else {
+                None
+            },
+            if uses_tip {
+                let (estimated, source) = action_tip_estimate(&market);
+                sell_report.tipSource = source;
+                sell_report.tipEstimateLamports = estimated;
+                Some(estimated.ok_or_else(|| {
+                    "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
+                })?)
+            } else {
+                None
+            },
+            cap_lamports,
+            provider,
+            "Sell",
+        )?;
 
-        if uses_priority {
-            let (estimated, source) = priority_estimate_for_action("sell");
-            sell_report.prioritySource = source;
-            sell_report.priorityEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Sell auto fee is enabled but no Helius priority estimate was returned."
-                    .to_string()
-            })?;
-            let resolved = cap_auto_fee_lamports(estimated.max(1), cap_lamports);
+        if let Some(resolved) = resolved_priority {
             normalized.execution.sellPriorityFeeSol =
                 priority_price_micro_lamports_to_sol_equivalent(resolved);
             sell_report.resolvedPriorityLamports = Some(resolved);
@@ -2702,30 +3036,7 @@ async fn resolve_auto_execution_fees(
             normalized.execution.sellPriorityFeeSol.clear();
         }
 
-        if uses_tip {
-            let (estimated, source) = action_tip_estimate(&market);
-            sell_report.tipSource = source;
-            sell_report.tipEstimateLamports = estimated;
-            let estimated = estimated.ok_or_else(|| {
-                "Sell auto fee is enabled but no Jito tip estimate was returned.".to_string()
-            })?;
-            let mut resolved = cap_auto_fee_lamports(estimated, cap_lamports);
-            if let Some(minimum_tip_lamports) = provider_required_tip_lamports(provider)
-                && resolved > 0
-                && resolved < minimum_tip_lamports
-            {
-                if cap_lamports.is_some()
-                    && cap_lamports.unwrap_or_default() < minimum_tip_lamports
-                {
-                    return Err(
-                        format!(
-                            "Sell max auto fee is below the {} minimum tip of 0.0002 SOL.",
-                            provider
-                        ),
-                    );
-                }
-                resolved = minimum_tip_lamports;
-            }
+        if let Some(resolved) = resolved_tip {
             normalized.execution.sellTipSol = format_lamports_to_sol_decimal(resolved);
             sell_report.resolvedTipLamports = Some(resolved);
         } else {
@@ -2753,6 +3064,7 @@ async fn resolve_auto_execution_fees(
     Ok(AutoFeeResolutionSummary {
         notes,
         report: AutoFeeReport {
+            jito_tip_percentile: auto_fee_jito_tip_percentile(),
             snapshot: market,
             creation: creation_report,
             buy: buy_report,
@@ -2768,7 +3080,9 @@ fn apply_same_time_creation_fee_guard(
         return Ok(None);
     }
     let creation_priority = parse_sol_decimal_to_lamports(&normalized.execution.priorityFeeSol)
-        .ok_or_else(|| "Invalid creation priority fee while applying same-time guard.".to_string())?;
+        .ok_or_else(|| {
+            "Invalid creation priority fee while applying same-time guard.".to_string()
+        })?;
     let buy_priority = parse_sol_decimal_to_lamports(&normalized.execution.buyPriorityFeeSol)
         .ok_or_else(|| "Invalid buy priority fee while applying same-time guard.".to_string())?;
     let creation_tip = parse_sol_decimal_to_lamports(&normalized.execution.tipSol)
@@ -2936,23 +3250,25 @@ async fn compile_presigned_follow_actions(
                 let Some(sell_percent) = action.sellPercent else {
                     continue;
                 };
-                let Some(mut tx) = crate::pump_native::compile_follow_sell_transaction_with_token_amount(
-                    rpc_url,
-                    &normalized.execution,
-                    normalized.token.mayhemMode,
-                    &sell_tip_account,
-                    &wallet_secret,
-                    mint,
-                    launch_creator,
-                    sell_percent,
-                    should_use_post_setup_creator_vault_for_sell(
-                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
-                        action,
-                    ),
-                    Some(predicted_tokens),
-                    Some(normalized.mode == "cashback"),
-                )
-                .await? else {
+                let Some(mut tx) =
+                    crate::pump_native::compile_follow_sell_transaction_with_token_amount(
+                        rpc_url,
+                        &normalized.execution,
+                        normalized.token.mayhemMode,
+                        &sell_tip_account,
+                        &wallet_secret,
+                        mint,
+                        launch_creator,
+                        sell_percent,
+                        should_use_post_setup_creator_vault_for_sell(
+                            matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                            action,
+                        ),
+                        Some(predicted_tokens),
+                        Some(normalized.mode == "cashback"),
+                    )
+                    .await?
+                else {
                     continue;
                 };
                 tx.label = action.actionId.clone();
@@ -3414,8 +3730,8 @@ async fn execute_engine_action_payload(
     })?;
     let auto_fee_resolve_ms = auto_fee_started.elapsed().as_millis();
     let same_time_guard_started = Instant::now();
-    let same_time_fee_guard_warning = apply_same_time_creation_fee_guard(&mut normalized).map_err(
-        |error| {
+    let same_time_fee_guard_warning =
+        apply_same_time_creation_fee_guard(&mut normalized).map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -3424,8 +3740,7 @@ async fn execute_engine_action_payload(
                     "traceId": trace.traceId,
                 })),
             )
-        },
-    )?;
+        })?;
     let same_time_fee_guard_ms = same_time_guard_started.elapsed().as_millis();
     let should_persist_report = normalized.tx.writeReport || action == "send";
     if action == "build" {
@@ -3519,7 +3834,11 @@ async fn execute_engine_action_payload(
         };
         let backend_elapsed_ms = action_started.elapsed().as_millis();
         set_report_timing(&mut report_value, "executionTotalMs", backend_elapsed_ms);
-        set_report_timing(&mut report_value, "backendTotalElapsedMs", backend_elapsed_ms);
+        set_report_timing(
+            &mut report_value,
+            "backendTotalElapsedMs",
+            backend_elapsed_ms,
+        );
         set_report_timing(&mut report_value, "totalElapsedMs", backend_elapsed_ms);
         refresh_report_benchmark(&mut report_value);
         if let Some(path) = send_log_path.as_ref() {
@@ -3744,7 +4063,11 @@ async fn execute_engine_action_payload(
         })?;
         let mut report = report_value;
         set_report_benchmark_mode(&mut report, benchmark_mode);
-        set_optional_report_timing(&mut report, "prepareRequestPayloadMs", prepare_request_payload_ms);
+        set_optional_report_timing(
+            &mut report,
+            "prepareRequestPayloadMs",
+            prepare_request_payload_ms,
+        );
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
         }
@@ -3910,6 +4233,7 @@ async fn execute_engine_action_payload(
 
     if action == "send" {
         let execution_class = transport_plan.executionClass.clone();
+        let secure_hellomoon_bundle_transport = transport_plan.transportType == "hellomoon-bundle";
         let use_phased_follow_pipeline = matches!(normalized.launchpad.as_str(), "pump" | "bonk");
         let (same_time_snipes, deferred_follow_launch) = if use_phased_follow_pipeline {
             (vec![], normalized.followLaunch.clone())
@@ -3927,8 +4251,15 @@ async fn execute_engine_action_payload(
                 })),
             )
         })?;
-        let should_reserve_deferred_follow_job =
-            should_reserve_follow_job(&deferred_follow_launch, &deferred_setup_transactions);
+        let effective_deferred_setup_transactions = if secure_hellomoon_bundle_transport {
+            vec![]
+        } else {
+            deferred_setup_transactions.clone()
+        };
+        let should_reserve_deferred_follow_job = should_reserve_follow_job(
+            &deferred_follow_launch,
+            &effective_deferred_setup_transactions,
+        );
         let follow_daemon_client = if should_reserve_deferred_follow_job {
             Some(FollowDaemonClient::new(&configured_follow_daemon_base_url()))
         } else {
@@ -3954,31 +4285,31 @@ async fn execute_engine_action_payload(
         let mut bags_setup_confirm_ms = 0u128;
         let mut follow_reserve_ms = 0u128;
         let mut follow_arm_ms = 0u128;
-        let prebuilt_follow_actions = if use_phased_follow_pipeline && deferred_follow_launch.enabled
-        {
-            Some(
-                compile_presigned_follow_actions(
-                    &rpc_url,
-                    &normalized,
-                    &compiled_mint,
-                    &compiled_launch_creator,
-                    true,
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Pre-signing follow actions failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
+        let prebuilt_follow_actions =
+            if use_phased_follow_pipeline && deferred_follow_launch.enabled {
+                Some(
+                    compile_presigned_follow_actions(
+                        &rpc_url,
+                        &normalized,
+                        &compiled_mint,
+                        &compiled_launch_creator,
+                        true,
                     )
-                })?,
-            )
-        } else {
-            None
-        };
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("Pre-signing follow actions failed: {error}"),
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
         let mut reserve_follow_job_task = if let Some(client) = follow_daemon_client.as_ref() {
             let client = client.clone();
             let trace_id = trace.traceId.clone();
@@ -3991,11 +4322,12 @@ async fn execute_engine_action_payload(
             let token_mayhem_mode = normalized.token.mayhemMode;
             let jito_tip_account = normalized.tx.jitoTipAccount.clone();
             let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
-            let sell_tip_account = pick_tip_account_for_provider(&normalized.execution.sellProvider);
+            let sell_tip_account =
+                pick_tip_account_for_provider(&normalized.execution.sellProvider);
             let prefer_post_setup_creator_vault_for_sell =
                 matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked");
             let prebuilt_actions = prebuilt_follow_actions.clone().unwrap_or_default();
-            let deferred_setup_transactions = deferred_setup_transactions.clone();
+            let deferred_setup_transactions = effective_deferred_setup_transactions.clone();
             Some(tokio::spawn(async move {
                 let follow_reserve_started = Instant::now();
                 let reserved = client
@@ -4011,7 +4343,8 @@ async fn execute_engine_action_payload(
                         jitoTipAccount: jito_tip_account,
                         buyTipAccount: buy_tip_account,
                         sellTipAccount: sell_tip_account,
-                        preferPostSetupCreatorVaultForSell: prefer_post_setup_creator_vault_for_sell,
+                        preferPostSetupCreatorVaultForSell:
+                            prefer_post_setup_creator_vault_for_sell,
                         prebuiltActions: prebuilt_actions,
                         deferredSetupTransactions: deferred_setup_transactions,
                     })
@@ -4022,86 +4355,6 @@ async fn execute_engine_action_payload(
             None
         };
         if let Some(prepared) = prepared_bags_send.as_ref() {
-            for bundle in &prepared.setup_bundles {
-                let (mut bundle_sent, bundle_warnings, bundle_timing) = send_transactions_bundle(
-                    &rpc_url,
-                    &transport_plan.jitoBundleEndpoints,
-                    bundle,
-                    &normalized.execution.commitment,
-                    normalized.execution.trackSendBlockHeight,
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Bags setup bundle send failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
-                bags_setup_submit_ms += bundle_timing.submit_ms;
-                bags_setup_confirm_ms += bundle_timing.confirm_ms;
-                bags_setup_warnings.extend(bundle_warnings);
-                bags_setup_sent.append(&mut bundle_sent);
-            }
-            if !prepared.setup_transactions.is_empty() {
-                for setup_transaction in &prepared.setup_transactions {
-                    let setup_batch = vec![setup_transaction.clone()];
-                    let (mut setup_sent, setup_warnings, setup_submit_ms) =
-                        submit_transactions_sequential(
-                            &rpc_url,
-                            &setup_batch,
-                            &normalized.execution.commitment,
-                            transport_plan.skipPreflight,
-                            normalized.execution.trackSendBlockHeight,
-                        )
-                        .await
-                        .map_err(|error| {
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "ok": false,
-                                    "error": format!("Bags setup transaction send failed for {}: {error}", setup_transaction.label),
-                                    "traceId": trace.traceId,
-                                })),
-                            )
-                        })?;
-                    let (setup_confirm_warnings, setup_confirm_ms) =
-                        confirm_transactions_with_websocket_fallback(
-                            &rpc_url,
-                            transport_plan
-                                .watchEndpoint
-                                .as_deref()
-                                .or_else(|| transport_plan.watchEndpoints.first().map(String::as_str)),
-                            &mut setup_sent,
-                            &normalized.execution.commitment,
-                            normalized.execution.trackSendBlockHeight,
-                            225,
-                            400,
-                        )
-                        .await
-                        .map_err(|error| {
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "ok": false,
-                                    "error": format!(
-                                        "Bags setup transaction confirmation failed for {}: {error}",
-                                        setup_transaction.label
-                                    ),
-                                    "traceId": trace.traceId,
-                                })),
-                            )
-                        })?;
-                    bags_setup_submit_ms += setup_submit_ms;
-                    bags_setup_confirm_ms += setup_confirm_ms;
-                    bags_setup_warnings.extend(setup_warnings);
-                    bags_setup_warnings.extend(setup_confirm_warnings);
-                    bags_setup_sent.append(&mut setup_sent);
-                }
-            }
             let launch_compiled = compile_bags_launch_transaction(
                 &rpc_url,
                 &normalized,
@@ -4121,18 +4374,108 @@ async fn execute_engine_action_payload(
                     })),
                 )
             })?;
-            compiled_transactions = vec![launch_compiled];
-            if let Some(transactions) = report_value
-                .get_mut("transactions")
-                .and_then(Value::as_array_mut)
-            {
-                let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
+            if secure_hellomoon_bundle_transport {
+                compiled_transactions = prepared.native_artifacts.compiled_transactions.clone();
+                compiled_transactions.push(launch_compiled);
+                report_value["transactions"] = serde_json::to_value(summarize_bags_transactions(
                     &compiled_transactions,
                     normalized.tx.dumpBase64,
                 ))
                 .unwrap_or_else(|_| Value::Array(vec![]));
-                if let Some(items) = launch_summaries.as_array_mut() {
-                    transactions.append(items);
+            } else {
+                for bundle in &prepared.setup_bundles {
+                    let (mut bundle_sent, bundle_warnings, bundle_timing) =
+                        send_transactions_bundle(
+                            &rpc_url,
+                            &transport_plan.jitoBundleEndpoints,
+                            bundle,
+                            &normalized.execution.commitment,
+                            normalized.execution.trackSendBlockHeight,
+                        )
+                        .await
+                        .map_err(|error| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "error": format!("Bags setup bundle send failed: {error}"),
+                                    "traceId": trace.traceId,
+                                })),
+                            )
+                        })?;
+                    bags_setup_submit_ms += bundle_timing.submit_ms;
+                    bags_setup_confirm_ms += bundle_timing.confirm_ms;
+                    bags_setup_warnings.extend(bundle_warnings);
+                    bags_setup_sent.append(&mut bundle_sent);
+                }
+                if !prepared.setup_transactions.is_empty() {
+                    for setup_transaction in &prepared.setup_transactions {
+                        let setup_batch = vec![setup_transaction.clone()];
+                        let (mut setup_sent, setup_warnings, setup_submit_ms) =
+                            submit_transactions_sequential(
+                                &rpc_url,
+                                &setup_batch,
+                                &normalized.execution.commitment,
+                                transport_plan.skipPreflight,
+                                normalized.execution.trackSendBlockHeight,
+                            )
+                            .await
+                            .map_err(|error| {
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!({
+                                        "ok": false,
+                                        "error": format!("Bags setup transaction send failed for {}: {error}", setup_transaction.label),
+                                        "traceId": trace.traceId,
+                                    })),
+                                )
+                            })?;
+                        let (setup_confirm_warnings, setup_confirm_ms) =
+                            confirm_transactions_with_websocket_fallback(
+                                &rpc_url,
+                                transport_plan.watchEndpoint.as_deref().or_else(|| {
+                                    transport_plan.watchEndpoints.first().map(String::as_str)
+                                }),
+                                &mut setup_sent,
+                                &normalized.execution.commitment,
+                                normalized.execution.trackSendBlockHeight,
+                                225,
+                                400,
+                            )
+                            .await
+                            .map_err(|error| {
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!({
+                                        "ok": false,
+                                        "error": format!(
+                                            "Bags setup transaction confirmation failed for {}: {error}",
+                                            setup_transaction.label
+                                        ),
+                                        "traceId": trace.traceId,
+                                    })),
+                                )
+                            })?;
+                        bags_setup_submit_ms += setup_submit_ms;
+                        bags_setup_confirm_ms += setup_confirm_ms;
+                        bags_setup_warnings.extend(setup_warnings);
+                        bags_setup_warnings.extend(setup_confirm_warnings);
+                        bags_setup_sent.append(&mut setup_sent);
+                    }
+                }
+                compiled_transactions = vec![launch_compiled];
+                if let Some(transactions) = report_value
+                    .get_mut("transactions")
+                    .and_then(Value::as_array_mut)
+                {
+                    let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
+                        &compiled_transactions,
+                        normalized.tx.dumpBase64,
+                    ))
+                    .unwrap_or_else(|_| Value::Array(vec![]));
+                    if let Some(items) = launch_summaries.as_array_mut() {
+                        transactions.append(items);
+                    }
                 }
             }
         }
@@ -4165,7 +4508,7 @@ async fn execute_engine_action_payload(
                 same_time_independent_compiled = same_time_compiled;
             }
         }
-        if use_phased_follow_pipeline {
+        if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
             compiled_transactions = creation_transactions.clone();
         }
         let submit_started_ms = current_time_ms();
@@ -4392,7 +4735,11 @@ async fn execute_engine_action_payload(
         }
         let mut report = report_value;
         set_report_benchmark_mode(&mut report, benchmark_mode);
-        set_optional_report_timing(&mut report, "prepareRequestPayloadMs", prepare_request_payload_ms);
+        set_optional_report_timing(
+            &mut report,
+            "prepareRequestPayloadMs",
+            prepare_request_payload_ms,
+        );
         if let Some(value) = form_to_raw_config_ms {
             set_report_timing(&mut report, "formToRawConfigMs", value);
         }
@@ -4467,29 +4814,44 @@ async fn execute_engine_action_payload(
         set_report_timing(&mut report, "sendConfirmMs", bags_setup_confirm_ms);
         set_report_timing(&mut report, "sendTransportConfirmMs", 0);
         if let Some(task) = reserve_follow_job_task.take() {
-            let (reserved, elapsed_ms) = task.await.map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": format!("Follow daemon reservation task failed: {error}"),
-                        "traceId": trace.traceId,
-                    })),
-                )
-            })?.map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": format!("Follow daemon reservation failed: {error}"),
-                        "traceId": trace.traceId,
-                    })),
-                )
-            })?;
+            let (reserved, elapsed_ms) = task
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Follow daemon reservation task failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?
+                .map_err(|error| {
+                    record_error(
+                        "follow-client",
+                        "Follow daemon reservation failed.",
+                        Some(json!({
+                            "traceId": trace.traceId,
+                            "message": error,
+                        })),
+                    );
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Follow daemon reservation failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    )
+                })?;
             follow_reserve_ms = elapsed_ms;
             reserved_follow_job = Some(reserved);
         }
-        set_optional_report_timing(&mut report, "followDaemonReserveMs", Some(follow_reserve_ms));
+        set_optional_report_timing(
+            &mut report,
+            "followDaemonReserveMs",
+            Some(follow_reserve_ms),
+        );
         if bags_setup_submit_ms > 0 || bags_setup_confirm_ms > 0 {
             set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
             set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_confirm_ms);
@@ -4602,6 +4964,14 @@ async fn execute_engine_action_payload(
                         follow_arm_ms = follow_arm_started.elapsed().as_millis();
                         let warning =
                             format!("Launch confirmed, but follow daemon arm failed: {error}");
+                        record_error(
+                            "follow-client",
+                            "Follow daemon arm failed.",
+                            Some(json!({
+                                "traceId": trace.traceId,
+                                "message": error,
+                            })),
+                        );
                         post_send_warnings.push(warning.clone());
                         send_phase_errors.push(warning);
                     }
@@ -4684,28 +5054,42 @@ async fn execute_engine_action_payload(
         set_report_timing(&mut report, "sendCreationSubmitMs", submit_ms);
         set_report_timing(&mut report, "sendCreationConfirmMs", confirm_ms);
         if use_phased_follow_pipeline {
-            append_execution_note(
-                &mut report,
-                "Pump/Bonk phased send path reserved pre-signed follow actions in the daemon and moved setup into deferred post-confirm execution.",
-            );
-            if !deferred_setup_transactions.is_empty() {
+            if secure_hellomoon_bundle_transport {
                 append_execution_note(
                     &mut report,
-                    &format!(
-                        "Deferred post-confirm setup prepared {} transaction(s) for daemon-managed submission.",
-                        deferred_setup_transactions.len()
-                    ),
+                    "Secure Hello Moon creation bundled the phased setup transactions into the creation bundle instead of deferring them to the daemon.",
                 );
+            } else {
+                append_execution_note(
+                    &mut report,
+                    "Pump/Bonk phased send path reserved pre-signed follow actions in the daemon and moved setup into deferred post-confirm execution.",
+                );
+                if !deferred_setup_transactions.is_empty() {
+                    append_execution_note(
+                        &mut report,
+                        &format!(
+                            "Deferred post-confirm setup prepared {} transaction(s) for daemon-managed submission.",
+                            deferred_setup_transactions.len()
+                        ),
+                    );
+                }
             }
         }
-        set_optional_report_timing(&mut report, "followDaemonReserveMs", Some(follow_reserve_ms));
+        set_optional_report_timing(
+            &mut report,
+            "followDaemonReserveMs",
+            Some(follow_reserve_ms),
+        );
         set_optional_report_timing(&mut report, "followDaemonArmMs", Some(follow_arm_ms));
         if let Some(execution) = report.get_mut("execution") {
             execution["sent"] = serde_json::to_value(&sent).unwrap_or(Value::Array(vec![]));
-            if let Some(actual_responder) = sent
-                .iter()
-                .find_map(|entry| entry.endpoint.as_ref().filter(|value| !value.is_empty()).cloned())
-            {
+            if let Some(actual_responder) = sent.iter().find_map(|entry| {
+                entry
+                    .endpoint
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            }) {
                 execution["heliusSenderEndpoint"] = Value::String(actual_responder);
             }
             let mut existing_warnings = execution
@@ -5515,7 +5899,10 @@ async fn api_startup_warm(
         }),
     };
     let mut startup_endpoint_attempts = Vec::new();
-    if selected_routes.iter().any(|route| route.provider == "standard-rpc") {
+    if selected_routes
+        .iter()
+        .any(|route| route.provider == "standard-rpc")
+    {
         let endpoint = primary_standard_rpc_warm_endpoint(&main_rpc_url);
         let result = prewarm_rpc_endpoint(&endpoint).await;
         startup_endpoint_attempts.push(build_warm_target_attempt(
@@ -5529,13 +5916,17 @@ async fn api_startup_warm(
             },
         ));
     }
-    if selected_routes.iter().any(|route| route.provider == "helius-sender") {
+    if selected_routes
+        .iter()
+        .any(|route| route.provider == "helius-sender")
+    {
         let mut seen = HashSet::new();
         for route in selected_routes
             .iter()
             .filter(|route| route.provider == "helius-sender")
         {
-            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile) {
+            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
+            {
                 if !seen.insert(endpoint.clone()) {
                     continue;
                 }
@@ -5553,7 +5944,39 @@ async fn api_startup_warm(
             }
         }
     }
-    if selected_routes.iter().any(|route| route.provider == "jito-bundle") {
+    if selected_routes
+        .iter()
+        .any(|route| route.provider == "hellomoon")
+    {
+        let mut seen = HashSet::new();
+        let mev_protect = configured_hellomoon_mev_protect();
+        for route in selected_routes
+            .iter()
+            .filter(|route| route.provider == "hellomoon")
+        {
+            for endpoint in configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
+            {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let result = prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await;
+                startup_endpoint_attempts.push(build_warm_target_attempt(
+                    "endpoint",
+                    Some("hellomoon"),
+                    "Hello Moon QUIC",
+                    endpoint,
+                    match result {
+                        Ok(()) => WarmAttemptResult::Success,
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
+    if selected_routes
+        .iter()
+        .any(|route| route.provider == "jito-bundle")
+    {
         let mut seen = HashSet::new();
         for route in selected_routes
             .iter()
@@ -5680,7 +6103,11 @@ async fn api_startup_warm(
             None,
             "Lookup tables",
             rpc_url.clone(),
-            match lookup_tables_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            match lookup_tables_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 true => WarmAttemptResult::Success,
                 false => WarmAttemptResult::Error(
                     lookup_tables_payload
@@ -5696,7 +6123,11 @@ async fn api_startup_warm(
             None,
             "Pump global",
             rpc_url.clone(),
-            match pump_global_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            match pump_global_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 true => WarmAttemptResult::Success,
                 false => WarmAttemptResult::Error(
                     pump_global_payload
@@ -5712,7 +6143,11 @@ async fn api_startup_warm(
             None,
             "Bonk state",
             rpc_url.clone(),
-            match bonk_state_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            match bonk_state_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 true => WarmAttemptResult::Success,
                 false => WarmAttemptResult::Error(
                     bonk_state_payload
@@ -5728,7 +6163,11 @@ async fn api_startup_warm(
             None,
             "Fee Market",
             main_rpc_url.clone(),
-            match fee_market_payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            match fee_market_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 true => WarmAttemptResult::Success,
                 false => WarmAttemptResult::Error(
                     fee_market_payload
@@ -6048,7 +6487,11 @@ async fn api_run(
         refresh_report_benchmark(report);
         let render_started = Instant::now();
         rendered_text = Some(render_report_value(report));
-        set_report_timing(report, "reportRenderMs", render_started.elapsed().as_millis());
+        set_report_timing(
+            report,
+            "reportRenderMs",
+            render_started.elapsed().as_millis(),
+        );
         refresh_report_benchmark(report);
         persisted_report_snapshot = Some(report.clone());
     }
@@ -6180,6 +6623,29 @@ async fn api_reports_list(Query(query): Query<ReportsQuery>) -> Json<Value> {
             "ok": true,
             "sort": sort,
             "reports": list_persisted_reports(sort),
+        }),
+        started_at_ms,
+    ))
+}
+
+async fn api_logs(Query(query): Query<LogsQuery>) -> Json<Value> {
+    let started_at_ms = current_time_ms();
+    let normalized_view = query
+        .view
+        .unwrap_or_else(|| "live".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let logs = if normalized_view == "errors" {
+        list_error_logs(Some(limit))
+    } else {
+        list_live_logs(limit.min(100))
+    };
+    Json(attach_timing(
+        json!({
+            "ok": true,
+            "view": if normalized_view == "errors" { "errors" } else { "live" },
+            "logs": logs,
         }),
         started_at_ms,
     ))
@@ -6705,7 +7171,10 @@ mod tests {
                 endpoint_profile: String::new(),
             }],
         );
-        let warm = state.warm.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         assert!(immediate);
         assert_eq!(warm.current_reason, "active-operator-activity");
@@ -6799,7 +7268,11 @@ mod tests {
         assert_eq!(payload.get("active").and_then(Value::as_bool), Some(false));
         assert_eq!(
             payload.get("lastSuspendAtMs").and_then(Value::as_u64),
-            Some((now_ms.saturating_sub(idle_ms).saturating_add(idle_timeout_ms)) as u64)
+            Some(
+                (now_ms
+                    .saturating_sub(idle_ms)
+                    .saturating_add(idle_timeout_ms)) as u64
+            )
         );
         let state_targets = payload
             .get("stateTargets")
@@ -6876,9 +7349,7 @@ mod tests {
             Some("standard-rpc")
         );
         assert_eq!(
-            endpoint_targets[0]
-                .get("lastError")
-                .and_then(Value::as_str),
+            endpoint_targets[0].get("lastError").and_then(Value::as_str),
             Some("timeout")
         );
         assert_eq!(
@@ -6995,14 +7466,65 @@ mod tests {
     }
 
     #[test]
+    fn hellomoon_auto_fee_policy_uses_both_priority_and_tip() {
+        assert!(provider_uses_auto_fee_priority(
+            "hellomoon",
+            "single",
+            "creation"
+        ));
+        assert!(provider_uses_auto_fee_tip("hellomoon", "creation"));
+        assert!(provider_uses_auto_fee_priority(
+            "hellomoon",
+            "single",
+            "buy"
+        ));
+        assert!(provider_uses_auto_fee_tip("hellomoon", "buy"));
+        assert!(provider_uses_auto_fee_priority(
+            "hellomoon",
+            "single",
+            "sell"
+        ));
+        assert!(provider_uses_auto_fee_tip("hellomoon", "sell"));
+    }
+
+    #[test]
+    fn jito_bundle_auto_fee_policy_skips_priority_only_for_bundle_creation() {
+        assert!(!provider_uses_auto_fee_priority(
+            "jito-bundle",
+            "bundle",
+            "creation"
+        ));
+        assert!(provider_uses_auto_fee_tip("jito-bundle", "creation"));
+        assert!(provider_uses_auto_fee_priority(
+            "jito-bundle",
+            "bundle",
+            "buy"
+        ));
+        assert!(provider_uses_auto_fee_priority(
+            "jito-bundle",
+            "bundle",
+            "sell"
+        ));
+    }
+
+    #[test]
     fn helius_priority_estimate_parser_uses_selected_level_then_fallbacks() {
         let payload = json!({
             "priorityFeeLevels": {
+                "medium": 222,
                 "high": 1234,
                 "veryHigh": 5678
             },
             "priorityFeeEstimate": 4321
         });
+        assert_eq!(
+            parse_helius_priority_estimate_result(&payload, "Medium"),
+            Some(222)
+        );
+        assert_eq!(
+            parse_helius_priority_estimate_result(&payload, "High"),
+            Some(1234)
+        );
         assert_eq!(
             parse_helius_priority_estimate_result(&payload, "veryhigh"),
             Some(5678)
@@ -7016,11 +7538,118 @@ mod tests {
             Some(4321)
         );
     }
+
+    #[test]
+    fn clamp_auto_fee_tip_raises_zero_estimate_to_provider_minimum() {
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(0, "hellomoon", None, "Buy").unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(0, "helius-sender", None, "Buy").unwrap(),
+            200_000
+        );
+    }
+
+    #[test]
+    fn clamp_auto_fee_tip_raises_subminimum_to_provider_floor() {
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(50_000, "hellomoon", None, "Sell").unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn clamp_auto_fee_tip_leaves_at_or_above_minimum_unchanged() {
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(2_000_000, "hellomoon", None, "Creation")
+                .unwrap(),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn clamp_auto_fee_tip_errors_when_cap_below_minimum() {
+        let err = clamp_auto_fee_tip_to_provider_minimum(
+            50_000,
+            "hellomoon",
+            Some(100_000),
+            "Buy",
+        )
+        .expect_err("cap below minimum");
+        assert!(err.contains("max auto fee is below"));
+        assert!(err.contains("hellomoon"));
+    }
+
+    #[test]
+    fn clamp_auto_fee_tip_no_provider_minimum_passes_through() {
+        assert_eq!(
+            clamp_auto_fee_tip_to_provider_minimum(0, "standard-rpc", None, "Buy").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn total_auto_fee_cap_is_shared_between_priority_and_tip() {
+        let (priority, tip) = resolve_auto_fee_components_with_total_cap(
+            Some(700_000),
+            Some(1_500_000),
+            Some(1_100_000),
+            "standard-rpc",
+            "Creation",
+        )
+        .unwrap();
+        assert_eq!(priority, Some(330_000));
+        assert_eq!(tip, Some(770_000));
+    }
+
+    #[test]
+    fn total_auto_fee_cap_respects_tip_floor_when_ratio_is_too_low() {
+        let (priority, tip) = resolve_auto_fee_components_with_total_cap(
+            Some(700_000),
+            Some(200_000),
+            Some(1_200_000),
+            "hellomoon",
+            "Creation",
+        )
+        .unwrap();
+        assert_eq!(priority, Some(200_000));
+        assert_eq!(tip, Some(1_000_000));
+    }
+
+    #[test]
+    fn total_auto_fee_cap_redistributes_unused_tip_share_to_priority() {
+        let (priority, tip) = resolve_auto_fee_components_with_total_cap(
+            Some(900_000),
+            Some(100_000),
+            Some(500_000),
+            "standard-rpc",
+            "Creation",
+        )
+        .unwrap();
+        assert_eq!(priority, Some(400_000));
+        assert_eq!(tip, Some(100_000));
+    }
+
+    #[test]
+    fn total_auto_fee_cap_errors_when_tip_floor_leaves_no_priority_budget() {
+        let err = resolve_auto_fee_components_with_total_cap(
+            Some(700_000),
+            Some(200_000),
+            Some(1_000_000),
+            "hellomoon",
+            "Creation",
+        )
+        .expect_err("cap should leave room above provider minimum tip");
+        assert!(err.contains("must be above"));
+        assert!(err.contains("hellomoon"));
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+    crypto::install_rustls_crypto_provider();
     clear_bags_session_credentials();
     let rpc_url = configured_rpc_url();
     let state = Arc::new(AppState {
@@ -7071,6 +7700,7 @@ async fn main() {
         )
         .route("/api/settings/save", post(api_settings_save))
         .route("/api/reports", get(api_reports_list))
+        .route("/api/logs", get(api_logs))
         .route("/api/reports/view", get(api_reports_view))
         .route("/api/upload-image", post(api_upload_image))
         .route("/api/metadata/upload", post(api_metadata_upload))
@@ -7097,11 +7727,26 @@ async fn main() {
         .await
         .expect("failed to bind LaunchDeck engine listener");
     if !restored_workers.is_empty() {
+        record_info(
+            "engine",
+            format!(
+                "Restored {} runtime worker(s) from disk",
+                restored_workers.len()
+            ),
+            None,
+        );
         println!(
             "Restored {} runtime worker(s) from disk.",
             restored_workers.len()
         );
     }
+    record_info(
+        "engine",
+        format!("LaunchDeck engine listening at http://{addr}"),
+        Some(json!({
+            "address": addr.to_string(),
+        })),
+    );
     println!("LaunchDeck engine running at http://{}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

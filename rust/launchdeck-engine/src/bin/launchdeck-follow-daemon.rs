@@ -8,6 +8,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use launchdeck_engine::{
+    app_logs::{record_error, record_info, record_warn},
     bags_native::{
         compile_follow_buy_transaction as compile_bags_follow_buy_transaction,
         compile_follow_sell_transaction as compile_bags_follow_sell_transaction,
@@ -18,16 +19,16 @@ use launchdeck_engine::{
         compile_follow_sell_transaction_with_token_amount as compile_bonk_follow_sell_transaction_with_token_amount,
         fetch_bonk_market_snapshot,
     },
-    launchpad_dispatch::compile_atomic_follow_buy_for_launchpad,
+    crypto::install_rustls_crypto_provider,
     follow::{
         DeferredSetupState, FOLLOW_RESPONSE_SCHEMA_VERSION, FollowActionKind, FollowActionRecord,
         FollowActionState, FollowArmRequest, FollowCancelRequest, FollowDaemonHealth,
-        FollowDaemonStore,
-        FollowJobRecord, FollowJobResponse, FollowJobState, FollowReadyRequest,
+        FollowDaemonStore, FollowJobRecord, FollowJobResponse, FollowJobState, FollowReadyRequest,
         FollowReadyResponse, FollowReserveRequest, FollowStopAllRequest, FollowWatcherHealth,
         follow_job_response, follow_ready_response, should_use_post_setup_creator_vault_for_buy,
         should_use_post_setup_creator_vault_for_sell,
     },
+    launchpad_dispatch::compile_atomic_follow_buy_for_launchpad,
     observability::update_persisted_follow_daemon_snapshot,
     paths,
     pump_native::{
@@ -35,16 +36,16 @@ use launchdeck_engine::{
         fetch_pump_market_snapshot, finalize_follow_buy_transaction, prepare_follow_buy_runtime,
         prepare_follow_buy_static, pump_bonding_curve_address,
     },
+    report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
     rpc::{
         confirm_submitted_transactions_for_transport, fetch_current_block_height,
-        fetch_current_block_height_fresh,
-        spawn_blockhash_refresh_task, submit_transactions_for_transport,
+        fetch_current_block_height_fresh, spawn_blockhash_refresh_task,
+        submit_transactions_for_transport,
     },
     transport::{
         TransportPlan, build_transport_plan, configured_watch_endpoints_for_provider,
-        supports_helius_transaction_subscribe,
+        prefers_helius_transaction_subscribe_path, resolved_helius_transaction_subscribe_ws_url,
     },
-    report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
     wallet::{
         fetch_balance_lamports, fetch_token_balance, load_solana_wallet_by_env_key,
         public_key_from_secret, selected_wallet_key_or_default,
@@ -318,6 +319,7 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, J
     if actual == expected {
         Ok(())
     } else {
+        record_warn("follow-daemon", "Unauthorized follow daemon request.", None);
         Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -442,7 +444,10 @@ fn follow_buy_cache_key(trace_id: &str, action_id: &str) -> String {
     format!("{trace_id}:{action_id}")
 }
 
-fn hot_follow_buy_runtime_cache_key(trace_id: &str, prefer_post_setup_creator_vault: bool) -> String {
+fn hot_follow_buy_runtime_cache_key(
+    trace_id: &str,
+    prefer_post_setup_creator_vault: bool,
+) -> String {
     format!(
         "{trace_id}:{}",
         if prefer_post_setup_creator_vault {
@@ -496,11 +501,12 @@ async fn get_hot_follow_buy_runtime(
     prefer_post_setup_creator_vault: bool,
 ) -> Option<CachedFollowBuyRuntime> {
     let cache = state.hot_follow_buy_runtime.lock().await;
-    cache.get(&hot_follow_buy_runtime_cache_key(
-        trace_id,
-        prefer_post_setup_creator_vault,
-    ))
-    .cloned()
+    cache
+        .get(&hot_follow_buy_runtime_cache_key(
+            trace_id,
+            prefer_post_setup_creator_vault,
+        ))
+        .cloned()
 }
 
 async fn clear_follow_buy_caches(state: &Arc<AppState>, trace_id: &str) {
@@ -1006,9 +1012,12 @@ fn selected_realtime_watcher_mode(
     endpoint_profile: &str,
     watch_endpoint: Option<&str>,
 ) -> String {
-    if configured_enable_helius_transaction_subscribe()
-        && supports_helius_transaction_subscribe(provider, endpoint_profile, watch_endpoint)
-    {
+    let _ = provider;
+    let _ = endpoint_profile;
+    if prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        watch_endpoint,
+    ) {
         "helius-transaction-subscribe".to_string()
     } else {
         "standard-ws".to_string()
@@ -1023,20 +1032,19 @@ fn selected_market_watcher_mode(
     selected_realtime_watcher_mode(provider, endpoint_profile, watch_endpoint)
 }
 
-async fn remember_watch_endpoint(
-    state: &Arc<AppState>,
-    endpoint: &str,
-) {
+async fn remember_watch_endpoint(state: &Arc<AppState>, endpoint: &str) {
     let key = watch_endpoint_cache_key(endpoint);
     let mut cache = state.watch_endpoint_health.lock().await;
-    cache.entry(key).or_insert_with(|| CachedWatchEndpointHealth {
-        endpoint: endpoint.to_string(),
-        checked_at_ms: 0,
-        healthy: false,
-        error: Some("Watcher health has not been validated yet.".to_string()),
-        provider: None,
-        endpoint_profile: None,
-    });
+    cache
+        .entry(key)
+        .or_insert_with(|| CachedWatchEndpointHealth {
+            endpoint: endpoint.to_string(),
+            checked_at_ms: 0,
+            healthy: false,
+            error: Some("Watcher health has not been validated yet.".to_string()),
+            provider: None,
+            endpoint_profile: None,
+        });
 }
 
 async fn cached_watch_endpoint_health(
@@ -1064,9 +1072,11 @@ async fn store_watch_endpoint_health(
     let provider = provider
         .map(str::to_string)
         .or_else(|| previous.as_ref().and_then(|entry| entry.provider.clone()));
-    let endpoint_profile = endpoint_profile
-        .map(str::to_string)
-        .or_else(|| previous.as_ref().and_then(|entry| entry.endpoint_profile.clone()));
+    let endpoint_profile = endpoint_profile.map(str::to_string).or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|entry| entry.endpoint_profile.clone())
+    });
     let entry = CachedWatchEndpointHealth {
         endpoint: endpoint.to_string(),
         checked_at_ms: now_ms(),
@@ -1125,7 +1135,8 @@ async fn refresh_watch_endpoint_health(
     let result = validate_watch_endpoint(endpoint).await;
     match &result {
         Ok(()) => {
-            store_watch_endpoint_health(state, endpoint, true, None, provider, endpoint_profile).await;
+            store_watch_endpoint_health(state, endpoint, true, None, provider, endpoint_profile)
+                .await;
         }
         Err(error) => {
             store_watch_endpoint_health(
@@ -1409,8 +1420,8 @@ async fn reserve_job(
         watch_endpoint.as_ref(),
         true,
     )
-        .await
-        .map_err(internal_error)?;
+    .await
+    .map_err(internal_error)?;
     let existing = get_job(&state, &payload.traceId).await;
     let health = build_health(&state).await;
     if existing.is_none() && !has_capacity_for_new_job(&health) {
@@ -1428,6 +1439,16 @@ async fn reserve_job(
         .reserve_job(payload)
         .await
         .map_err(internal_error)?;
+    record_info(
+        "follow-daemon",
+        "Reserved follow job.",
+        Some(json!({
+            "traceId": job.traceId,
+            "jobId": job.jobId,
+            "launchpad": job.launchpad,
+            "quoteAsset": job.quoteAsset,
+        })),
+    );
     update_job_timings(&state, &job.traceId, |timings| {
         timings.reserveMs = Some(reserve_started.elapsed().as_millis());
     })
@@ -1445,6 +1466,15 @@ async fn arm_job(
     authorize(&headers, &state)?;
     let trace_id = payload.traceId.clone();
     let job = state.store.arm_job(payload).await.map_err(internal_error)?;
+    record_info(
+        "follow-daemon",
+        "Armed follow job.",
+        Some(json!({
+            "traceId": job.traceId,
+            "jobId": job.jobId,
+            "launchpad": job.launchpad,
+        })),
+    );
     update_job_timings(&state, &trace_id, |timings| {
         timings.armMs = Some(arm_started.elapsed().as_millis());
     })
@@ -1458,7 +1488,10 @@ async fn arm_job(
         let cache_started = Instant::now();
         prepare_follow_job_buy_caches(arm_task_state.clone(), &arm_task_job).await;
         update_job_timings(&arm_task_state, &arm_task_trace_id, |timings| {
-            add_time(&mut timings.cachePrepMs, cache_started.elapsed().as_millis());
+            add_time(
+                &mut timings.cachePrepMs,
+                cache_started.elapsed().as_millis(),
+            );
         })
         .await;
     });
@@ -1478,6 +1511,14 @@ async fn cancel_job(
         .cancel_job(payload)
         .await
         .map_err(internal_error)?;
+    record_info(
+        "follow-daemon",
+        "Cancelled follow job.",
+        Some(json!({
+            "traceId": job.traceId,
+            "jobId": job.jobId,
+        })),
+    );
     sync_follow_job_report_final(&state, &trace_id).await;
     Ok(Json(job_response(&state, Some(job)).await))
 }
@@ -1525,6 +1566,13 @@ async fn stop_all_jobs(
 }
 
 fn internal_error(error: String) -> (StatusCode, Json<Value>) {
+    record_error(
+        "follow-daemon",
+        "Follow daemon request failed.",
+        Some(json!({
+            "message": error,
+        })),
+    );
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
@@ -1571,9 +1619,11 @@ fn refresh_follow_job_timing_rollups(job: &mut FollowJobRecord) {
             .iter()
             .map(|action| action.timings.eligibilityMs),
     );
-    let action_compile = sum_follow_times(job.actions.iter().map(|action| action.timings.compileMs));
+    let action_compile =
+        sum_follow_times(job.actions.iter().map(|action| action.timings.compileMs));
     let action_submit = sum_follow_times(job.actions.iter().map(|action| action.timings.submitMs));
-    let action_confirm = sum_follow_times(job.actions.iter().map(|action| action.timings.confirmMs));
+    let action_confirm =
+        sum_follow_times(job.actions.iter().map(|action| action.timings.confirmMs));
     let action_execution = sum_follow_times(
         job.actions
             .iter()
@@ -1591,10 +1641,8 @@ fn refresh_follow_job_timing_rollups(job: &mut FollowJobRecord) {
         job.timings.cachePrepMs,
         action_execution,
     ]);
-    job.timings.reportingOverheadMs = sum_follow_times([
-        job.timings.reportSyncMs,
-        job.timings.followSnapshotFlushMs,
-    ]);
+    job.timings.reportingOverheadMs =
+        sum_follow_times([job.timings.reportSyncMs, job.timings.followSnapshotFlushMs]);
 }
 
 async fn update_job_timings(
@@ -1706,7 +1754,10 @@ async fn queue_follow_job_report_sync(
         "health": health,
     });
     update_job_timings(state, trace_id, |timings| {
-        add_time(&mut timings.reportSyncMs, sync_started.elapsed().as_millis());
+        add_time(
+            &mut timings.reportSyncMs,
+            sync_started.elapsed().as_millis(),
+        );
     })
     .await;
     let delay_ms = match mode {
@@ -1816,7 +1867,10 @@ async fn run_job(state: Arc<AppState>, trace_id: String) {
             .triggerKey
             .clone()
             .unwrap_or_else(|| action.actionId.clone());
-        grouped_by_trigger.entry(key).or_default().push(action.clone());
+        grouped_by_trigger
+            .entry(key)
+            .or_default()
+            .push(action.clone());
     }
     for (_, mut actions) in grouped_by_trigger {
         actions.sort_by_key(action_group_sort_key);
@@ -1840,7 +1894,8 @@ async fn run_job(state: Arc<AppState>, trace_id: String) {
     if job.deferredSetup.is_some() {
         let setup_state = state.clone();
         let setup_trace_id = trace_id.clone();
-        action_tasks.spawn(async move { run_deferred_setup_task(setup_state, setup_trace_id).await });
+        action_tasks
+            .spawn(async move { run_deferred_setup_task(setup_state, setup_trace_id).await });
     }
     while let Some(result) = action_tasks.join_next().await {
         match result {
@@ -1874,20 +1929,47 @@ async fn run_job(state: Arc<AppState>, trace_id: String) {
         .deferredSetup
         .as_ref()
         .is_some_and(|setup| matches!(setup.state, DeferredSetupState::Confirmed));
-    let final_state =
-        if final_job.cancelRequested || matches!(final_job.state, FollowJobState::Cancelled) {
-            FollowJobState::Cancelled
-        } else if (has_failed_actions || setup_failed) && (has_confirmed_actions || setup_confirmed) {
-            FollowJobState::CompletedWithFailures
-        } else if had_failure || has_failed_actions || setup_failed {
-            FollowJobState::Failed
-        } else {
-            FollowJobState::Completed
-        };
+    let final_state = if final_job.cancelRequested
+        || matches!(final_job.state, FollowJobState::Cancelled)
+    {
+        FollowJobState::Cancelled
+    } else if (has_failed_actions || setup_failed) && (has_confirmed_actions || setup_confirmed) {
+        FollowJobState::CompletedWithFailures
+    } else if had_failure || has_failed_actions || setup_failed {
+        FollowJobState::Failed
+    } else {
+        FollowJobState::Completed
+    };
     let _ = state
         .store
-        .finalize_job_state(&trace_id, final_state, None)
+        .finalize_job_state(&trace_id, final_state.clone(), None)
         .await;
+    match final_state {
+        FollowJobState::Completed => record_info(
+            "follow-daemon",
+            "Follow job completed.",
+            Some(json!({ "traceId": trace_id })),
+        ),
+        FollowJobState::CompletedWithFailures => record_warn(
+            "follow-daemon",
+            "Follow job completed with failures.",
+            Some(json!({ "traceId": trace_id })),
+        ),
+        FollowJobState::Failed => record_error(
+            "follow-daemon",
+            "Follow job failed.",
+            Some(json!({
+                "traceId": trace_id,
+                "lastError": final_job.lastError,
+            })),
+        ),
+        FollowJobState::Cancelled => record_info(
+            "follow-daemon",
+            "Follow job cancelled.",
+            Some(json!({ "traceId": trace_id })),
+        ),
+        _ => {}
+    }
     sync_follow_job_report_final(&state, &trace_id).await;
     clear_follow_buy_caches(&state, &trace_id).await;
     remove_job_watch_hub(&state, &trace_id).await;
@@ -2117,7 +2199,10 @@ async fn run_deferred_setup_task(state: Arc<AppState>, trace_id: String) -> Resu
         let Some(setup) = job.deferredSetup.clone() else {
             return Ok(());
         };
-        if matches!(setup.state, DeferredSetupState::Confirmed | DeferredSetupState::Failed) {
+        if matches!(
+            setup.state,
+            DeferredSetupState::Confirmed | DeferredSetupState::Failed
+        ) {
             return Ok(());
         }
         wait_for_signature_confirmation(state.clone(), &job, "post-confirm-setup").await?;
@@ -2440,10 +2525,8 @@ async fn execute_action(
         .as_deref()
         .ok_or_else(|| "Follow job missing launch creator.".to_string())?;
     let compile_started = Instant::now();
-    let prefer_post_setup_creator_vault_for_buy = should_use_post_setup_creator_vault_for_buy(
-        job.preferPostSetupCreatorVaultForSell,
-        action,
-    );
+    let prefer_post_setup_creator_vault_for_buy =
+        should_use_post_setup_creator_vault_for_buy(job.preferPostSetupCreatorVaultForSell, action);
     let prefer_post_setup_creator_vault_for_sell = should_use_post_setup_creator_vault_for_sell(
         job.preferPostSetupCreatorVaultForSell,
         action,
@@ -2474,14 +2557,13 @@ async fn execute_action(
         )
         .await?;
         match action.kind {
-        FollowActionKind::SniperBuy => {
-            let amount = action
-                .buyAmountSol
-                .as_deref()
-                .ok_or_else(|| "Follow buy missing amount.".to_string())?;
-            if job.launchpad == "bonk" {
-                Some(
-                    if job.quoteAsset == "usd1" {
+            FollowActionKind::SniperBuy => {
+                let amount = action
+                    .buyAmountSol
+                    .as_deref()
+                    .ok_or_else(|| "Follow buy missing amount.".to_string())?;
+                if job.launchpad == "bonk" {
+                    Some(if job.quoteAsset == "usd1" {
                         compile_atomic_follow_buy_for_launchpad(
                             &job.launchpad,
                             &job.launchMode,
@@ -2511,97 +2593,95 @@ async fn execute_action(
                             true,
                         )
                         .await?
-                    }
-                )
-            } else if job.launchpad == "bagsapp" {
-                Some(
-                    compile_bags_follow_buy_transaction(
-                        &state.rpc_url,
-                        &job.execution,
-                        job.tokenMayhemMode,
-                        &job.buyTipAccount,
+                    })
+                } else if job.launchpad == "bagsapp" {
+                    Some(
+                        compile_bags_follow_buy_transaction(
+                            &state.rpc_url,
+                            &job.execution,
+                            job.tokenMayhemMode,
+                            &job.buyTipAccount,
+                            &wallet_secret,
+                            mint,
+                            launch_creator,
+                            amount,
+                        )
+                        .await?,
+                    )
+                } else {
+                    let prepared = resolve_prepared_follow_buy(
+                        &state,
+                        job,
+                        action,
                         &wallet_secret,
-                        mint,
                         launch_creator,
                         amount,
                     )
-                    .await?,
-                )
-            } else {
-                let prepared = resolve_prepared_follow_buy(
-                    &state,
-                    job,
-                    action,
-                    &wallet_secret,
-                    launch_creator,
-                    amount,
-                )
-                .await?;
-                let runtime =
-                    resolve_hot_follow_buy_runtime_for_job(
+                    .await?;
+                    let runtime = resolve_hot_follow_buy_runtime_for_job(
                         &state,
                         job,
                         launch_creator,
                         prefer_post_setup_creator_vault_for_buy,
                     )
                     .await?;
-                Some(
-                    finalize_follow_buy_transaction(
+                    Some(
+                        finalize_follow_buy_transaction(
+                            &state.rpc_url,
+                            &job.execution,
+                            job.tokenMayhemMode,
+                            &wallet_secret,
+                            &prepared,
+                            &runtime,
+                        )
+                        .await?,
+                    )
+                }
+            }
+            FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
+                if job.launchpad == "bonk" {
+                    compile_bonk_follow_sell_transaction_with_token_amount(
+                        &state.rpc_url,
+                        &job.quoteAsset,
+                        &job.execution,
+                        &job.sellTipAccount,
+                        &wallet_secret,
+                        mint,
+                        sell_percent.unwrap_or_default(),
+                        None,
+                        action.poolId.as_deref(),
+                        None,
+                        None,
+                    )
+                    .await?
+                } else if job.launchpad == "bagsapp" {
+                    compile_bags_follow_sell_transaction(
                         &state.rpc_url,
                         &job.execution,
                         job.tokenMayhemMode,
+                        &job.sellTipAccount,
                         &wallet_secret,
-                        &prepared,
-                        &runtime,
+                        mint,
+                        launch_creator,
+                        sell_percent.unwrap_or_default(),
+                        prefer_post_setup_creator_vault_for_sell,
                     )
-                    .await?,
-                )
+                    .await?
+                } else {
+                    compile_follow_sell_transaction(
+                        &state.rpc_url,
+                        &job.execution,
+                        job.tokenMayhemMode,
+                        &job.sellTipAccount,
+                        &wallet_secret,
+                        mint,
+                        launch_creator,
+                        sell_percent.unwrap_or_default(),
+                        prefer_post_setup_creator_vault_for_sell,
+                    )
+                    .await?
+                }
             }
-        }
-        FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
-            if job.launchpad == "bonk" {
-                compile_bonk_follow_sell_transaction_with_token_amount(
-                    &state.rpc_url,
-                    &job.quoteAsset,
-                    &job.execution,
-                    &job.sellTipAccount,
-                    &wallet_secret,
-                    mint,
-                    sell_percent.unwrap_or_default(),
-                    None,
-                    action.poolId.as_deref(),
-                    None,
-                    None,
-                )
-                .await?
-            } else if job.launchpad == "bagsapp" {
-                compile_bags_follow_sell_transaction(
-                    &state.rpc_url,
-                    &job.execution,
-                    job.tokenMayhemMode,
-                    &job.sellTipAccount,
-                    &wallet_secret,
-                    mint,
-                    launch_creator,
-                    sell_percent.unwrap_or_default(),
-                    prefer_post_setup_creator_vault_for_sell,
-                )
-                .await?
-            } else {
-                compile_follow_sell_transaction(
-                    &state.rpc_url,
-                    &job.execution,
-                    job.tokenMayhemMode,
-                    &job.sellTipAccount,
-                    &wallet_secret,
-                    mint,
-                    launch_creator,
-                    sell_percent.unwrap_or_default(),
-                    prefer_post_setup_creator_vault_for_sell,
-                )
-                .await?
-            }
-        }
         }
     };
     let Some(mut compiled) = compiled else {
@@ -2758,12 +2838,15 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
     let trace_id = job.traceId.clone();
     let mut attempt = setup.attemptCount;
     loop {
-        let _ = state.store.update_job(&trace_id, |record| {
-            if let Some(setup) = record.deferredSetup.as_mut() {
-                setup.state = DeferredSetupState::Running;
-                setup.attemptCount = setup.attemptCount.saturating_add(1);
-            }
-        }).await;
+        let _ = state
+            .store
+            .update_job(&trace_id, |record| {
+                if let Some(setup) = record.deferredSetup.as_mut() {
+                    setup.state = DeferredSetupState::Running;
+                    setup.attemptCount = setup.attemptCount.saturating_add(1);
+                }
+            })
+            .await;
         sync_follow_job_report(&state, &trace_id).await;
         let _send_permit =
             acquire_capacity_slot(state.send_slots.clone(), state.capacity_wait_ms, "send").await?;
@@ -2782,18 +2865,21 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
                     .iter()
                     .filter_map(|entry| entry.signature.clone())
                     .collect::<Vec<_>>();
-                let _ = state.store.update_job(&trace_id, |record| {
-                    if let Some(setup) = record.deferredSetup.as_mut() {
-                        setup.state = DeferredSetupState::Sent;
-                        setup.submittedAtMs = Some(now_ms());
-                        setup.signatures = signatures.clone();
-                        setup.lastError = if warnings.is_empty() {
-                            None
-                        } else {
-                            Some(warnings.join(" | "))
-                        };
-                    }
-                }).await;
+                let _ = state
+                    .store
+                    .update_job(&trace_id, |record| {
+                        if let Some(setup) = record.deferredSetup.as_mut() {
+                            setup.state = DeferredSetupState::Sent;
+                            setup.submittedAtMs = Some(now_ms());
+                            setup.signatures = signatures.clone();
+                            setup.lastError = if warnings.is_empty() {
+                                None
+                            } else {
+                                Some(warnings.join(" | "))
+                            };
+                        }
+                    })
+                    .await;
                 let _ = confirm_submitted_transactions_for_transport(
                     &state.rpc_url,
                     &transport_plan,
@@ -2802,32 +2888,41 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
                     job.execution.trackSendBlockHeight,
                 )
                 .await?;
-                let _ = state.store.update_job(&trace_id, |record| {
-                    if let Some(setup) = record.deferredSetup.as_mut() {
-                        setup.state = DeferredSetupState::Confirmed;
-                        setup.confirmedAtMs = Some(now_ms());
-                    }
-                }).await;
+                let _ = state
+                    .store
+                    .update_job(&trace_id, |record| {
+                        if let Some(setup) = record.deferredSetup.as_mut() {
+                            setup.state = DeferredSetupState::Confirmed;
+                            setup.confirmedAtMs = Some(now_ms());
+                        }
+                    })
+                    .await;
                 sync_follow_job_report(&state, &trace_id).await;
                 return Ok(());
             }
             Err(error) if attempt < 2 && is_retryable_action_error(&error) => {
                 attempt = attempt.saturating_add(1);
-                let _ = state.store.update_job(&trace_id, |record| {
-                    if let Some(setup) = record.deferredSetup.as_mut() {
-                        setup.state = DeferredSetupState::Queued;
-                        setup.lastError = Some(error.clone());
-                    }
-                }).await;
+                let _ = state
+                    .store
+                    .update_job(&trace_id, |record| {
+                        if let Some(setup) = record.deferredSetup.as_mut() {
+                            setup.state = DeferredSetupState::Queued;
+                            setup.lastError = Some(error.clone());
+                        }
+                    })
+                    .await;
                 sleep(Duration::from_millis(action_retry_backoff_ms(attempt))).await;
             }
             Err(error) => {
-                let _ = state.store.update_job(&trace_id, |record| {
-                    if let Some(setup) = record.deferredSetup.as_mut() {
-                        setup.state = DeferredSetupState::Failed;
-                        setup.lastError = Some(error.clone());
-                    }
-                }).await;
+                let _ = state
+                    .store
+                    .update_job(&trace_id, |record| {
+                        if let Some(setup) = record.deferredSetup.as_mut() {
+                            setup.state = DeferredSetupState::Failed;
+                            setup.lastError = Some(error.clone());
+                        }
+                    })
+                    .await;
                 sync_follow_job_report(&state, &trace_id).await;
                 return Err(error);
             }
@@ -2835,22 +2930,34 @@ async fn execute_deferred_setup(state: Arc<AppState>, job: &FollowJobRecord) -> 
     }
 }
 
-fn follow_action_execution(job: &FollowJobRecord, action: &FollowActionRecord) -> launchdeck_engine::config::NormalizedExecution {
+fn follow_action_execution(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+) -> launchdeck_engine::config::NormalizedExecution {
     let mut execution = job.execution.clone();
     match action.kind {
         FollowActionKind::SniperBuy => {
             execution.provider = job.execution.buyProvider.clone();
             execution.endpointProfile = job.execution.buyEndpointProfile.clone();
+            execution.mevProtect = job.execution.buyMevProtect;
+            execution.mevMode = job.execution.buyMevMode.clone();
+            execution.jitodontfront = job.execution.buyJitodontfront;
         }
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
             execution.provider = job.execution.sellProvider.clone();
             execution.endpointProfile = job.execution.sellEndpointProfile.clone();
+            execution.mevProtect = job.execution.sellMevProtect;
+            execution.mevMode = job.execution.sellMevMode.clone();
+            execution.jitodontfront = job.execution.sellJitodontfront;
         }
     }
     execution
 }
 
-fn follow_action_transport_plan(job: &FollowJobRecord, action: &FollowActionRecord) -> TransportPlan {
+fn follow_action_transport_plan(
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+) -> TransportPlan {
     build_transport_plan(&follow_action_execution(job, action), 1)
 }
 
@@ -2921,7 +3028,8 @@ async fn wait_for_action_eligibility(
                     u64::from(action.targetBlockOffset.unwrap()),
                 )
                 .await?;
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             }
         }
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => {
@@ -2940,7 +3048,8 @@ async fn wait_for_action_eligibility(
                     ) => result?,
                     result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
                 }
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if has_slot {
                 let wait_started = Instant::now();
                 wait_for_slot_offset(
@@ -2951,14 +3060,16 @@ async fn wait_for_action_eligibility(
                     u64::from(action.targetBlockOffset.unwrap()),
                 )
                 .await?;
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if has_time && has_market {
                 let wait_started = Instant::now();
                 tokio::select! {
                     result = wait_until_ms(state.clone(), &job.traceId, Some(&action.actionId), action.scheduledForMs.unwrap()) => result?,
                     result = wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId) => result?,
                 }
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             } else if let Some(schedule_ms) = action.scheduledForMs {
                 wait_until_ms(
                     state.clone(),
@@ -2970,7 +3081,8 @@ async fn wait_for_action_eligibility(
             } else if has_market {
                 let wait_started = Instant::now();
                 wait_for_market_cap_trigger(state.clone(), job, action, &action.actionId).await?;
-                watcher_wait_ms = watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
+                watcher_wait_ms =
+                    watcher_wait_ms.saturating_add(wait_started.elapsed().as_millis());
             }
         }
     }
@@ -3232,9 +3344,8 @@ async fn complete_offset_consumers_for_approximate_tick(
                 let elapsed_ms = now.saturating_sub(consumer.confirmation_detected_at_ms) as u64;
                 let adjusted_elapsed_ms = elapsed_ms.saturating_add(correction_ms);
                 let estimated_blocks_elapsed = adjusted_elapsed_ms / interval_ms;
-                (estimated_blocks_elapsed >= consumer.target_block_offset).then(|| {
-                    (key.clone(), consumer.completion_tx.clone())
-                })
+                (estimated_blocks_elapsed >= consumer.target_block_offset)
+                    .then(|| (key.clone(), consumer.completion_tx.clone()))
             })
             .collect::<Vec<_>>()
     };
@@ -3261,7 +3372,8 @@ async fn complete_offset_consumers_for_height(state: &Arc<AppState>, block_heigh
                 let target_height = consumer
                     .base_confirmed_block_height
                     .saturating_add(consumer.target_block_offset);
-                (block_height >= target_height).then(|| (key.clone(), consumer.completion_tx.clone()))
+                (block_height >= target_height)
+                    .then(|| (key.clone(), consumer.completion_tx.clone()))
             })
             .collect::<Vec<_>>()
     };
@@ -3314,7 +3426,7 @@ async fn run_offset_worker(state: Arc<AppState>) {
                 interval_ms,
                 next_tick_correction_ms,
             )
-                .await;
+            .await;
             next_tick_correction_ms = 0;
             delay_ms = interval_ms;
             continue;
@@ -3327,11 +3439,13 @@ async fn run_offset_worker(state: Arc<AppState>) {
                     let previous_block_height =
                         { *state.offset_worker.last_observed_block_height.lock().await };
                     {
-                        let mut last_height = state.offset_worker.last_observed_block_height.lock().await;
+                        let mut last_height =
+                            state.offset_worker.last_observed_block_height.lock().await;
                         *last_height = Some(block_height);
                     }
                     {
-                        let mut last_observed_at = state.offset_worker.last_observed_at_ms.lock().await;
+                        let mut last_observed_at =
+                            state.offset_worker.last_observed_at_ms.lock().await;
                         *last_observed_at = Some(now_ms());
                     }
                     set_watcher_health(
@@ -3418,9 +3532,15 @@ async fn capture_action_watcher_metadata(
             inferred_endpoint.as_deref(),
         )),
     };
-    let fallback_reason = health.lastError.clone().filter(|value| !value.trim().is_empty());
+    let fallback_reason = health
+        .lastError
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     let mode = match kind {
-        WatcherKind::Slot => health.slotWatcherMode.clone().or_else(|| inferred_mode.clone()),
+        WatcherKind::Slot => health
+            .slotWatcherMode
+            .clone()
+            .or_else(|| inferred_mode.clone()),
         WatcherKind::Signature => {
             if fallback_reason.is_some() {
                 health
@@ -3801,20 +3921,20 @@ async fn run_signature_watcher(
         return;
     };
     let mut attempt: u32 = 0;
-    let prefers_helius_transaction_subscribe = configured_enable_helius_transaction_subscribe()
-        && supports_helius_transaction_subscribe(
-            &job.execution.provider,
-            &job.execution.endpointProfile,
-            Some(&endpoint),
-        );
+    let prefers_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        Some(&endpoint),
+    );
     loop {
         let session: Result<u64, String> = async {
             if prefers_helius_transaction_subscribe {
+                let hel_ws = resolved_helius_transaction_subscribe_ws_url(Some(&endpoint))
+                    .expect("Helius transactionSubscribe enabled but HELIUS_WS_URL / Helius watch endpoint is missing");
                 match run_helius_transaction_signature_watcher_session(
                     &state,
                     &job,
                     &tx,
-                    &endpoint,
+                    &hel_ws,
                     &signature,
                 )
                 .await
@@ -3912,18 +4032,16 @@ async fn run_slot_watcher(
 ) {
     let mut attempt: u32 = 0;
     let watch_endpoint = resolve_job_watch_endpoint(&job).ok();
-    let prefers_helius_transaction_subscribe = watch_endpoint.as_deref().is_some_and(|endpoint| {
-        configured_enable_helius_transaction_subscribe()
-            && supports_helius_transaction_subscribe(
-                &job.execution.provider,
-                &job.execution.endpointProfile,
-                Some(endpoint),
-            )
-    });
+    let prefers_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        watch_endpoint.as_deref(),
+    );
     loop {
         let session = if let Some(endpoint) = watch_endpoint.as_deref() {
             if prefers_helius_transaction_subscribe {
-                match run_helius_transaction_slot_watcher_session(&state, &job, &tx, endpoint).await
+                let hel_ws = resolved_helius_transaction_subscribe_ws_url(Some(endpoint))
+                    .expect("Helius transactionSubscribe enabled but HELIUS_WS_URL / Helius watch endpoint is missing");
+                match run_helius_transaction_slot_watcher_session(&state, &job, &tx, &hel_ws).await
                 {
                     Ok(()) => Ok(()),
                     Err(error) => {
@@ -3963,7 +4081,8 @@ async fn run_slot_watcher(
                         let fallback_note = format!(
                             "Standard websocket slot watcher failed: {error}. Falling back to RPC polling."
                         );
-                        run_slot_watcher_polling_session(&state, &job, &tx, Some(fallback_note)).await
+                        run_slot_watcher_polling_session(&state, &job, &tx, Some(fallback_note))
+                            .await
                     }
                 }
             }
@@ -4016,24 +4135,24 @@ async fn run_market_watcher(
         return;
     };
     let mut attempt: u32 = 0;
-    let prefers_helius_transaction_subscribe = configured_enable_helius_transaction_subscribe()
-        && supports_helius_transaction_subscribe(
-            &job.execution.provider,
-            &job.execution.endpointProfile,
-            Some(&endpoint),
-        );
+    let prefers_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        Some(&endpoint),
+    );
     loop {
         let session = if prefers_helius_transaction_subscribe {
+            let hel_ws = resolved_helius_transaction_subscribe_ws_url(Some(&endpoint))
+                .expect("Helius transactionSubscribe enabled but HELIUS_WS_URL / Helius watch endpoint is missing");
             set_watcher_health(
                 &state,
                 WatcherKind::Market,
                 FollowWatcherHealth::Healthy,
                 Some("helius-transaction-subscribe".to_string()),
-                Some(endpoint.clone()),
+                Some(hel_ws.clone()),
                 None,
             )
             .await;
-            match run_helius_transaction_market_watcher_session(&state, &job, &tx, &endpoint, &mint)
+            match run_helius_transaction_market_watcher_session(&state, &job, &tx, &hel_ws, &mint)
                 .await
             {
                 Ok(()) => Ok(()),
@@ -4235,8 +4354,13 @@ async fn wait_for_market_cap_trigger(
                             current_health.lastError.clone(),
                         )
                         .await;
-                        capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market)
-                            .await;
+                        capture_action_watcher_metadata(
+                            &state,
+                            job,
+                            action_id,
+                            WatcherKind::Market,
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
@@ -4354,6 +4478,7 @@ async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+    install_rustls_crypto_provider();
     let base_url = configured_follow_daemon_base_url();
     let max_active_jobs = configured_limit("LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS");
     let max_concurrent_compiles = configured_limit("LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES");
@@ -4424,6 +4549,14 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind LaunchDeck follow daemon listener");
+    record_info(
+        "follow-daemon",
+        format!("LaunchDeck follow daemon listening at {}", base_url),
+        Some(json!({
+            "address": addr.to_string(),
+            "baseUrl": base_url,
+        })),
+    );
     println!("LaunchDeck follow daemon running at {}", base_url);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -4465,6 +4598,7 @@ mod tests {
             "trackSendBlockHeight": true,
             "provider": "helius-sender",
             "endpointProfile": "us",
+            "mevProtect": false,
             "autoGas": false,
             "autoMode": "off",
             "priorityFeeSol": "0.001",
@@ -4473,6 +4607,7 @@ mod tests {
             "maxTipSol": "",
             "buyProvider": "standard-rpc",
             "buyEndpointProfile": "",
+            "buyMevProtect": false,
             "buyAutoGas": false,
             "buyAutoMode": "off",
             "buyPriorityFeeSol": "0.001",
@@ -4484,6 +4619,7 @@ mod tests {
             "sellAutoMode": "off",
             "sellProvider": "jito-bundle",
             "sellEndpointProfile": "eu",
+            "sellMevProtect": false,
             "sellPriorityFeeSol": "0.001",
             "sellTipSol": "0.01",
             "sellSlippagePercent": "90",
@@ -5043,6 +5179,26 @@ mod tests {
         );
         unsafe {
             env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
+        }
+    }
+
+    #[test]
+    fn selected_realtime_watcher_mode_uses_helius_ws_env_with_non_helius_watch() {
+        unsafe {
+            env::set_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE", "true");
+            env::set_var("HELIUS_WS_URL", "wss://mainnet.helius-rpc.com/?api-key=test-env");
+        }
+        assert_eq!(
+            selected_realtime_watcher_mode(
+                "standard-rpc",
+                "us",
+                Some("wss://rpc.shyft.to/ws"),
+            ),
+            "helius-transaction-subscribe"
+        );
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
+            env::remove_var("HELIUS_WS_URL");
         }
     }
 

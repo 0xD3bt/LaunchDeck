@@ -111,6 +111,8 @@ struct HelperTxConfig<'a> {
     computeUnitPriceMicroLamports: u64,
     tipLamports: u64,
     tipAccount: &'a str,
+    jitodontfront: bool,
+    singleBundleTipLastTx: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -444,31 +446,52 @@ fn helper_tx_config(
     compute_unit_price_micro_lamports: u64,
     tip_lamports: u64,
     tip_account: &str,
+    jitodontfront: bool,
+    single_bundle_tip_last_tx: bool,
 ) -> HelperTxConfig<'_> {
     HelperTxConfig {
-        computeUnitLimit: compute_unit_limit.unwrap_or_else(configured_default_launch_compute_unit_limit),
+        computeUnitLimit: compute_unit_limit
+            .unwrap_or_else(configured_default_launch_compute_unit_limit),
         computeUnitPriceMicroLamports: compute_unit_price_micro_lamports,
         tipLamports: tip_lamports,
         tipAccount: tip_account,
+        jitodontfront,
+        singleBundleTipLastTx: single_bundle_tip_last_tx,
     }
+}
+
+fn uses_single_bundle_tip_last_tx(provider: &str, mev_mode: &str) -> bool {
+    provider.trim().eq_ignore_ascii_case("hellomoon")
+        && mev_mode.trim().eq_ignore_ascii_case("secure")
 }
 
 fn provider_uses_follow_tip(provider: &str) -> bool {
     matches!(
         provider.trim().to_ascii_lowercase().as_str(),
-        "helius-sender" | "jito-bundle"
+        "helius-sender" | "hellomoon" | "jito-bundle"
     )
 }
 
-fn resolve_follow_tip_lamports(
-    provider: &str,
-    tip_sol: &str,
-    label: &str,
-) -> Result<u64, String> {
+const HELLOMOON_MIN_FOLLOW_TIP_LAMPORTS: u64 = 1_000_000;
+
+fn resolve_follow_tip_lamports(provider: &str, tip_sol: &str, label: &str) -> Result<u64, String> {
     if !provider_uses_follow_tip(provider) {
         return Ok(0);
     }
-    parse_decimal_u64(tip_sol, 9, label)
+    if provider.trim().eq_ignore_ascii_case("hellomoon") && tip_sol.trim().is_empty() {
+        return Err(format!(
+            "{label} cannot be empty when using Hello Moon for follow / snipe / auto-sell."
+        ));
+    }
+    let tip_lamports = parse_decimal_u64(tip_sol, 9, label)?;
+    if provider.trim().eq_ignore_ascii_case("hellomoon")
+        && tip_lamports < HELLOMOON_MIN_FOLLOW_TIP_LAMPORTS
+    {
+        return Err(format!(
+            "{label} must be at least 0.001 SOL when using Hello Moon for follow / snipe / auto-sell."
+        ));
+    }
+    Ok(tip_lamports)
 }
 
 fn parse_decimal_u64(value: &str, decimals: u32, label: &str) -> Result<u64, String> {
@@ -643,6 +666,8 @@ pub async fn compile_sol_to_usd1_topup_transaction(
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
+            execution.buyJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.buyProvider, &execution.buyMevMode),
         ),
     }))
     .await?;
@@ -687,6 +712,8 @@ pub async fn try_compile_native_bonk(
                 .unwrap_or_default(),
             tip_lamports,
             &config.tx.jitoTipAccount,
+            config.execution.jitodontfront,
+            uses_single_bundle_tip_last_tx(&config.execution.provider, &config.execution.mevMode),
         ),
         "token": {
             "name": config.token.name,
@@ -720,9 +747,10 @@ pub async fn try_compile_native_bonk(
         "Bonk launch assembly uses the Raydium LaunchLab SDK-backed compile bridge.".to_string(),
     );
     if response.atomicCombined {
-        report.execution.notes.push(
-            "USD1 dev buy was assembled atomically with the launch transaction.".to_string(),
-        );
+        report
+            .execution
+            .notes
+            .push("USD1 dev buy was assembled atomically with the launch transaction.".to_string());
     } else if let Some(reason) = response.atomicFallbackReason.as_ref() {
         report.execution.notes.push(format!(
             "USD1 dev buy uses split launch transactions: {reason}"
@@ -772,7 +800,8 @@ pub async fn compile_follow_buy_transaction(
     buy_amount_sol: &str,
     allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
-    let tip_lamports = resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
         "action": "compile-follow-buy",
         "rpcUrl": rpc_url,
@@ -789,6 +818,8 @@ pub async fn compile_follow_buy_transaction(
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
+            execution.buyJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.buyProvider, &execution.buyMevMode),
         ),
     }))
     .await?;
@@ -808,7 +839,8 @@ pub async fn compile_atomic_follow_buy_transaction(
     buy_amount_sol: &str,
     allow_ata_creation: bool,
 ) -> Result<CompiledTransaction, String> {
-    let tip_lamports = resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
+    let tip_lamports =
+        resolve_follow_tip_lamports(&execution.buyProvider, &execution.buyTipSol, "buy tip")?;
     let response: HelperFollowBuyResponse = run_helper(&json!({
         "action": "compile-follow-buy-atomic",
         "mode": launch_mode,
@@ -827,6 +859,8 @@ pub async fn compile_atomic_follow_buy_transaction(
             priority_fee_sol_to_micro_lamports(&execution.buyPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
+            execution.buyJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.buyProvider, &execution.buyMevMode),
         ),
     }))
     .await?;
@@ -895,6 +929,8 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
             priority_fee_sol_to_micro_lamports(&execution.sellPriorityFeeSol)?,
             tip_lamports,
             jito_tip_account,
+            execution.sellJitodontfront,
+            uses_single_bundle_tip_last_tx(&execution.sellProvider, &execution.sellMevMode),
         ),
     }))
     .await?;
@@ -923,14 +959,15 @@ pub async fn predict_dev_buy_token_amount(
     .await?;
     response
         .predictedDevBuyTokenAmountRaw
-        .map(|value| value.parse::<u64>().map_err(|error| format!("Invalid Bonk predicted dev buy token amount: {error}")))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| format!("Invalid Bonk predicted dev buy token amount: {error}"))
+        })
         .transpose()
 }
 
-pub async fn derive_canonical_pool_id(
-    quote_asset: &str,
-    mint: &str,
-) -> Result<String, String> {
+pub async fn derive_canonical_pool_id(quote_asset: &str, mint: &str) -> Result<String, String> {
     let response: HelperDerivePoolIdResponse = run_helper(&json!({
         "action": "derive-pool-id",
         "quoteAsset": quote_asset,
@@ -1036,6 +1073,18 @@ mod tests {
         let tip_lamports =
             resolve_follow_tip_lamports("jito-bundle", "0.01", "buy tip").expect("jito tip");
         assert!(tip_lamports > 0);
+    }
+
+    #[test]
+    fn hellomoon_follow_tip_requires_at_least_point_zero_zero_one_sol() {
+        assert_eq!(
+            resolve_follow_tip_lamports("hellomoon", "0.001", "buy tip").expect("tip"),
+            1_000_000
+        );
+        resolve_follow_tip_lamports("hellomoon", "", "buy tip").expect_err("empty tip");
+        let error = resolve_follow_tip_lamports("hellomoon", "0.0001", "buy tip")
+            .expect_err("sub-minimum tip");
+        assert!(error.contains("0.001 SOL"), "unexpected: {error}");
     }
 
     #[test]

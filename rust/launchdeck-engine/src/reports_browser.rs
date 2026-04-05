@@ -264,16 +264,24 @@ pub fn record_persisted_report_payload(file_name: &str, payload: &Value) {
         newest: vec![],
         oldest: vec![],
     });
-    existing.files.retain(|entry| entry.file_name != safe_file_name);
+    existing
+        .files
+        .retain(|entry| entry.file_name != safe_file_name);
     existing.files.push(ReportCacheFileMeta {
         file_name: safe_file_name.clone(),
         modified_ms: written_at_ms,
         len: 0,
     });
-    existing.newest.retain(|entry| entry.fileName != safe_file_name);
-    existing.oldest.retain(|entry| entry.fileName != safe_file_name);
+    existing
+        .newest
+        .retain(|entry| entry.fileName != safe_file_name);
+    existing
+        .oldest
+        .retain(|entry| entry.fileName != safe_file_name);
     existing.newest.push(summary.clone());
-    existing.newest.sort_by(|left, right| right.writtenAtMs.cmp(&left.writtenAtMs));
+    existing
+        .newest
+        .sort_by(|left, right| right.writtenAtMs.cmp(&left.writtenAtMs));
     existing.oldest = existing.newest.clone();
     existing.oldest.reverse();
 }

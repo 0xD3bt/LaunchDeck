@@ -73,13 +73,22 @@ impl WorkerProcess {
                 ))
             })?;
         let stdin = child.stdin.take().ok_or_else(|| {
-            HelperWorkerError::Transport(format!("{} worker stdin was unavailable.", config.helper_name))
+            HelperWorkerError::Transport(format!(
+                "{} worker stdin was unavailable.",
+                config.helper_name
+            ))
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            HelperWorkerError::Transport(format!("{} worker stdout was unavailable.", config.helper_name))
+            HelperWorkerError::Transport(format!(
+                "{} worker stdout was unavailable.",
+                config.helper_name
+            ))
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
-            HelperWorkerError::Transport(format!("{} worker stderr was unavailable.", config.helper_name))
+            HelperWorkerError::Transport(format!(
+                "{} worker stderr was unavailable.",
+                config.helper_name
+            ))
         })?;
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let stderr_task = spawn_stderr_task(config.helper_name, stderr, Arc::clone(&stderr_tail));
@@ -189,7 +198,11 @@ impl HelperWorkerClient {
             }
             let exchange = timeout(
                 Duration::from_millis(self.config.timeout_ms),
-                self.exchange_locked(guard.as_mut().expect("worker initialized"), request_id, &payload),
+                self.exchange_locked(
+                    guard.as_mut().expect("worker initialized"),
+                    request_id,
+                    &payload,
+                ),
             )
             .await;
             match exchange {
@@ -239,12 +252,16 @@ impl HelperWorkerClient {
         request_id: u64,
         payload: &str,
     ) -> Result<Value, HelperWorkerError> {
-        worker.stdin.write_all(payload.as_bytes()).await.map_err(|error| {
-            HelperWorkerError::Transport(format!(
-                "Failed to send {} worker request: {error}",
-                self.config.helper_name
-            ))
-        })?;
+        worker
+            .stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|error| {
+                HelperWorkerError::Transport(format!(
+                    "Failed to send {} worker request: {error}",
+                    self.config.helper_name
+                ))
+            })?;
         worker.stdin.write_all(b"\n").await.map_err(|error| {
             HelperWorkerError::Transport(format!(
                 "Failed to terminate {} worker request: {error}",
@@ -291,10 +308,7 @@ impl HelperWorkerClient {
                 }
             };
             if envelope.requestId != request_id {
-                ignored_lines.push(format!(
-                    "mismatched-request-id:{}",
-                    envelope.requestId
-                ));
+                ignored_lines.push(format!("mismatched-request-id:{}", envelope.requestId));
                 if ignored_lines.len() > 8 {
                     ignored_lines.remove(0);
                 }

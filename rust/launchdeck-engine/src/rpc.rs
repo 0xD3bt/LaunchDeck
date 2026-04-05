@@ -1,20 +1,21 @@
 #![allow(non_snake_case, dead_code)]
 
 use futures_util::{SinkExt, StreamExt, future::join_all, stream::FuturesUnordered};
+use lunar_lander_quic_client::{ClientOptions, LunarLanderQuicClient};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_sdk::transaction::VersionedTransaction;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use crate::transport::{JitoBundleEndpoint, TransportPlan};
+use crate::transport::{JitoBundleEndpoint, TransportPlan, configured_hellomoon_api_key};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledTransaction {
@@ -125,6 +126,51 @@ fn block_height_refresh_inflight() -> &'static AsyncMutex<HashSet<String>> {
     INFLIGHT.get_or_init(|| AsyncMutex::new(HashSet::new()))
 }
 
+fn hellomoon_quic_client_cache() -> &'static AsyncMutex<HashMap<String, Arc<LunarLanderQuicClient>>>
+{
+    static CACHE: OnceLock<AsyncMutex<HashMap<String, Arc<LunarLanderQuicClient>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+fn hellomoon_quic_client_cache_key(endpoint: &str, api_key: &str, mev_protect: bool) -> String {
+    format!("{endpoint}|{mev_protect}|{api_key}")
+}
+
+async fn cached_hellomoon_quic_client(
+    endpoint: &str,
+    api_key: &str,
+    mev_protect: bool,
+) -> Result<Arc<LunarLanderQuicClient>, String> {
+    let key = hellomoon_quic_client_cache_key(endpoint, api_key, mev_protect);
+    {
+        let cache = hellomoon_quic_client_cache().lock().await;
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+    }
+    let client = Arc::new(
+        LunarLanderQuicClient::connect_with_options(
+            endpoint.to_string(),
+            api_key.to_string(),
+            ClientOptions {
+                mev_protect,
+                ..ClientOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| format!("Hello Moon QUIC connect failed for {endpoint}: {error}"))?,
+    );
+    let mut cache = hellomoon_quic_client_cache().lock().await;
+    Ok(cache.entry(key).or_insert_with(|| client.clone()).clone())
+}
+
+async fn invalidate_hellomoon_quic_client(endpoint: &str, api_key: &str, mev_protect: bool) {
+    let key = hellomoon_quic_client_cache_key(endpoint, api_key, mev_protect);
+    let mut cache = hellomoon_quic_client_cache().lock().await;
+    cache.remove(&key);
+}
+
 fn current_time_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -164,10 +210,7 @@ fn block_height_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
     blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
 }
 
-async fn refresh_block_height_sample(
-    rpc_url: &str,
-    commitment: &str,
-) -> Result<u64, String> {
+async fn refresh_block_height_sample(rpc_url: &str, commitment: &str) -> Result<u64, String> {
     let block_height_rpc_url = configured_warm_rpc_url(rpc_url);
     let cache_key = blockhash_cache_key(&block_height_rpc_url, commitment);
     let result = rpc_request(
@@ -311,12 +354,19 @@ async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value
                 payload
                     .get("message")
                     .and_then(Value::as_str)
-                    .map(|message| match payload.get("code").and_then(Value::as_i64) {
-                        Some(code) => format!("code={code}, message={message}"),
-                        None => message.to_string(),
-                    })
+                    .map(
+                        |message| match payload.get("code").and_then(Value::as_i64) {
+                            Some(code) => format!("code={code}, message={message}"),
+                            None => message.to_string(),
+                        },
+                    )
             })
-            .or_else(|| payload.get("raw").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| {
+                payload
+                    .get("raw")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| payload.to_string());
         let header_detail = if header_summary.is_empty() {
             String::new()
@@ -398,10 +448,7 @@ pub async fn fetch_latest_blockhash_cached(
     Ok((blockhash, last_valid_block_height))
 }
 
-pub async fn refresh_latest_blockhash_cache(
-    rpc_url: &str,
-    commitment: &str,
-) -> Result<(), String> {
+pub async fn refresh_latest_blockhash_cache(rpc_url: &str, commitment: &str) -> Result<(), String> {
     let (blockhash, last_valid_block_height) = fetch_latest_blockhash(rpc_url, commitment).await?;
     cache_blockhash(rpc_url, commitment, blockhash, last_valid_block_height);
     Ok(())
@@ -1097,7 +1144,9 @@ async fn wait_for_confirmations_websocket_batch(
                 .unwrap_or(Value::Null);
             let err = value.get("err").cloned().unwrap_or(Value::Null);
             if !err.is_null() {
-                return Err(format!("Launch signature notification reported error: {err}"));
+                return Err(format!(
+                    "Launch signature notification reported error: {err}"
+                ));
             }
             let confirmed_observed_block_height = if track_confirmed_block_height {
                 fetch_sampled_block_height_snapshot(rpc_url, commitment)
@@ -1649,10 +1698,9 @@ pub async fn submit_transactions_helius_sender(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height =
-            fetch_sampled_block_height_snapshot(rpc_url, commitment)
-                .await
-                .ok();
+        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok();
         for result in &mut results {
             result.sendObservedBlockHeight = send_observed_block_height;
         }
@@ -1778,9 +1826,11 @@ pub async fn submit_transactions_helius_sender_parallel(
         return Err("Helius Sender endpoint is not configured.".to_string());
     }
     let submit_started = std::time::Instant::now();
-    let results = join_all(transactions.iter().map(|transaction| {
-        submit_single_transaction_helius_sender(endpoints, transaction)
-    }))
+    let results = join_all(
+        transactions
+            .iter()
+            .map(|transaction| submit_single_transaction_helius_sender(endpoints, transaction)),
+    )
     .await;
     let mut sent = Vec::with_capacity(results.len());
     let mut warnings = Vec::new();
@@ -1790,10 +1840,9 @@ pub async fn submit_transactions_helius_sender_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height =
-            fetch_sampled_block_height_snapshot(rpc_url, commitment)
-                .await
-                .ok();
+        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok();
         for result in &mut sent {
             result.sendObservedBlockHeight = send_observed_block_height;
         }
@@ -1976,8 +2025,10 @@ pub async fn confirm_transactions_bundle(
                         "{}:{} status-request={}",
                         endpoint.name, bundle_id, error
                     ));
-                    observed_bundle_statuses
-                        .push(format!("{}:{}=status-request-failed", endpoint.name, bundle_id));
+                    observed_bundle_statuses.push(format!(
+                        "{}:{}=status-request-failed",
+                        endpoint.name, bundle_id
+                    ));
                     continue;
                 }
             };
@@ -2003,10 +2054,8 @@ pub async fn confirm_transactions_bundle(
                     .get("confirmation_status")
                     .and_then(Value::as_str)
                     .unwrap_or("processed");
-                observed_bundle_statuses.push(format!(
-                    "{}:{}={}",
-                    endpoint.name, bundle_id, actual
-                ));
+                observed_bundle_statuses
+                    .push(format!("{}:{}={}", endpoint.name, bundle_id, actual));
                 if !commitment_satisfied(actual, commitment) {
                     continue;
                 }
@@ -2070,8 +2119,7 @@ pub async fn confirm_transactions_bundle(
         "Timed out waiting for fanout Jito bundle submissions to reach {}. Accepted endpoints: {}. Bundle ids: {}. Last observed bundle statuses: {}",
         commitment,
         accepted_attempts.join(" | "),
-        attempted_bundle_ids.join(", ")
-        ,
+        attempted_bundle_ids.join(", "),
         if last_observed_bundle_statuses.is_empty() {
             "none".to_string()
         } else {
@@ -2131,6 +2179,557 @@ fn validate_helius_sender_transaction(transaction: &CompiledTransaction) -> Resu
         ));
     }
     Ok(())
+}
+
+fn validate_hellomoon_transaction(transaction: &CompiledTransaction) -> Result<(), String> {
+    if transaction.inlineTipLamports.unwrap_or(0) < 1_000_000 {
+        return Err(format!(
+            "Transaction {} is missing the required inline Hello Moon tip (minimum 0.001 SOL).",
+            transaction.label
+        ));
+    }
+    if transaction.computeUnitPriceMicroLamports.unwrap_or(0) == 0 {
+        return Err(format!(
+            "Transaction {} is missing the required compute unit price for Hello Moon QUIC.",
+            transaction.label
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hellomoon_bundle_transactions(
+    transactions: &[CompiledTransaction],
+) -> Result<(), String> {
+    if transactions.is_empty() {
+        return Ok(());
+    }
+    for transaction in transactions {
+        if transaction.computeUnitPriceMicroLamports.unwrap_or(0) == 0 {
+            return Err(format!(
+                "Transaction {} is missing the required compute unit price for Hello Moon bundles.",
+                transaction.label
+            ));
+        }
+    }
+    let mut has_valid_tip = false;
+    for transaction in transactions {
+        let tip_lamports = transaction.inlineTipLamports.unwrap_or(0);
+        if tip_lamports >= 1_000_000 {
+            has_valid_tip = true;
+        }
+    }
+    if !has_valid_tip {
+        return Err(
+            "Hello Moon bundles require at least one inline Hello Moon tip (minimum 0.001 SOL) somewhere in the bundle."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_hellomoon_bundle_error(status: StatusCode, detail: &str) -> String {
+    let normalized = detail.trim();
+    if (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
+        && normalized
+            .to_ascii_lowercase()
+            .contains("api key missing required scope")
+    {
+        return format!(
+            "status {}: Hello Moon recognized the API key, but sendBundle is not enabled for it (api key missing required scope).",
+            status
+        );
+    }
+    format!("status {}: {}", status, normalized)
+}
+
+async fn hellomoon_bundle_request(
+    endpoint: &str,
+    api_key: &str,
+    transactions: &[String],
+) -> Result<Vec<String>, String> {
+    crate::observability::record_outbound_provider_http_request();
+    let response = shared_http_client()
+        .post(format!("{endpoint}?api-key={api_key}"))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [
+                transactions,
+                {
+                    "encoding": "base64",
+                }
+            ],
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Hello Moon bundle request failed for {endpoint}: {error}"))?;
+    let status = response.status();
+    let payload: Value = response.json().await.map_err(|error| {
+        format!("Hello Moon bundle response decode failed for {endpoint}: {error}")
+    })?;
+    if !status.is_success() {
+        let detail = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("message").and_then(Value::as_str))
+            .unwrap_or("Hello Moon bundle request failed.");
+        return Err(normalize_hellomoon_bundle_error(status, detail));
+    }
+    if let Some(error) = payload.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Hello Moon bundle request failed.")
+            .to_string());
+    }
+    payload
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Hello Moon sendBundle did not return a signature array.".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "Hello Moon sendBundle returned a non-string signature.".to_string())
+        })
+        .collect()
+}
+
+pub async fn submit_transactions_hellomoon_bundle(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    if transactions.is_empty() {
+        return Ok((vec![], vec![], 0));
+    }
+    if transactions.len() > 4 {
+        return Err(format!(
+            "Hello Moon bundles support at most 4 transactions. Got: {}",
+            transactions.len()
+        ));
+    }
+    if endpoints.is_empty() {
+        return Err("Hello Moon bundle endpoint is not configured.".to_string());
+    }
+    validate_hellomoon_bundle_transactions(transactions)?;
+    let api_key = configured_hellomoon_api_key();
+    if api_key.trim().is_empty() {
+        return Err(
+            "Hello Moon bundle transport requires HELLOMOON_API_KEY.".to_string(),
+        );
+    }
+    let encoded = transactions
+        .iter()
+        .map(|entry| entry.serializedBase64.clone())
+        .collect::<Vec<_>>();
+    let local_signatures = transactions
+        .iter()
+        .map(|transaction| {
+            transaction
+                .signature
+                .clone()
+                .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+        })
+        .collect::<Vec<_>>();
+    let submit_started = std::time::Instant::now();
+    let mut first_successful_endpoint = None;
+    let mut successful_endpoints = Vec::new();
+    let mut returned_signatures = Vec::new();
+    let mut errors = Vec::new();
+    let mut endpoint_results = endpoints
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let api_key = api_key.clone();
+            let encoded = encoded.clone();
+            async move {
+                (
+                    endpoint.clone(),
+                    hellomoon_bundle_request(&endpoint, &api_key, &encoded).await,
+                )
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    while let Some((endpoint, result)) = endpoint_results.next().await {
+        match result {
+            Ok(signatures) => {
+                if first_successful_endpoint.is_none() {
+                    first_successful_endpoint = Some(endpoint.clone());
+                    returned_signatures = signatures;
+                }
+                successful_endpoints.push(endpoint);
+            }
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if successful_endpoints.is_empty() {
+        return Err(format!(
+            "Hello Moon bundle submission failed on all attempted endpoints: {}",
+            errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !errors.is_empty() {
+        warnings.push(format!(
+            "Hello Moon bundle fanout had partial submission failures: {}",
+            errors.join(" | ")
+        ));
+    }
+    let send_observed_block_height = if track_send_block_height {
+        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let results = transactions
+        .iter()
+        .enumerate()
+        .map(|(index, transaction)| {
+            let signature = local_signatures
+                .get(index)
+                .cloned()
+                .flatten()
+                .or_else(|| returned_signatures.get(index).cloned());
+            SentResult {
+                label: transaction.label.clone(),
+                format: transaction.format.clone(),
+                explorerUrl: signature
+                    .as_ref()
+                    .map(|value| format!("https://solscan.io/tx/{value}")),
+                signature,
+                transportType: "hellomoon-bundle".to_string(),
+                endpoint: first_successful_endpoint.clone(),
+                attemptedEndpoints: successful_endpoints.clone(),
+                skipPreflight: true,
+                maxRetries: 0,
+                confirmationStatus: None,
+                confirmationSource: None,
+                submittedAtMs: Some(current_time_ms()),
+                firstObservedStatus: None,
+                firstObservedSlot: None,
+                firstObservedAtMs: None,
+                confirmedAtMs: None,
+                sendObservedBlockHeight: send_observed_block_height,
+                confirmedObservedBlockHeight: None,
+                confirmedSlot: None,
+                computeUnitLimit: transaction.computeUnitLimit,
+                computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+                inlineTipLamports: transaction.inlineTipLamports,
+                inlineTipAccount: transaction.inlineTipAccount.clone(),
+                bundleId: None,
+                attemptedBundleIds: vec![],
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
+}
+
+pub async fn prewarm_hellomoon_quic_endpoint(
+    endpoint: &str,
+    mev_protect: bool,
+) -> Result<(), String> {
+    let api_key = configured_hellomoon_api_key();
+    if api_key.trim().is_empty() {
+        return Err(
+            "Hello Moon QUIC prewarm requires HELLOMOON_API_KEY.".to_string(),
+        );
+    }
+    cached_hellomoon_quic_client(endpoint, &api_key, mev_protect)
+        .await
+        .map(|_| ())
+}
+
+async fn send_transaction_hellomoon_quic_endpoint(
+    endpoint: &str,
+    api_key: &str,
+    mev_protect: bool,
+    payload: &[u8],
+) -> Result<(), String> {
+    let client = cached_hellomoon_quic_client(endpoint, api_key, mev_protect).await?;
+    match client.send_transaction(payload).await {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            invalidate_hellomoon_quic_client(endpoint, api_key, mev_protect).await;
+            let client = cached_hellomoon_quic_client(endpoint, api_key, mev_protect).await?;
+            client.send_transaction(payload).await.map_err(|second_error| {
+                format!(
+                    "Hello Moon QUIC send failed on {endpoint}: {first_error}; reconnect retry failed: {second_error}"
+                )
+            })
+        }
+    }
+}
+
+async fn submit_single_transaction_hellomoon_quic(
+    endpoints: &[String],
+    transaction: &CompiledTransaction,
+    mev_protect: bool,
+) -> Result<(SentResult, Vec<String>), String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    validate_hellomoon_transaction(transaction)?;
+    let api_key = configured_hellomoon_api_key();
+    if api_key.trim().is_empty() {
+        return Err(
+            "Hello Moon QUIC requires HELLOMOON_API_KEY.".to_string(),
+        );
+    }
+    let payload = BASE64
+        .decode(&transaction.serializedBase64)
+        .map_err(|error| {
+            format!(
+                "Failed to decode {} for Hello Moon QUIC: {error}",
+                transaction.label
+            )
+        })?;
+    let mut endpoint_results = endpoints
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let api_key = api_key.clone();
+            let payload = payload.clone();
+            async move {
+                (
+                    endpoint.clone(),
+                    send_transaction_hellomoon_quic_endpoint(
+                        &endpoint,
+                        &api_key,
+                        mev_protect,
+                        &payload,
+                    )
+                    .await,
+                )
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut first_successful_endpoint = None;
+    let mut successful_endpoints = Vec::new();
+    let mut errors = Vec::new();
+    while let Some((endpoint, result)) = endpoint_results.next().await {
+        match result {
+            Ok(()) => {
+                if first_successful_endpoint.is_none() {
+                    first_successful_endpoint = Some(endpoint.clone());
+                }
+                successful_endpoints.push(endpoint);
+            }
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if successful_endpoints.is_empty() {
+        return Err(format!(
+            "Hello Moon QUIC failed for transaction {} on all attempted endpoints: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !errors.is_empty() {
+        warnings.push(format!(
+            "Hello Moon QUIC fanout had partial failures for {}: {}",
+            transaction.label,
+            errors.join(" | ")
+        ));
+    }
+    let signature = transaction
+        .signature
+        .clone()
+        .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
+        .ok_or_else(|| {
+            format!(
+                "Hello Moon QUIC could not derive a signature for {}.",
+                transaction.label
+            )
+        })?;
+    Ok((
+        SentResult {
+            label: transaction.label.clone(),
+            format: transaction.format.clone(),
+            signature: Some(signature.clone()),
+            explorerUrl: Some(format!("https://solscan.io/tx/{signature}")),
+            transportType: "hellomoon-quic".to_string(),
+            endpoint: first_successful_endpoint,
+            attemptedEndpoints: endpoints.to_vec(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: Some(current_time_ms()),
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            confirmedSlot: None,
+            computeUnitLimit: transaction.computeUnitLimit,
+            computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
+            inlineTipLamports: transaction.inlineTipLamports,
+            inlineTipAccount: transaction.inlineTipAccount.clone(),
+            bundleId: None,
+            attemptedBundleIds: vec![],
+        },
+        warnings,
+    ))
+}
+
+pub async fn submit_transactions_hellomoon_quic(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+    mev_protect: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    if endpoints.is_empty() {
+        return Err("Hello Moon QUIC endpoint is not configured.".to_string());
+    }
+    let submit_started = std::time::Instant::now();
+    let mut results = Vec::with_capacity(transactions.len());
+    let mut warnings = Vec::new();
+    for transaction in transactions {
+        let (entry, entry_warnings) =
+            submit_single_transaction_hellomoon_quic(endpoints, transaction, mev_protect).await?;
+        results.push(entry);
+        warnings.extend(entry_warnings);
+    }
+    if track_send_block_height {
+        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok();
+        for result in &mut results {
+            result.sendObservedBlockHeight = send_observed_block_height;
+        }
+    }
+    Ok((results, warnings, submit_started.elapsed().as_millis()))
+}
+
+pub async fn submit_transactions_hellomoon_quic_parallel(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+    mev_protect: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, u128), String> {
+    if endpoints.is_empty() {
+        return Err("Hello Moon QUIC endpoint is not configured.".to_string());
+    }
+    let submit_started = std::time::Instant::now();
+    let results = join_all(transactions.iter().map(|transaction| {
+        submit_single_transaction_hellomoon_quic(endpoints, transaction, mev_protect)
+    }))
+    .await;
+    let mut sent = Vec::with_capacity(results.len());
+    let mut warnings = Vec::new();
+    for result in results {
+        let (entry, entry_warnings) = result?;
+        sent.push(entry);
+        warnings.extend(entry_warnings);
+    }
+    if track_send_block_height {
+        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+            .await
+            .ok();
+        for result in &mut sent {
+            result.sendObservedBlockHeight = send_observed_block_height;
+        }
+    }
+    Ok((sent, warnings, submit_started.elapsed().as_millis()))
+}
+
+pub async fn send_transactions_hellomoon_quic(
+    rpc_url: &str,
+    endpoints: &[String],
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    track_send_block_height: bool,
+    mev_protect: bool,
+) -> Result<(Vec<SentResult>, Vec<String>, SendTimingBreakdown), String> {
+    if transactions.len() > 1 {
+        let started = std::time::Instant::now();
+        let mut results = Vec::with_capacity(transactions.len());
+        let mut warnings = Vec::new();
+        let mut submit_ms = 0u128;
+        let mut confirm_ms = 0u128;
+        for transaction in transactions {
+            let submit_started = std::time::Instant::now();
+            let (mut sent, entry_warnings) =
+                submit_single_transaction_hellomoon_quic(endpoints, transaction, mev_protect)
+                    .await?;
+            if track_send_block_height {
+                sent.sendObservedBlockHeight =
+                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                        .await
+                        .ok();
+            }
+            submit_ms += submit_started.elapsed().as_millis();
+            warnings.extend(entry_warnings);
+            let mut submitted = vec![sent];
+            let confirm_started = std::time::Instant::now();
+            confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                None,
+                &mut submitted,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await?;
+            confirm_ms += confirm_started.elapsed().as_millis();
+            results.extend(submitted);
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        if submit_ms + confirm_ms < elapsed_ms {
+            confirm_ms += elapsed_ms - (submit_ms + confirm_ms);
+        }
+        return Ok((
+            results,
+            warnings,
+            SendTimingBreakdown {
+                submit_ms,
+                confirm_ms,
+            },
+        ));
+    }
+    let (mut results, warnings, submit_ms) = submit_transactions_hellomoon_quic(
+        rpc_url,
+        endpoints,
+        transactions,
+        commitment,
+        track_send_block_height,
+        mev_protect,
+    )
+    .await?;
+    let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+        rpc_url,
+        None,
+        &mut results,
+        commitment,
+        track_send_block_height,
+        75,
+        400,
+    )
+    .await?;
+    let mut combined_warnings = warnings;
+    combined_warnings.extend(confirm_warnings);
+    Ok((
+        results,
+        combined_warnings,
+        SendTimingBreakdown {
+            submit_ms,
+            confirm_ms,
+        },
+    ))
 }
 
 pub async fn send_transactions_helius_sender(
@@ -2392,6 +2991,65 @@ pub async fn send_transactions_for_transport(
             )
             .await
         }
+        "hellomoon-bundle" => {
+            let (mut results, mut warnings, submit_ms) = submit_transactions_hellomoon_bundle(
+                rpc_url,
+                &transport_plan.helloMoonBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await?;
+            let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                &mut results,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await?;
+            warnings.extend(confirm_warnings);
+            Ok((
+                results,
+                warnings,
+                SendTimingBreakdown {
+                    submit_ms,
+                    confirm_ms,
+                },
+            ))
+        }
+        "hellomoon-quic" => {
+            let (mut results, mut warnings, submit_ms) = submit_transactions_hellomoon_quic(
+                rpc_url,
+                &transport_plan.helloMoonQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.helloMoonMevProtect,
+            )
+            .await?;
+            let (confirm_warnings, confirm_ms) = confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                &mut results,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await?;
+            warnings.extend(confirm_warnings);
+            Ok((
+                results,
+                warnings,
+                SendTimingBreakdown {
+                    submit_ms,
+                    confirm_ms,
+                },
+            ))
+        }
         "helius-sender" => {
             let (mut results, mut warnings, submit_ms) = submit_transactions_helius_sender(
                 rpc_url,
@@ -2476,6 +3134,27 @@ pub async fn submit_transactions_for_transport(
             )
             .await
         }
+        "hellomoon-bundle" => {
+            submit_transactions_hellomoon_bundle(
+                rpc_url,
+                &transport_plan.helloMoonBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "hellomoon-quic" => {
+            submit_transactions_hellomoon_quic(
+                rpc_url,
+                &transport_plan.helloMoonQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.helloMoonMevProtect,
+            )
+            .await
+        }
         "helius-sender" => {
             submit_transactions_helius_sender(
                 rpc_url,
@@ -2518,6 +3197,27 @@ pub async fn submit_independent_transactions_for_transport(
                 transactions,
                 commitment,
                 track_send_block_height,
+            )
+            .await
+        }
+        "hellomoon-bundle" => {
+            submit_transactions_hellomoon_bundle(
+                rpc_url,
+                &transport_plan.helloMoonBundleEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+            )
+            .await
+        }
+        "hellomoon-quic" => {
+            submit_transactions_hellomoon_quic_parallel(
+                rpc_url,
+                &transport_plan.helloMoonQuicEndpoints,
+                transactions,
+                commitment,
+                track_send_block_height,
+                transport_plan.helloMoonMevProtect,
             )
             .await
         }
@@ -2565,6 +3265,30 @@ pub async fn confirm_submitted_transactions_for_transport(
             )
             .await
         }
+        "hellomoon-bundle" => {
+            confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                submitted,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await
+        }
+        "hellomoon-quic" => {
+            confirm_transactions_with_websocket_fallback(
+                rpc_url,
+                transport_watch_endpoint(transport_plan),
+                submitted,
+                commitment,
+                track_send_block_height,
+                75,
+                400,
+            )
+            .await
+        }
         "helius-sender" => {
             confirm_transactions_with_websocket_fallback(
                 rpc_url,
@@ -2595,12 +3319,7 @@ pub async fn confirm_submitted_transactions_for_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        Json, Router,
-        extract::State,
-        http::StatusCode,
-        routing::post,
-    };
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use serde_json::json;
     use std::{net::SocketAddr, sync::Arc};
     use tokio::sync::Mutex;
@@ -2804,9 +3523,8 @@ mod tests {
         let endpoint = JitoBundleEndpoint {
             name: "frankfurt.mainnet.block-engine.jito.wtf".to_string(),
             send: "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles".to_string(),
-            status:
-                "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses"
-                    .to_string(),
+            status: "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses"
+                .to_string(),
         };
         assert_eq!(
             jito_tip_accounts_endpoint(&endpoint),
@@ -2980,6 +3698,48 @@ mod tests {
         assert_eq!(options.get("skipPreflight"), Some(&Value::Bool(true)));
         assert_eq!(options.get("maxRetries"), Some(&Value::from(0)));
         assert_eq!(calls_two.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn hellomoon_bundle_accepts_tip_on_last_transaction() {
+        let mut first = compiled_tx("setup");
+        first.computeUnitPriceMicroLamports = Some(5);
+        first.inlineTipLamports = None;
+        first.inlineTipAccount = None;
+
+        let mut last = compiled_tx("launch");
+        last.computeUnitPriceMicroLamports = Some(5);
+        last.inlineTipLamports = Some(1_000_000);
+
+        assert!(validate_hellomoon_bundle_transactions(&[first, last]).is_ok());
+    }
+
+    #[test]
+    fn hellomoon_bundle_accepts_non_last_inline_tip() {
+        let mut first = compiled_tx("setup");
+        first.computeUnitPriceMicroLamports = Some(5);
+        first.inlineTipLamports = Some(1_000_000);
+
+        let mut last = compiled_tx("launch");
+        last.computeUnitPriceMicroLamports = Some(5);
+        last.inlineTipLamports = None;
+
+        assert!(validate_hellomoon_bundle_transactions(&[first, last]).is_ok());
+    }
+
+    #[test]
+    fn hellomoon_bundle_requires_at_least_one_valid_tip() {
+        let mut first = compiled_tx("setup");
+        first.computeUnitPriceMicroLamports = Some(5);
+        first.inlineTipLamports = None;
+
+        let mut last = compiled_tx("launch");
+        last.computeUnitPriceMicroLamports = Some(5);
+        last.inlineTipLamports = Some(500_000);
+
+        let error = validate_hellomoon_bundle_transactions(&[first, last])
+            .expect_err("bundle should require a valid Hello Moon tip");
+        assert!(error.contains("at least one inline Hello Moon tip"));
     }
 
     #[tokio::test]

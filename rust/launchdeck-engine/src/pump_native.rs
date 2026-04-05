@@ -37,13 +37,13 @@ use crate::{
     report::{LaunchReport, build_report, render_report},
     rpc::{
         CompiledTransaction, fetch_account_data, fetch_account_exists,
-        fetch_multiple_account_exists,
-        fetch_latest_blockhash_cached,
+        fetch_latest_blockhash_cached, fetch_multiple_account_exists,
     },
     transport::TransportPlan,
     wallet::read_keypair_bytes,
 };
 
+const JITODONTFRONT_ACCOUNT: &str = "jitodontfront111111111111111111111111111111";
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_AMM_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const MAYHEM_PROGRAM_ID: &str = "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e";
@@ -237,22 +237,38 @@ pub async fn try_compile_native_pump(
             transport_plan,
             has_follow_up_transaction,
         );
+    let single_bundle_tip_last_tx = transport_plan.transportType == "hellomoon-bundle";
+    let launch_tip_lamports = if transport_plan.requiresInlineTip || !separate_tip_transaction {
+        if single_bundle_tip_last_tx && has_follow_up_transaction {
+            0
+        } else {
+            config.tx.jitoTipLamports
+        }
+    } else {
+        0
+    };
+    let launch_tip_account = if launch_tip_lamports > 0 && !config.tx.jitoTipAccount.is_empty() {
+        config.tx.jitoTipAccount.clone()
+    } else {
+        String::new()
+    };
+    let follow_up_tip_lamports = if transport_plan.requiresInlineTip {
+        config.tx.jitoTipLamports
+    } else {
+        0
+    };
+    let follow_up_tip_account =
+        if follow_up_tip_lamports > 0 && !config.tx.jitoTipAccount.is_empty() {
+            config.tx.jitoTipAccount.clone()
+        } else {
+            String::new()
+        };
 
     let launch_tx_config = NativeTxConfig {
         compute_unit_limit: configured_launch_compute_unit_limit(config)?,
         compute_unit_price_micro_lamports: creation_compute_unit_price_micro_lamports,
-        jito_tip_lamports: if transport_plan.requiresInlineTip || !separate_tip_transaction {
-            config.tx.jitoTipLamports
-        } else {
-            0
-        },
-        jito_tip_account: if (transport_plan.requiresInlineTip || !separate_tip_transaction)
-            && !config.tx.jitoTipAccount.is_empty()
-        {
-            config.tx.jitoTipAccount.clone()
-        } else {
-            String::new()
-        },
+        jito_tip_lamports: launch_tip_lamports,
+        jito_tip_account: launch_tip_account,
     };
 
     let launch_lookup_table_variants =
@@ -266,8 +282,12 @@ pub async fn try_compile_native_pump(
         agent_authority.as_ref(),
         global.as_ref(),
     )?);
-    let launch_tx_instructions =
-        with_tx_settings(launch_instructions, &launch_tx_config, &creator)?;
+    let launch_tx_instructions = with_tx_settings(
+        launch_instructions,
+        &launch_tx_config,
+        &creator,
+        config.execution.jitodontfront,
+    )?;
     let launch_serialize_started = Instant::now();
     let (launch_compiled, launch_metrics) = compile_transaction_with_metrics(
         "launch",
@@ -315,18 +335,11 @@ pub async fn try_compile_native_pump(
                 )?,
                 compute_unit_price_micro_lamports:
                     effective_follow_up_compute_unit_price_micro_lamports(config, transport_plan),
-                jito_tip_lamports: if transport_plan.requiresInlineTip {
-                    config.tx.jitoTipLamports
-                } else {
-                    0
-                },
-                jito_tip_account: if transport_plan.requiresInlineTip {
-                    config.tx.jitoTipAccount.clone()
-                } else {
-                    String::new()
-                },
+                jito_tip_lamports: follow_up_tip_lamports,
+                jito_tip_account: follow_up_tip_account.clone(),
             },
             &creator,
+            config.execution.jitodontfront,
         )?;
         let follow_up_serialize_started = Instant::now();
         let (follow_up_compiled, follow_up_metrics) = compile_transaction_with_metrics(
@@ -344,16 +357,8 @@ pub async fn try_compile_native_pump(
                 )?,
                 compute_unit_price_micro_lamports:
                     effective_follow_up_compute_unit_price_micro_lamports(config, transport_plan),
-                jito_tip_lamports: if transport_plan.requiresInlineTip {
-                    config.tx.jitoTipLamports
-                } else {
-                    0
-                },
-                jito_tip_account: if transport_plan.requiresInlineTip {
-                    config.tx.jitoTipAccount.clone()
-                } else {
-                    String::new()
-                },
+                jito_tip_lamports: follow_up_tip_lamports,
+                jito_tip_account: follow_up_tip_account.clone(),
             },
             &follow_up_lookup_table_variants,
         )?;
@@ -375,16 +380,8 @@ pub async fn try_compile_native_pump(
                             config,
                             transport_plan,
                         ),
-                    jito_tip_lamports: if transport_plan.requiresInlineTip {
-                        config.tx.jitoTipLamports
-                    } else {
-                        0
-                    },
-                    jito_tip_account: if transport_plan.requiresInlineTip {
-                        config.tx.jitoTipAccount.clone()
-                    } else {
-                        String::new()
-                    },
+                    jito_tip_lamports: follow_up_tip_lamports,
+                    jito_tip_account: follow_up_tip_account.clone(),
                 },
             ));
         deferred_setup_transactions.push(follow_up_compiled.clone());
@@ -1328,9 +1325,11 @@ pub async fn compile_follow_buy_transaction(
 fn provider_uses_follow_tip(provider: &str) -> bool {
     matches!(
         provider.trim().to_ascii_lowercase().as_str(),
-        "helius-sender" | "jito-bundle"
+        "helius-sender" | "hellomoon" | "jito-bundle"
     )
 }
+
+const HELLOMOON_MIN_INLINE_TIP_LAMPORTS: i64 = 1_000_000;
 
 fn resolve_follow_tip_config(
     provider: &str,
@@ -1342,6 +1341,13 @@ fn resolve_follow_tip_config(
         return Ok((0, String::new()));
     }
     let tip_lamports = parse_decimal_u64(tip_sol, 9, label)? as i64;
+    if provider.trim().eq_ignore_ascii_case("hellomoon")
+        && tip_lamports < HELLOMOON_MIN_INLINE_TIP_LAMPORTS
+    {
+        return Err(format!(
+            "{label} must be at least 0.001 SOL when using Hello Moon for follow / snipe / auto-sell."
+        ));
+    }
     let tip_account = if tip_sol.trim().is_empty() {
         String::new()
     } else {
@@ -1446,7 +1452,12 @@ pub async fn finalize_follow_buy_transaction(
             token_mayhem_mode,
         )?,
     ];
-    let tx_instructions = with_tx_settings(instructions, &prepared.tx_config, &user)?;
+    let tx_instructions = with_tx_settings(
+        instructions,
+        &prepared.tx_config,
+        &user,
+        execution.buyJitodontfront,
+    )?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-buy",
         prepared.tx_format,
@@ -1509,7 +1520,8 @@ pub async fn compile_atomic_follow_buy_transaction(
         jito_tip_lamports,
         jito_tip_account,
     };
-    let tx_instructions = with_tx_settings(instructions, &tx_config, &user)?;
+    let tx_instructions =
+        with_tx_settings(instructions, &tx_config, &user, execution.buyJitodontfront)?;
     let tx_format = select_native_format(&execution.txFormat, false)?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-buy-atomic",
@@ -1583,7 +1595,9 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
             virtual_token_reserves: global
                 .initial_virtual_token_reserves
                 .saturating_sub(token_amount_override),
-            virtual_sol_reserves: global.initial_virtual_sol_reserves.saturating_add(curve_input),
+            virtual_sol_reserves: global
+                .initial_virtual_sol_reserves
+                .saturating_add(curve_input),
             real_token_reserves: global
                 .initial_real_token_reserves
                 .saturating_sub(token_amount_override),
@@ -1623,8 +1637,8 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
             last_error.unwrap_or_else(|| format!("Account {account_key} was not found."))
         })?;
         let token_balance = read_token_account_amount(&account_data)?;
-        ((u128::from(token_balance) * u128::from(sell_percent)) / 100u128)
-            .min(u128::from(u64::MAX)) as u64
+        ((u128::from(token_balance) * u128::from(sell_percent)) / 100u128).min(u128::from(u64::MAX))
+            as u64
     };
     if token_amount == 0 {
         return Ok(None);
@@ -1662,7 +1676,8 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
         jito_tip_lamports,
         jito_tip_account,
     };
-    let tx_instructions = with_tx_settings(instructions, &tx_config, &user)?;
+    let tx_instructions =
+        with_tx_settings(instructions, &tx_config, &user, execution.sellJitodontfront)?;
     let tx_format = select_native_format(&execution.txFormat, false)?;
     let (compiled, _) = compile_transaction_with_metrics(
         "follow-sell",
@@ -2378,14 +2393,20 @@ fn with_tx_settings(
     core_instructions: Vec<Instruction>,
     tx_config: &NativeTxConfig,
     payer: &Pubkey,
+    jitodontfront_enabled: bool,
 ) -> Result<Vec<Instruction>, String> {
-    let mut instructions = vec![build_compute_unit_limit_instruction(tx_config.compute_unit_limit)?];
+    let mut instructions = vec![build_compute_unit_limit_instruction(
+        tx_config.compute_unit_limit,
+    )?];
     if tx_config.compute_unit_price_micro_lamports > 0 {
         instructions.push(build_compute_unit_price_instruction(
             tx_config.compute_unit_price_micro_lamports as u64,
         )?);
     }
-    instructions.extend(core_instructions);
+    instructions.extend(apply_jitodontfront(
+        core_instructions,
+        jitodontfront_enabled,
+    )?);
     if tx_config.jito_tip_lamports > 0 {
         let tip_account = parse_pubkey(&tx_config.jito_tip_account, "tx.jitoTipAccount")?;
         instructions.push(transfer(
@@ -2393,6 +2414,29 @@ fn with_tx_settings(
             &tip_account,
             tx_config.jito_tip_lamports as u64,
         ));
+    }
+    Ok(instructions)
+}
+
+fn apply_jitodontfront(
+    mut instructions: Vec<Instruction>,
+    enabled: bool,
+) -> Result<Vec<Instruction>, String> {
+    if !enabled {
+        return Ok(instructions);
+    }
+    let dontfront = parse_pubkey(JITODONTFRONT_ACCOUNT, "jitodontfront")?;
+    for instruction in &mut instructions {
+        if instruction
+            .accounts
+            .iter()
+            .any(|meta| meta.pubkey == dontfront)
+        {
+            continue;
+        }
+        instruction
+            .accounts
+            .push(AccountMeta::new_readonly(dontfront, false));
     }
     Ok(instructions)
 }
@@ -3628,12 +3672,8 @@ mod tests {
         let launch_creator = Pubkey::new_unique();
         let sharing_config = Pubkey::new_unique();
 
-        let authority = select_follow_creator_vault_authority(
-            &launch_creator,
-            &sharing_config,
-            true,
-            false,
-        );
+        let authority =
+            select_follow_creator_vault_authority(&launch_creator, &sharing_config, true, false);
 
         assert_eq!(authority, launch_creator);
     }
@@ -3643,12 +3683,8 @@ mod tests {
         let launch_creator = Pubkey::new_unique();
         let sharing_config = Pubkey::new_unique();
 
-        let authority = select_follow_creator_vault_authority(
-            &launch_creator,
-            &sharing_config,
-            true,
-            true,
-        );
+        let authority =
+            select_follow_creator_vault_authority(&launch_creator, &sharing_config, true, true);
 
         assert_eq!(authority, sharing_config);
     }
@@ -3815,6 +3851,22 @@ mod tests {
         let error = resolve_follow_tip_config("jito-bundle", "", "tip-account", "buy tip")
             .expect_err("blank jito tip should fail");
         assert!(error.contains("buy tip"));
+    }
+
+    #[test]
+    fn hellomoon_follow_tip_requires_at_least_point_zero_zero_one_sol() {
+        let (lamports, account) = resolve_follow_tip_config(
+            "hellomoon",
+            "0.001",
+            "tip-account",
+            "buy tip",
+        )
+        .expect("valid hellomoon tip");
+        assert_eq!(lamports, 1_000_000);
+        assert_eq!(account, "tip-account");
+        let error = resolve_follow_tip_config("hellomoon", "0.0001", "tip-account", "buy tip")
+            .expect_err("sub-minimum hellomoon tip should fail");
+        assert!(error.contains("0.001 SOL"), "unexpected: {error}");
     }
 
     #[test]

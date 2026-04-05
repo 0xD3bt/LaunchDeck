@@ -157,12 +157,12 @@ Optional but common:
 
 Recommended setup:
 
-- use a Helius mainnet RPC URL for `SOLANA_RPC_URL`
-- use the matching Helius websocket URL for `SOLANA_WS_URL`
+- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
+- use Helius standard websocket for `SOLANA_WS_URL`
 - use a [Shyft](https://shyft.to/) RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `Helius Sender` as your provider in LaunchDeck
 
-At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path. Helius dev tier is highly recommended if you want the biggest improvement in watcher quality, execution speed, and overall runtime behavior.
+At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path. Helius dev tier is highly recommended if you want the biggest improvement in watcher quality, execution speed, and overall runtime behavior, especially if you plan to run multiple snipes.
 
 Full env reference:
 

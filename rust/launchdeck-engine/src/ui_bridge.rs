@@ -50,6 +50,18 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
+const HELLOMOON_TIP_ACCOUNTS: [&str; 10] = [
+    "moon17L6BgxXRX5uHKudAmqVF96xia9h8ygcmG2sL3F",
+    "moon26Sek222Md7ZydcAGxoKG832DK36CkLrS3PQY4c",
+    "moon7fwyajcVstMoBnVy7UBcTx87SBtNoGGAaH2Cb8V",
+    "moonBtH9HvLHjLqi9ivyrMVKgFUsSfrz9BwQ9khhn1u",
+    "moonCJg8476LNFLptX1qrK8PdRsA1HD1R6XWyu9MB93",
+    "moonF2sz7qwAtdETnrgxNbjonnhGGjd6r4W4UC9284s",
+    "moonKfftMiGSak3cezvhEqvkPSzwrmQxQHXuspC96yj",
+    "moonQBUKBpkifLcTd78bfxxt4PYLwmJ5admLW6cBBs8",
+    "moonXwpKwoVkMegt5Bc776cSW793X1irL5hHV1vJ3JA",
+    "moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataUploadProvider {
@@ -144,6 +156,8 @@ pub struct UiForm {
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
+    pub creationMevMode: String,
+    #[serde(default)]
     pub priorityFeeSol: String,
     #[serde(default)]
     pub creationTipSol: String,
@@ -162,6 +176,8 @@ pub struct UiForm {
     #[serde(default)]
     pub buySlippagePercent: String,
     #[serde(default)]
+    pub buyMevMode: String,
+    #[serde(default)]
     pub buyAutoGas: bool,
     #[serde(default)]
     pub buyMaxPriorityFeeSol: String,
@@ -176,12 +192,16 @@ pub struct UiForm {
     #[serde(default)]
     pub sellSlippagePercent: String,
     #[serde(default)]
+    pub sellMevMode: String,
+    #[serde(default)]
     pub sellAutoGas: bool,
     #[serde(default)]
     pub sellMaxPriorityFeeSol: String,
     #[serde(default)]
     pub sellMaxTipSol: String,
+    /// Ignored for sends: raw config always sets `execution.skipPreflight` true.
     #[serde(default)]
+    #[allow(dead_code)]
     pub skipPreflight: bool,
     #[serde(default)]
     pub trackSendBlockHeight: bool,
@@ -335,20 +355,28 @@ fn sanitize_provider(value: &str) -> String {
 }
 
 fn tip_supported(provider: &str) -> bool {
-    matches!(provider, "helius-sender" | "jito-bundle")
+    matches!(provider, "helius-sender" | "jito-bundle" | "hellomoon")
 }
 
 fn pick_tip_account(provider: &str) -> String {
-    let accounts = if provider == "helius-sender" {
-        &HELIUS_SENDER_TIP_ACCOUNTS[..]
-    } else {
-        &JITO_TIP_ACCOUNTS[..]
+    let accounts = match provider {
+        "helius-sender" => &HELIUS_SENDER_TIP_ACCOUNTS[..],
+        "hellomoon" => &HELLOMOON_TIP_ACCOUNTS[..],
+        _ => &JITO_TIP_ACCOUNTS[..],
     };
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos() as usize)
         .unwrap_or_default();
     accounts[seed % accounts.len()].to_string()
+}
+
+fn provider_min_tip_lamports(provider: &str) -> u64 {
+    match provider {
+        "hellomoon" => 1_000_000,
+        "helius-sender" | "jito-bundle" => 200_000,
+        _ => 0,
+    }
 }
 
 fn parse_decimal_to_u64(value: &str, decimals: u32, label: &str) -> Result<u64, String> {
@@ -930,6 +958,16 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         0
     };
+    let raw_tx_priority_micro_lamports = if form.autoGas && tip_supported(&provider) {
+        1
+    } else {
+        lamports_to_priority_fee_micro_lamports(priority_fee_lamports)
+    };
+    let raw_tx_tip_lamports = if form.autoGas {
+        provider_min_tip_lamports(&provider)
+    } else {
+        tip_lamports
+    };
     parse_decimal_to_u64(&form.maxPriorityFeeSol, 9, "creation max auto fee")?;
     parse_decimal_to_u64(&form.maxTipSol, 9, "creation max auto tip")?;
     parse_decimal_to_u64(&form.buyMaxPriorityFeeSol, 9, "buy max auto fee")?;
@@ -969,7 +1007,8 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     };
     resolve_recipient_github_ids(&mut fee_sharing_recipients).await?;
     resolve_recipient_github_ids(&mut agent_fee_recipients).await?;
-    let enable_agent_split_init = is_agent_locked || (is_agent_custom && !agent_fee_recipients.is_empty());
+    let enable_agent_split_init =
+        is_agent_locked || (is_agent_custom && !agent_fee_recipients.is_empty());
 
     let image_file_name = Path::new(form.imageFileName.trim())
         .file_name()
@@ -984,7 +1023,8 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         form.sniperWallets.clone()
     };
     let snipes_enabled = form.followLaunch.enabled || form.sniperEnabled;
-    let dev_auto_sell_enabled = form.followLaunch.devAutoSell.enabled || form.automaticDevSellEnabled;
+    let dev_auto_sell_enabled =
+        form.followLaunch.devAutoSell.enabled || form.automaticDevSellEnabled;
     let follow_launch_snipes = follow_snipes
         .iter()
         .enumerate()
@@ -1054,19 +1094,33 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellPercent.trim().to_string()
     };
-    let dev_auto_sell_trigger_family =
-        if !form.followLaunch.devAutoSell.triggerFamily.trim().is_empty() {
-            form.followLaunch.devAutoSell.triggerFamily.trim().to_lowercase()
-        } else if !form.automaticDevSellTriggerFamily.trim().is_empty() {
-            form.automaticDevSellTriggerFamily.trim().to_lowercase()
-        } else if form.automaticDevSellMarketCapEnabled
-            || !form.followLaunch.devAutoSell.marketCapThreshold.trim().is_empty()
-            || !form.automaticDevSellMarketCapThreshold.trim().is_empty()
-        {
-            "market-cap".to_string()
-        } else {
-            "time".to_string()
-        };
+    let dev_auto_sell_trigger_family = if !form
+        .followLaunch
+        .devAutoSell
+        .triggerFamily
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
+            .devAutoSell
+            .triggerFamily
+            .trim()
+            .to_lowercase()
+    } else if !form.automaticDevSellTriggerFamily.trim().is_empty() {
+        form.automaticDevSellTriggerFamily.trim().to_lowercase()
+    } else if form.automaticDevSellMarketCapEnabled
+        || !form
+            .followLaunch
+            .devAutoSell
+            .marketCapThreshold
+            .trim()
+            .is_empty()
+        || !form.automaticDevSellMarketCapThreshold.trim().is_empty()
+    {
+        "market-cap".to_string()
+    } else {
+        "time".to_string()
+    };
     let dev_auto_sell_trigger_mode = if !form.followLaunch.devAutoSell.triggerMode.trim().is_empty()
     {
         form.followLaunch.devAutoSell.triggerMode.trim().to_string()
@@ -1080,102 +1134,110 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     } else {
         form.automaticDevSellDelayMs.trim().to_string()
     };
-    let dev_auto_sell_market_cap_threshold =
-        if !form.followLaunch.devAutoSell.marketCapThreshold.trim().is_empty() {
-            form.followLaunch
-                .devAutoSell
-                .marketCapThreshold
-                .trim()
-                .to_string()
-        } else {
-            form.automaticDevSellMarketCapThreshold.trim().to_string()
-        };
+    let dev_auto_sell_market_cap_threshold = if !form
+        .followLaunch
+        .devAutoSell
+        .marketCapThreshold
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
+            .devAutoSell
+            .marketCapThreshold
+            .trim()
+            .to_string()
+    } else {
+        form.automaticDevSellMarketCapThreshold.trim().to_string()
+    };
     let dev_auto_sell_market_cap_enabled = dev_auto_sell_trigger_family == "market-cap"
         && !dev_auto_sell_market_cap_threshold.trim().is_empty();
-    let dev_auto_sell_market_cap_direction =
-        if !form.followLaunch.devAutoSell.marketCapDirection.trim().is_empty() {
-            form.followLaunch
-                .devAutoSell
-                .marketCapDirection
-                .trim()
-                .to_string()
-        } else if !form.automaticDevSellMarketCapDirection.trim().is_empty() {
-            form.automaticDevSellMarketCapDirection.trim().to_string()
-        } else {
-            "gte".to_string()
-        };
-    let dev_auto_sell_market_cap_scan_timeout_seconds =
-        if !form
-            .followLaunch
+    let dev_auto_sell_market_cap_direction = if !form
+        .followLaunch
+        .devAutoSell
+        .marketCapDirection
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
+            .devAutoSell
+            .marketCapDirection
+            .trim()
+            .to_string()
+    } else if !form.automaticDevSellMarketCapDirection.trim().is_empty() {
+        form.automaticDevSellMarketCapDirection.trim().to_string()
+    } else {
+        "gte".to_string()
+    };
+    let dev_auto_sell_market_cap_scan_timeout_seconds = if !form
+        .followLaunch
+        .devAutoSell
+        .marketCapScanTimeoutSeconds
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
             .devAutoSell
             .marketCapScanTimeoutSeconds
             .trim()
-            .is_empty()
-        {
-            form.followLaunch
-                .devAutoSell
-                .marketCapScanTimeoutSeconds
-                .trim()
-                .to_string()
-        } else if !form
-            .automaticDevSellMarketCapScanTimeoutSeconds
+            .to_string()
+    } else if !form
+        .automaticDevSellMarketCapScanTimeoutSeconds
+        .trim()
+        .is_empty()
+    {
+        form.automaticDevSellMarketCapScanTimeoutSeconds
             .trim()
-            .is_empty()
-        {
-            form.automaticDevSellMarketCapScanTimeoutSeconds
-                .trim()
-                .to_string()
-        } else if !form
-            .followLaunch
+            .to_string()
+    } else if !form
+        .followLaunch
+        .devAutoSell
+        .marketCapScanTimeoutMinutes
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
             .devAutoSell
             .marketCapScanTimeoutMinutes
             .trim()
-            .is_empty()
-        {
-            form.followLaunch
-                .devAutoSell
-                .marketCapScanTimeoutMinutes
-                .trim()
-                .parse::<u64>()
-                .map(|value| value.saturating_mul(60).to_string())
-                .unwrap_or_else(|_| "15".to_string())
-        } else if !form
-            .automaticDevSellMarketCapScanTimeoutMinutes
+            .parse::<u64>()
+            .map(|value| value.saturating_mul(60).to_string())
+            .unwrap_or_else(|_| "15".to_string())
+    } else if !form
+        .automaticDevSellMarketCapScanTimeoutMinutes
+        .trim()
+        .is_empty()
+    {
+        form.automaticDevSellMarketCapScanTimeoutMinutes
             .trim()
-            .is_empty()
-        {
-            form.automaticDevSellMarketCapScanTimeoutMinutes
-                .trim()
-                .parse::<u64>()
-                .map(|value| value.saturating_mul(60).to_string())
-                .unwrap_or_else(|_| "15".to_string())
-        } else {
-            "15".to_string()
-        };
-    let dev_auto_sell_market_cap_timeout_action =
-        if !form
-            .followLaunch
+            .parse::<u64>()
+            .map(|value| value.saturating_mul(60).to_string())
+            .unwrap_or_else(|_| "15".to_string())
+    } else {
+        "15".to_string()
+    };
+    let dev_auto_sell_market_cap_timeout_action = if !form
+        .followLaunch
+        .devAutoSell
+        .marketCapTimeoutAction
+        .trim()
+        .is_empty()
+    {
+        form.followLaunch
             .devAutoSell
             .marketCapTimeoutAction
             .trim()
-            .is_empty()
-        {
-            form.followLaunch
-                .devAutoSell
-                .marketCapTimeoutAction
-                .trim()
-                .to_string()
-        } else if !form
-            .automaticDevSellMarketCapTimeoutAction
+            .to_string()
+    } else if !form
+        .automaticDevSellMarketCapTimeoutAction
+        .trim()
+        .is_empty()
+    {
+        form.automaticDevSellMarketCapTimeoutAction
             .trim()
-            .is_empty()
-        {
-            form.automaticDevSellMarketCapTimeoutAction
-                .trim()
-                .to_string()
-        } else {
-            "stop".to_string()
-        };
+            .to_string()
+    } else {
+        "stop".to_string()
+    };
     let dev_auto_sell_block_offset = if !form
         .followLaunch
         .devAutoSell
@@ -1195,10 +1257,10 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
         dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "confirmation";
     let dev_auto_sell_target_block_offset =
         if dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "block-offset" {
-        dev_auto_sell_block_offset.clone()
-    } else {
-        String::new()
-    };
+            dev_auto_sell_block_offset.clone()
+        } else {
+            String::new()
+        };
     let dev_auto_sell_delay_ms =
         if dev_auto_sell_trigger_family == "time" && dev_auto_sell_trigger_mode == "submit-delay" {
             dev_auto_sell_delay_ms
@@ -1268,12 +1330,10 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             },
         },
         tx: RawTx {
-            computeUnitLimit: Some(json!(FIXED_COMPUTE_UNIT_LIMIT)),
-            computeUnitPriceMicroLamports: Some(json!(lamports_to_priority_fee_micro_lamports(
-                priority_fee_lamports
-            ))),
-            jitoTipLamports: Some(json!(tip_lamports)),
-            jitoTipAccount: if tip_lamports > 0 {
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: Some(json!(raw_tx_priority_micro_lamports)),
+            jitoTipLamports: Some(json!(raw_tx_tip_lamports)),
+            jitoTipAccount: if raw_tx_tip_lamports > 0 {
                 pick_tip_account(&provider)
             } else {
                 String::new()
@@ -1304,19 +1364,24 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             send: Some(json!(action == "send")),
             txFormat: "auto".to_string(),
             commitment: "confirmed".to_string(),
-            skipPreflight: Some(json!(if provider == "helius-sender" {
-                true
-            } else {
-                form.skipPreflight
-            })),
+            skipPreflight: Some(json!(true)),
             trackSendBlockHeight: Some(json!(form.trackSendBlockHeight)),
             provider: provider.clone(),
             endpointProfile: endpoint_profile.clone(),
             policy: String::new(),
+            mevProtect: Some(json!(matches!(
+                form.creationMevMode.trim().to_ascii_lowercase().as_str(),
+                "reduced" | "secure"
+            ))),
+            mevMode: Some(json!(form.creationMevMode.trim().to_ascii_lowercase())),
             autoGas: Some(json!(form.autoGas)),
             autoMode: "launchAuto".to_string(),
-            priorityFeeSol: form.priorityFeeSol.trim().to_string(),
-            tipSol: if tip_lamports > 0 {
+            priorityFeeSol: if form.autoGas {
+                String::new()
+            } else {
+                form.priorityFeeSol.trim().to_string()
+            },
+            tipSol: if tip_lamports > 0 && !form.autoGas {
                 form.creationTipSol.trim().to_string()
             } else {
                 String::new()
@@ -1338,10 +1403,19 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             buyProvider: buy_provider,
             buyEndpointProfile: buy_endpoint_profile,
             buyPolicy: String::new(),
+            buyMevProtect: Some(json!(matches!(
+                form.buyMevMode.trim().to_ascii_lowercase().as_str(),
+                "reduced" | "secure"
+            ))),
+            buyMevMode: Some(json!(form.buyMevMode.trim().to_ascii_lowercase())),
             buyAutoGas: Some(json!(form.buyAutoGas)),
             buyAutoMode: "buyAuto".to_string(),
-            buyPriorityFeeSol: form.buyPriorityFeeSol.trim().to_string(),
-            buyTipSol: if buy_tip_supported {
+            buyPriorityFeeSol: if form.buyAutoGas {
+                String::new()
+            } else {
+                form.buyPriorityFeeSol.trim().to_string()
+            },
+            buyTipSol: if buy_tip_supported && !form.buyAutoGas {
                 form.buyTipSol.trim().to_string()
             } else {
                 String::new()
@@ -1366,8 +1440,17 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             sellProvider: sell_provider,
             sellEndpointProfile: sell_endpoint_profile,
             sellPolicy: String::new(),
-            sellPriorityFeeSol: form.sellPriorityFeeSol.trim().to_string(),
-            sellTipSol: if sell_tip_supported {
+            sellMevProtect: Some(json!(matches!(
+                form.sellMevMode.trim().to_ascii_lowercase().as_str(),
+                "reduced" | "secure"
+            ))),
+            sellMevMode: Some(json!(form.sellMevMode.trim().to_ascii_lowercase())),
+            sellPriorityFeeSol: if form.sellAutoGas {
+                String::new()
+            } else {
+                form.sellPriorityFeeSol.trim().to_string()
+            },
+            sellTipSol: if sell_tip_supported && !form.sellAutoGas {
                 form.sellTipSol.trim().to_string()
             } else {
                 String::new()
@@ -1426,7 +1509,9 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                         enabled: Some(json!(dev_auto_sell_market_cap_enabled)),
                         direction: dev_auto_sell_market_cap_direction,
                         threshold: dev_auto_sell_market_cap_threshold,
-                        scanTimeoutSeconds: Some(json!(dev_auto_sell_market_cap_scan_timeout_seconds)),
+                        scanTimeoutSeconds: Some(json!(
+                            dev_auto_sell_market_cap_scan_timeout_seconds
+                        )),
                         timeoutAction: dev_auto_sell_market_cap_timeout_action,
                         legacyScanTimeoutMinutes: None,
                     },

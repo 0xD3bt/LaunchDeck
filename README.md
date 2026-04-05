@@ -18,20 +18,26 @@ LaunchDeck is open-source tooling provided as-is. Running it, configuring it, mo
 
 ## Current Recommendation
 
-For most operators today, the best-supported and fastest setup is:
+For most operators today, the best-supported setup is:
 
 - [Helius](https://www.helius.dev/) for the full infrastructure stack
-- `Helius` for `SOLANA_RPC_URL`
-- `Helius` for `SOLANA_WS_URL`
+- `Helius Gatekeeper HTTP` for `SOLANA_RPC_URL`
+- `Helius standard websocket` for `SOLANA_WS_URL`
 - a separate [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- `Helius Sender` as the creation, buy, and sell provider
+- `Helius Sender` or `Hello Moon QUIC` as the creation, buy, and sell provider
 
 Why this is the current recommended stack:
 
 - `LAUNCHDECK_WARM_RPC_URL` offloads startup warmup and block-height observation away from your main execution RPC
 - Shyft is a good fit for that warm path because you can use a free API key there
 - startup and keep-warm also hit each Helius Sender host’s HTTP `/ping` (derived from `/fast`) and report per-target status in the UI runtime indicator
-- Helius dev tier gives a very noticeable improvement in watcher performance and live execution quality versus a bare-minimum free setup
+- Helius dev tier gives a very noticeable improvement in watcher performance and live execution quality versus a bare-minimum free setup, especially if you run multiple snipes or watcher-heavy follow automation
+
+Provider note:
+
+- `Helius Sender` is still the easiest default recommendation for most operators
+- `Hello Moon QUIC` is also recommended when you want a strong alternate low-latency path
+- `Hello Moon QUIC` requires a Lunar Lander API key from Hello Moon first; request access through their [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) and [Hello Moon Discord](https://discord.com/invite/HelloMoon)
 
 If you have Helius dev tier and your websocket endpoint supports it, also enable:
 
@@ -158,10 +164,20 @@ Optional but common:
 
 Recommended practical setup:
 
-- use a Helius mainnet RPC URL for `SOLANA_RPC_URL`
-- use the matching Helius websocket URL for `SOLANA_WS_URL`
+- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
+- use Helius standard websocket for `SOLANA_WS_URL`
 - use a Shyft RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
 - use `Helius Sender` as the provider in LaunchDeck
+
+Example URL shapes:
+
+```bash
+SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
+```
+
+Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
 
 That combination is currently the strongest default operator path in LaunchDeck. The app can run without paid infra, but Helius dev tier is highly recommended if you care about maximum speed, better watcher behavior, and better execution consistency.
 
@@ -204,9 +220,10 @@ VPS deployment walkthrough: `docs/VPS_SETUP.md`
 
 ## Execution Providers
 
-LaunchDeck exposes three current provider choices:
+LaunchDeck exposes four current provider choices:
 
 - `Helius Sender`
+- `Hello Moon QUIC`
 - `Standard RPC`
 - `Jito Bundle`
 
@@ -214,6 +231,7 @@ Important rules:
 
 - `Helius Sender` is the current default, fastest, and most reliable starting point for most operators
 - `Helius Sender` requires `skipPreflight=true`, a positive compute-unit price, and a tip of at least `200000` lamports
+- `Hello Moon QUIC` is available as a QUIC-based low-latency provider path
 - `Standard RPC` uses the optimized `standard-rpc-fanout` transport and does not use tip
 - `Standard RPC` always submits with `skipPreflight=true` and `maxRetries=0`
 - `Standard RPC` can fan out to `SOLANA_RPC_URL` plus optional extra submit endpoints from `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
@@ -226,6 +244,7 @@ Examples:
 
 - a stored tip value is ignored on `Standard RPC`
 - `Helius Sender` hard-fails if Sender requirements are not satisfied
+- `Hello Moon QUIC` hard-fails if its provider requirements are not satisfied
 - `Jito Bundle` may drop creation priority in launch shapes where it would only add cost without helping
 
 Provider details: `docs/PROVIDERS.md`

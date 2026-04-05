@@ -531,15 +531,11 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
         if !threshold.trim().is_empty() {
             parts.push(format!("market {}", threshold.trim()));
         }
-        if let Some(timeout_seconds) = market_cap
-            .get("scanTimeoutSeconds")
-            .and_then(Value::as_u64)
+        if let Some(timeout_seconds) = market_cap.get("scanTimeoutSeconds").and_then(Value::as_u64)
         {
             parts.push(format!("scan={}s", timeout_seconds));
         }
-        if let Some(timeout_action) = market_cap
-            .get("timeoutAction")
-            .and_then(Value::as_str)
+        if let Some(timeout_action) = market_cap.get("timeoutAction").and_then(Value::as_str)
             && !timeout_action.trim().is_empty()
         {
             parts.push(format!("timeout={}", timeout_action.trim()));
@@ -771,9 +767,11 @@ pub fn build_report(
     let creator_fee_receiver = match config.mode.as_str() {
         "cashback" => "cashback to traders".to_string(),
         "agent-locked" => "agent buyback escrow (locked after launch)".to_string(),
-        "agent-custom" if has_launch_follow_up(config) => {
-            summarize_recipients(&config.agent.feeRecipients, &creator, config.agent.buybackBps)
-        }
+        "agent-custom" if has_launch_follow_up(config) => summarize_recipients(
+            &config.agent.feeRecipients,
+            &creator,
+            config.agent.buybackBps,
+        ),
         _ if config.creatorFee.mode == "github" && !config.creatorFee.githubUsername.is_empty() => {
             format!("GitHub @{}", config.creatorFee.githubUsername)
         }
@@ -1063,9 +1061,10 @@ pub fn build_benchmark_timing_groups(
             timings.reportListRefreshMs,
         ])
     });
-    let execution_total = timings.backendTotalElapsedMs.map(|backend| {
-        backend.saturating_sub(reporting_total.unwrap_or_default())
-    }).or(timings.executionTotalMs);
+    let execution_total = timings
+        .backendTotalElapsedMs
+        .map(|backend| backend.saturating_sub(reporting_total.unwrap_or_default()))
+        .or(timings.executionTotalMs);
     let backend_other = timings.backendOtherMs.or_else(|| {
         remaining_time(
             execution_total,
@@ -1922,7 +1921,8 @@ pub fn render_report(report: &LaunchReport) -> String {
             if let Some(slot) = sent.confirmedSlot {
                 summary.push_str(&format!(" | confirmed slot={slot}"));
             }
-            if let (Some(submitted_at), Some(first_seen_at)) = (sent.submittedAtMs, sent.firstObservedAtMs)
+            if let (Some(submitted_at), Some(first_seen_at)) =
+                (sent.submittedAtMs, sent.firstObservedAtMs)
             {
                 summary.push_str(&format!(
                     " | first seen {} after submit",
@@ -1935,7 +1935,9 @@ pub fn render_report(report: &LaunchReport) -> String {
             if let Some(slot) = sent.firstObservedSlot {
                 summary.push_str(&format!(" | first slot={slot}"));
             }
-            if let (Some(submitted_at), Some(confirmed_at)) = (sent.submittedAtMs, sent.confirmedAtMs) {
+            if let (Some(submitted_at), Some(confirmed_at)) =
+                (sent.submittedAtMs, sent.confirmedAtMs)
+            {
                 summary.push_str(&format!(
                     " | confirmed seen {} after submit",
                     format_duration_ms(confirmed_at.saturating_sub(submitted_at))

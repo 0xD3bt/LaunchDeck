@@ -41,6 +41,7 @@ const DEFAULT_TOTAL_SUPPLY = 1_000_000_000n;
 const BAGS_TOTAL_SUPPLY = 1_000_000_000n * 10n ** 9n;
 const BAGS_INITIAL_SQRT_PRICE = new BN("3141367320245630");
 const BAGS_MIGRATION_QUOTE_THRESHOLD = new BN("85000000000");
+const JITODONTFRONT_ACCOUNT = new PublicKey("jitodontfront111111111111111111111111111111");
 const BAGS_CURVE = [
   {
     sqrtPrice: new BN("6401204812200420"),
@@ -165,6 +166,17 @@ function normalizeTransactions(transactions, {
   }));
 }
 
+function txConfigWithoutInlineTip(txConfig) {
+  if (!txConfig) {
+    return txConfig;
+  }
+  return {
+    ...txConfig,
+    tipLamports: 0,
+    tipAccount: "",
+  };
+}
+
 async function resolveLookupTableAccounts(connection, transaction) {
   if (!(transaction instanceof VersionedTransaction)) {
     return [];
@@ -222,53 +234,95 @@ function buildInlineTipInstruction(ownerPubkey, tipAccount, tipLamports) {
   });
 }
 
-async function ensureInlineTipOnTransaction(connection, owner, transaction, txConfig) {
+function hasJitoDontFrontAccount(instruction) {
+  return Boolean(
+    instruction
+    && Array.isArray(instruction.keys)
+    && instruction.keys.some((key) => key && key.pubkey && key.pubkey.equals(JITODONTFRONT_ACCOUNT))
+  );
+}
+
+function ensureJitoDontFrontOnInstruction(instruction) {
+  if (!instruction || !Array.isArray(instruction.keys) || hasJitoDontFrontAccount(instruction)) {
+    return false;
+  }
+  instruction.keys.push({
+    pubkey: JITODONTFRONT_ACCOUNT,
+    isSigner: false,
+    isWritable: false,
+  });
+  return true;
+}
+
+async function ensureTxConfigOnTransaction(connection, owner, transaction, txConfig) {
+  const wantDontFront = Boolean(txConfig && txConfig.jitodontfront);
   const tipInstruction = buildInlineTipInstruction(
     owner.publicKey,
     txConfig && txConfig.tipAccount,
     txConfig && txConfig.tipLamports,
   );
-  if (!tipInstruction) {
+  if (!wantDontFront && !tipInstruction) {
     return signTransaction(transaction, owner);
   }
   if (transaction instanceof VersionedTransaction) {
     const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction);
-    if (instructions.some((instruction) => (
+    let modified = false;
+    if (wantDontFront) {
+      for (const instruction of instructions) {
+        modified = ensureJitoDontFrontOnInstruction(instruction) || modified;
+      }
+    }
+    const hasTip = instructions.some((instruction) => (
       isInlineTipInstruction(
         instruction,
         owner.publicKey,
         txConfig && txConfig.tipAccount,
         txConfig && txConfig.tipLamports,
       )
-    ))) {
+    ));
+    if (tipInstruction && !hasTip) {
+      instructions.push(tipInstruction);
+      modified = true;
+    }
+    if (!modified) {
       return signTransaction(transaction, owner);
     }
     const rebuilt = new VersionedTransaction(
       new TransactionMessage({
         payerKey: owner.publicKey,
         recentBlockhash: readTransactionBlockhash(transaction),
-        instructions: [...instructions, tipInstruction],
+        instructions,
       }).compileToV0Message(addressLookupTableAccounts),
     );
     rebuilt.sign([owner]);
     return rebuilt;
   }
   const instructions = transaction.instructions || [];
-  if (instructions.some((instruction) => (
+  let modified = false;
+  if (wantDontFront) {
+    for (const instruction of instructions) {
+      modified = ensureJitoDontFrontOnInstruction(instruction) || modified;
+    }
+  }
+  const hasTip = instructions.some((instruction) => (
     isInlineTipInstruction(
       instruction,
       owner.publicKey,
       txConfig && txConfig.tipAccount,
       txConfig && txConfig.tipLamports,
     )
-  ))) {
+  ));
+  if (tipInstruction && !hasTip) {
+    instructions.push(tipInstruction);
+    modified = true;
+  }
+  if (!modified) {
     return signTransaction(transaction, owner);
   }
   const rebuilt = new Transaction();
   rebuilt.feePayer = owner.publicKey;
   rebuilt.recentBlockhash = readTransactionBlockhash(transaction);
   instructions.forEach((instruction) => rebuilt.add(instruction));
-  rebuilt.add(tipInstruction);
   rebuilt.sign(owner);
   return rebuilt;
 }
@@ -418,7 +472,7 @@ function extractHeliusPriorityEstimate(rawPayload) {
 }
 
 async function fetchHeliusPriorityEstimate(rpcUrl) {
-  const heliusPriorityLevel = String(process.env.LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL || "veryHigh")
+  const heliusPriorityLevel = String(process.env.LAUNCHDECK_AUTO_FEE_HELIUS_PRIORITY_LEVEL || "high")
     .trim()
     .toLowerCase();
   const options = heliusPriorityLevel === "recommended"
@@ -806,7 +860,14 @@ async function prepareLaunch(request) {
     ? Number(parseDecimalToBigInt(request.devBuy.amount, 9, "dev buy amount"))
     : 0;
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
-  const directSetupTransactions = signTransactions(configResult.transactions, owner);
+  const setupTxConfig = request.txConfig && request.txConfig.singleBundleTipLastTx
+    ? txConfigWithoutInlineTip(request.txConfig)
+    : request.txConfig;
+  const directSetupTransactions = await Promise.all(
+    signTransactions(configResult.transactions, owner).map((transaction) =>
+      ensureTxConfigOnTransaction(connection, owner, transaction, setupTxConfig)
+    )
+  );
   const setupTransactions = normalizeTransactions(directSetupTransactions, {
     labelPrefix: "bags-config-direct",
     computeUnitLimit: Number(request.txConfig && request.txConfig.computeUnitLimit || 0) || null,
@@ -817,7 +878,11 @@ async function prepareLaunch(request) {
   });
   const setupBundles = [];
   for (const [index, bundle] of (Array.isArray(configResult.bundles) ? configResult.bundles : []).entries()) {
-    const signedBundleTransactions = signTransactions(bundle, owner);
+    const signedBundleTransactions = await Promise.all(
+      signTransactions(bundle, owner).map((transaction) =>
+        ensureTxConfigOnTransaction(connection, owner, transaction, setupTxConfig)
+      )
+    );
     const compiledBundleTransactions = normalizeTransactions(signedBundleTransactions, {
       labelPrefix: `bags-config-bundle-${index + 1}`,
       computeUnitLimit: Number(request.txConfig && request.txConfig.computeUnitLimit || 0) || null,
@@ -889,7 +954,12 @@ async function buildLaunchTransaction(request) {
   if (!launchTransaction) {
     throw launchError || new Error("Failed to create Bags launch transaction.");
   }
-  signTransaction(launchTransaction, owner);
+  launchTransaction = await ensureTxConfigOnTransaction(
+    connection,
+    owner,
+    signTransaction(launchTransaction, owner),
+    request.txConfig,
+  );
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
   return {
     compiledTransaction: normalizeTransactions([launchTransaction], {
@@ -920,7 +990,7 @@ async function compileFollowBuy(request) {
     quoteResponse: quote,
     userPublicKey: owner.publicKey,
   });
-  const transaction = await ensureInlineTipOnTransaction(connection, owner, swap.transaction, request.txConfig);
+  const transaction = await ensureTxConfigOnTransaction(connection, owner, swap.transaction, request.txConfig);
   return {
     compiledTransaction: normalizeTransactions([transaction], {
       labelPrefix: request.labelPrefix || "follow-buy",
@@ -969,7 +1039,7 @@ async function compileFollowSell(request) {
     quoteResponse: quote,
     userPublicKey: owner.publicKey,
   });
-  const transaction = await ensureInlineTipOnTransaction(connection, owner, swap.transaction, request.txConfig);
+  const transaction = await ensureTxConfigOnTransaction(connection, owner, swap.transaction, request.txConfig);
   return {
     compiledTransaction: normalizeTransactions([transaction], {
       labelPrefix: request.labelPrefix || "follow-sell",

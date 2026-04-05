@@ -3,11 +3,11 @@
 function getHelloMoonProvider() {
   return {
     id: "hellomoon",
-    label: "Hello Moon",
-    verified: false,
+    label: "Hello Moon QUIC",
+    verified: true,
     supportsSingle: true,
     supportsSequential: true,
-    supportsBundle: true,
+    supportsBundle: false,
   };
 }
 

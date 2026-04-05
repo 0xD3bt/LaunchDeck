@@ -139,7 +139,9 @@ fn choose_merged_image_url(base: &ImportedTokenData, overlay: &ImportedTokenData
     if overlay_image.is_empty() {
         return base_image.to_string();
     }
-    if is_ephemeral_launchblitz_image(base_image) && overlay.source.eq_ignore_ascii_case("DexScreener") {
+    if is_ephemeral_launchblitz_image(base_image)
+        && overlay.source.eq_ignore_ascii_case("DexScreener")
+    {
         return overlay_image.to_string();
     }
     base_image.to_string()
@@ -619,9 +621,11 @@ async fn parse_pump_sharing_config_recipients(
         account_addresses.push(address.to_string());
         entries.push((address, share_bps));
     }
-    let account_data = fetch_multiple_account_data(rpc_url, &account_addresses, "confirmed").await?;
+    let account_data =
+        fetch_multiple_account_data(rpc_url, &account_addresses, "confirmed").await?;
     let mut recipients = Vec::with_capacity(count);
-    for ((address, share_bps), maybe_account_data) in entries.into_iter().zip(account_data.into_iter())
+    for ((address, share_bps), maybe_account_data) in
+        entries.into_iter().zip(account_data.into_iter())
     {
         if let Some(account_data) = maybe_account_data
             && let Ok((user_id, platform)) = parse_pump_social_fee_pda(&account_data)

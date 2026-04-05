@@ -4,12 +4,13 @@ const fs = require("fs");
 const path = require("path");
 
 const PRODUCT_SLUG = "launchdeck";
-const PROVIDERS = ["helius-sender", "standard-rpc", "jito-bundle"];
+const PROVIDERS = ["helius-sender", "hellomoon", "standard-rpc", "jito-bundle"];
 const ENDPOINT_PROFILE_AGGREGATES = ["global", "us", "eu", "asia"];
 const ENDPOINT_PROFILE_METROS = ["slc", "ewr", "lon", "fra", "ams", "sg", "tyo"];
 const ENDPOINT_PROFILES = [...ENDPOINT_PROFILE_AGGREGATES, ...ENDPOINT_PROFILE_METROS];
 const PROVIDER_ENDPOINT_PROFILES = {
   "helius-sender": ENDPOINT_PROFILES,
+  hellomoon: ENDPOINT_PROFILES,
   "jito-bundle": ENDPOINT_PROFILES,
   "standard-rpc": [],
 };
@@ -19,13 +20,14 @@ const LEGACY_PROVIDER_ALIASES = {
   jito: "jito-bundle",
   astralane: "standard-rpc",
   bloxroute: "standard-rpc",
-  hellomoon: "standard-rpc",
+  hellomoon: "hellomoon",
 };
 const VERIFIED_PROVIDERS = new Set(PROVIDERS);
 const LAUNCHPADS = ["pump", "bonk", "bagsapp"];
 const EXECUTION_POLICIES = ["fast", "safe"];
 const AUTO_GAS_MODES = ["auto", "manual"];
 const POST_LAUNCH_STRATEGIES = ["none", "dev-buy", "snipe-own-launch", "automatic-dev-sell"];
+const MEV_MODES = ["off", "reduced", "secure"];
 const PRESET_IDS = ["preset1", "preset2", "preset3"];
 const DEFAULT_POLICY = "safe";
 const DEFAULT_PROVIDER = "helius-sender";
@@ -108,6 +110,17 @@ function coerceBoolean(value, fallback = false) {
   return Boolean(value);
 }
 
+function normalizeMevMode(value, fallback = "off") {
+  if (typeof value === "boolean") return value ? "reduced" : "off";
+  const normalized = String(value || "").trim().toLowerCase();
+  if (MEV_MODES.includes(normalized)) return normalized;
+  return MEV_MODES.includes(fallback) ? fallback : "off";
+}
+
+function defaultMevModeForProvider(provider) {
+  return normalizeProvider(provider) === "hellomoon" ? "reduced" : "off";
+}
+
 function coerceNumber(value, fallback = 0) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
@@ -120,14 +133,17 @@ function createCreationSettings({
   tipSol = DEFAULT_CREATION_TIP_SOL,
   priorityFeeSol = DEFAULT_CREATION_PRIORITY_FEE_SOL,
   devBuySol = "",
+  mevMode,
 } = {}) {
+  const normalizedProvider = normalizeProvider(provider);
   return {
-    provider: normalizeProvider(provider),
-    endpointProfile: normalizeEndpointProfile(provider, endpointProfile),
+    provider: normalizedProvider,
+    endpointProfile: normalizeEndpointProfile(normalizedProvider, endpointProfile),
     policy: normalizePolicy(policy),
     tipSol: normalizeDecimalString(tipSol, DEFAULT_CREATION_TIP_SOL),
     priorityFeeSol: normalizeDecimalString(priorityFeeSol, DEFAULT_CREATION_PRIORITY_FEE_SOL),
     devBuySol: normalizeDecimalString(devBuySol),
+    mevMode: normalizeMevMode(mevMode, defaultMevModeForProvider(normalizedProvider)),
   };
 }
 
@@ -138,14 +154,21 @@ function createTradeSettings({
   priorityFeeSol = DEFAULT_TRADE_PRIORITY_FEE_SOL,
   tipSol = DEFAULT_TRADE_TIP_SOL,
   slippagePercent = DEFAULT_TRADE_SLIPPAGE_PERCENT,
+  mevMode,
+  mevProtect = false,
 } = {}) {
+  const normalizedProvider = normalizeProvider(provider);
   return {
-    provider: normalizeProvider(provider),
-    endpointProfile: normalizeEndpointProfile(provider, endpointProfile),
+    provider: normalizedProvider,
+    endpointProfile: normalizeEndpointProfile(normalizedProvider, endpointProfile),
     policy: normalizePolicy(policy),
     priorityFeeSol: normalizeDecimalString(priorityFeeSol, DEFAULT_TRADE_PRIORITY_FEE_SOL),
     tipSol: normalizeDecimalString(tipSol, DEFAULT_TRADE_TIP_SOL),
     slippagePercent: normalizeDecimalString(slippagePercent, DEFAULT_TRADE_SLIPPAGE_PERCENT),
+    mevMode: normalizeMevMode(
+      mevMode,
+      coerceBoolean(mevProtect, false) ? "reduced" : defaultMevModeForProvider(normalizedProvider)
+    ),
   };
 }
 
@@ -227,6 +250,18 @@ function firstNonEmpty(...values) {
 }
 
 function normalizePresetShape(preset, fallbackPreset, index) {
+  const creationProvider = normalizeProvider(
+    preset && preset.creationSettings && preset.creationSettings.provider,
+    fallbackPreset.creationSettings.provider
+  );
+  const buyProvider = normalizeProvider(
+    preset && preset.buySettings && preset.buySettings.provider,
+    fallbackPreset.buySettings.provider
+  );
+  const sellProvider = normalizeProvider(
+    preset && preset.sellSettings && preset.sellSettings.provider,
+    fallbackPreset.sellSettings.provider
+  );
   return {
     ...fallbackPreset,
     ...(preset || {}),
@@ -235,9 +270,9 @@ function normalizePresetShape(preset, fallbackPreset, index) {
     creationSettings: {
       ...fallbackPreset.creationSettings,
       ...(preset && preset.creationSettings ? preset.creationSettings : {}),
-      provider: normalizeProvider(preset && preset.creationSettings && preset.creationSettings.provider, fallbackPreset.creationSettings.provider),
+      provider: creationProvider,
       endpointProfile: normalizeEndpointProfile(
-        preset && preset.creationSettings && preset.creationSettings.provider,
+        creationProvider,
         preset && preset.creationSettings && preset.creationSettings.endpointProfile,
         fallbackPreset.creationSettings.endpointProfile
       ),
@@ -245,13 +280,17 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       tipSol: normalizeDecimalString(preset && preset.creationSettings && preset.creationSettings.tipSol, fallbackPreset.creationSettings.tipSol),
       priorityFeeSol: normalizeDecimalString(preset && preset.creationSettings && preset.creationSettings.priorityFeeSol, fallbackPreset.creationSettings.priorityFeeSol),
       devBuySol: normalizeDecimalString(preset && preset.creationSettings && preset.creationSettings.devBuySol, fallbackPreset.creationSettings.devBuySol),
+      mevMode: normalizeMevMode(
+        preset && preset.creationSettings && preset.creationSettings.mevMode,
+        defaultMevModeForProvider(creationProvider)
+      ),
     },
     buySettings: {
       ...fallbackPreset.buySettings,
       ...(preset && preset.buySettings ? preset.buySettings : {}),
-      provider: normalizeProvider(preset && preset.buySettings && preset.buySettings.provider, fallbackPreset.buySettings.provider),
+      provider: buyProvider,
       endpointProfile: normalizeEndpointProfile(
-        preset && preset.buySettings && preset.buySettings.provider,
+        buyProvider,
         preset && preset.buySettings && preset.buySettings.endpointProfile,
         fallbackPreset.buySettings.endpointProfile
       ),
@@ -259,14 +298,18 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       priorityFeeSol: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.priorityFeeSol, fallbackPreset.buySettings.priorityFeeSol),
       tipSol: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.tipSol, fallbackPreset.buySettings.tipSol),
       slippagePercent: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.slippagePercent, fallbackPreset.buySettings.slippagePercent),
+      mevMode: normalizeMevMode(
+        preset && preset.buySettings && (preset.buySettings.mevMode ?? preset.buySettings.mevProtect),
+        defaultMevModeForProvider(buyProvider)
+      ),
       snipeBuyAmountSol: normalizeDecimalString(preset && preset.buySettings && preset.buySettings.snipeBuyAmountSol, fallbackPreset.buySettings.snipeBuyAmountSol),
     },
     sellSettings: {
       ...fallbackPreset.sellSettings,
       ...(preset && preset.sellSettings ? preset.sellSettings : {}),
-      provider: normalizeProvider(preset && preset.sellSettings && preset.sellSettings.provider, fallbackPreset.sellSettings.provider),
+      provider: sellProvider,
       endpointProfile: normalizeEndpointProfile(
-        preset && preset.sellSettings && preset.sellSettings.provider,
+        sellProvider,
         preset && preset.sellSettings && preset.sellSettings.endpointProfile,
         fallbackPreset.sellSettings.endpointProfile
       ),
@@ -274,6 +317,10 @@ function normalizePresetShape(preset, fallbackPreset, index) {
       priorityFeeSol: normalizeDecimalString(preset && preset.sellSettings && preset.sellSettings.priorityFeeSol, fallbackPreset.sellSettings.priorityFeeSol),
       tipSol: normalizeDecimalString(preset && preset.sellSettings && preset.sellSettings.tipSol, fallbackPreset.sellSettings.tipSol),
       slippagePercent: normalizeDecimalString(preset && preset.sellSettings && preset.sellSettings.slippagePercent, fallbackPreset.sellSettings.slippagePercent),
+      mevMode: normalizeMevMode(
+        preset && preset.sellSettings && (preset.sellSettings.mevMode ?? preset.sellSettings.mevProtect),
+        defaultMevModeForProvider(sellProvider)
+      ),
     },
     postLaunchStrategy: String((preset && preset.postLaunchStrategy) || fallbackPreset.postLaunchStrategy || "none").trim() || "none",
   };
@@ -445,7 +492,7 @@ function resolveProviderSupport(provider) {
   return {
     verified: VERIFIED_PROVIDERS.has(provider),
     supportsSingle: true,
-    supportsBundle: provider === "jito-bundle",
+    supportsBundle: provider === "jito-bundle" || provider === "hellomoon",
     supportsSequential: provider !== "jito-bundle",
     supportsEndpointProfiles: providerSupportsEndpointProfiles(provider),
     endpointProfiles: PROVIDER_ENDPOINT_PROFILES[provider] || [],
@@ -458,6 +505,7 @@ module.exports = {
   EXECUTION_POLICIES,
   ENDPOINT_PROFILES,
   LAUNCHPADS,
+  MEV_MODES,
   POST_LAUNCH_STRATEGIES,
   PRODUCT_SLUG,
   PROVIDERS,
@@ -470,6 +518,7 @@ module.exports = {
   normalizePersistentConfig,
   readPersistentConfig,
   normalizeEndpointProfile,
+  normalizeMevMode,
   providerSupportsEndpointProfiles,
   resolveProviderSupport,
   writePersistentConfig,

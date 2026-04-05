@@ -41,7 +41,8 @@ fn legacy_provider_alias(provider: &str) -> String {
     match provider {
         "auto" | "helius" => "helius-sender".to_string(),
         "jito" => "jito-bundle".to_string(),
-        "astralane" | "bloxroute" | "hellomoon" => "standard-rpc".to_string(),
+        "astralane" | "bloxroute" => "standard-rpc".to_string(),
+        "hellomoon" => "hellomoon".to_string(),
         _ => provider.to_string(),
     }
 }
@@ -84,7 +85,7 @@ fn normalize_provider(provider: &str, fallback: &str) -> String {
     }
     let migrated = legacy_provider_alias(&normalized);
     match migrated.as_str() {
-        "helius-sender" | "standard-rpc" | "jito-bundle" => migrated,
+        "helius-sender" | "hellomoon" | "standard-rpc" | "jito-bundle" => migrated,
         _ => fallback.to_string(),
     }
 }
@@ -98,6 +99,38 @@ fn normalize_decimal_string(value: &str, fallback: &str) -> String {
     }
 }
 
+/// UI + engine MEV routing mode for Hello Moon (and future providers). Must round-trip through
+/// `normalize_persistent_config` so settings save does not drop user choices.
+fn normalize_mev_mode(raw: Option<&Value>, fallback: &str) -> String {
+    let fallback_norm = match fallback.trim().to_ascii_lowercase().as_str() {
+        "reduced" => "reduced",
+        "secure" => "secure",
+        "off" | "" => "off",
+        _ => "off",
+    }
+    .to_string();
+    let Some(value) = raw else {
+        return fallback_norm;
+    };
+    if let Some(text) = value.as_str() {
+        return match text.trim().to_ascii_lowercase().as_str() {
+            "reduced" => "reduced".to_string(),
+            "secure" => "secure".to_string(),
+            "off" => "off".to_string(),
+            _ => fallback_norm,
+        };
+    }
+    if let Some(flag) = value.as_bool() {
+        // Legacy `mevProtect` boolean from older UI.
+        return if flag {
+            "reduced".to_string()
+        } else {
+            "off".to_string()
+        };
+    }
+    fallback_norm
+}
+
 fn creation_settings(
     provider: &str,
     tip_sol: &str,
@@ -105,6 +138,7 @@ fn creation_settings(
     auto_fee: bool,
     max_fee_sol: &str,
     dev_buy_sol: &str,
+    mev_mode: &str,
 ) -> Value {
     json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
@@ -113,6 +147,7 @@ fn creation_settings(
         "autoFee": auto_fee,
         "maxFeeSol": max_fee_sol.trim(),
         "devBuySol": normalize_decimal_string(dev_buy_sol, ""),
+        "mevMode": mev_mode,
     })
 }
 
@@ -123,6 +158,7 @@ fn trade_settings(
     slippage_percent: &str,
     auto_fee: bool,
     max_fee_sol: &str,
+    mev_mode: &str,
 ) -> Value {
     json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
@@ -131,11 +167,12 @@ fn trade_settings(
         "slippagePercent": normalize_decimal_string(slippage_percent, DEFAULT_TRADE_SLIPPAGE_PERCENT),
         "autoFee": auto_fee,
         "maxFeeSol": max_fee_sol.trim(),
+        "mevMode": mev_mode,
     })
 }
 
 fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
-    let mut buy = trade_settings("", "", "", "", false, "");
+    let mut buy = trade_settings("", "", "", "", false, "", "off");
     if let Some(object) = buy.as_object_mut() {
         object.insert(
             "snipeBuyAmountSol".to_string(),
@@ -145,9 +182,9 @@ fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
     json!({
         "id": id,
         "label": label,
-        "creationSettings": creation_settings("", "", "", false, "", dev_buy_sol),
+        "creationSettings": creation_settings("", "", "", false, "", dev_buy_sol, "off"),
         "buySettings": buy,
-        "sellSettings": trade_settings("", "", "", "", false, ""),
+        "sellSettings": trade_settings("", "", "", "", false, "", "off"),
         "postLaunchStrategy": "none",
     })
 }
@@ -224,6 +261,12 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
         .trim()
         .to_string()
         .if_empty_then(format!("P{}", index + 1));
+    let creation_mev_mode = normalize_mev_mode(
+        creation
+            .and_then(|value| value.get("mevMode"))
+            .or_else(|| creation.and_then(|value| value.get("mevProtect"))),
+        &string_value(fallback_creation.get("mevMode")),
+    );
     let creation_settings = creation_settings(
         creation
             .and_then(|value| value.get("provider"))
@@ -274,6 +317,12 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             ),
+        &creation_mev_mode,
+    );
+    let buy_mev_mode = normalize_mev_mode(
+        buy.and_then(|value| value.get("mevMode"))
+            .or_else(|| buy.and_then(|value| value.get("mevProtect"))),
+        &string_value(fallback_buy.get("mevMode")),
     );
     let mut buy_settings = trade_settings(
         buy.and_then(|value| value.get("provider"))
@@ -320,6 +369,7 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             ),
+        &buy_mev_mode,
     );
     buy_settings
         .as_object_mut()
@@ -338,6 +388,11 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                 "",
             )),
         );
+    let sell_mev_mode = normalize_mev_mode(
+        sell.and_then(|value| value.get("mevMode"))
+            .or_else(|| sell.and_then(|value| value.get("mevProtect"))),
+        &string_value(fallback_sell.get("mevMode")),
+    );
     let sell_settings = trade_settings(
         sell.and_then(|value| value.get("provider"))
             .and_then(Value::as_str)
@@ -383,6 +438,7 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             ),
+        &sell_mev_mode,
     );
     let post_launch_strategy = preset_obj
         .and_then(|value| value.get("postLaunchStrategy"))
@@ -711,17 +767,69 @@ mod tests {
             assert_eq!(preset["creationSettings"]["priorityFeeSol"], "0.000001");
             assert_eq!(preset["creationSettings"]["tipSol"], "0.0002");
             assert_eq!(preset["creationSettings"]["autoFee"], false);
+            assert_eq!(preset["creationSettings"]["mevMode"], "off");
             assert_eq!(preset["buySettings"]["provider"], "helius-sender");
             assert_eq!(preset["buySettings"]["priorityFeeSol"], "0.000001");
             assert_eq!(preset["buySettings"]["tipSol"], "0.0002");
             assert_eq!(preset["buySettings"]["slippagePercent"], "20");
             assert_eq!(preset["buySettings"]["autoFee"], false);
+            assert_eq!(preset["buySettings"]["mevMode"], "off");
             assert_eq!(preset["sellSettings"]["provider"], "helius-sender");
             assert_eq!(preset["sellSettings"]["priorityFeeSol"], "0.000001");
             assert_eq!(preset["sellSettings"]["tipSol"], "0.0002");
             assert_eq!(preset["sellSettings"]["slippagePercent"], "20");
             assert_eq!(preset["sellSettings"]["autoFee"], false);
+            assert_eq!(preset["sellSettings"]["mevMode"], "off");
         }
+    }
+
+    #[test]
+    fn normalize_persistent_config_preserves_hellomoon_mev_modes() {
+        let normalized = normalize_persistent_config(json!({
+            "defaults": {
+                "launchpad": "pump",
+                "mode": "regular",
+                "activePresetId": "preset1"
+            },
+            "presets": {
+                "items": [{
+                    "id": "preset1",
+                    "label": "P1",
+                    "creationSettings": {
+                        "provider": "hellomoon",
+                        "tipSol": "0.001",
+                        "priorityFeeSol": "0.00001",
+                        "mevMode": "reduced",
+                        "autoFee": false,
+                        "maxFeeSol": "",
+                        "devBuySol": ""
+                    },
+                    "buySettings": {
+                        "provider": "hellomoon",
+                        "priorityFeeSol": "0.00001",
+                        "tipSol": "0.001",
+                        "slippagePercent": "20",
+                        "mevMode": "secure",
+                        "autoFee": false,
+                        "maxFeeSol": ""
+                    },
+                    "sellSettings": {
+                        "provider": "hellomoon",
+                        "priorityFeeSol": "0.00001",
+                        "tipSol": "0.001",
+                        "slippagePercent": "20",
+                        "mevMode": "off",
+                        "autoFee": false,
+                        "maxFeeSol": ""
+                    }
+                }]
+            }
+        }));
+        let preset = &normalized["presets"]["items"][0];
+        assert_eq!(preset["creationSettings"]["provider"], "hellomoon");
+        assert_eq!(preset["creationSettings"]["mevMode"], "reduced");
+        assert_eq!(preset["buySettings"]["mevMode"], "secure");
+        assert_eq!(preset["sellSettings"]["mevMode"], "off");
     }
 
     #[test]

@@ -39,6 +39,8 @@ const {
   getPdaLaunchpadVaultId,
 } = require("@raydium-io/raydium-sdk-v2");
 
+const JITODONTFRONT_ACCOUNT = new PublicKey("jitodontfront111111111111111111111111111111");
+
 const FIXED_COMPUTE_UNIT_LIMIT = 1_000_000;
 const TOKEN_DECIMALS = 6;
 const PACKET_LIMIT = 1232;
@@ -534,10 +536,11 @@ function extractTransactions(result) {
       : [];
 }
 
-function normalizeTransactions(result, { labelPrefix, computeUnitLimit, computeUnitPriceMicroLamports, inlineTipLamports, inlineTipAccount, lastValidBlockHeight }) {
+function normalizeTransactions(result, { labelPrefix, computeUnitLimit, computeUnitPriceMicroLamports, inlineTipLamports, inlineTipAccount, lastValidBlockHeight, singleBundleTipLastTx = false }) {
   const transactions = extractTransactions(result);
   return transactions.map((transaction, index) => {
     const label = transactions.length === 1 ? labelPrefix : `${labelPrefix}-${index + 1}`;
+    const appliesTip = Boolean(inlineTipLamports) && (!singleBundleTipLastTx || index === transactions.length - 1);
     return {
       label,
       format: transaction instanceof VersionedTransaction ? "v0" : "legacy",
@@ -547,11 +550,22 @@ function normalizeTransactions(result, { labelPrefix, computeUnitLimit, computeU
       lookupTablesUsed: lookupTablesUsedOnTransaction(transaction),
       computeUnitLimit: computeUnitLimit || null,
       computeUnitPriceMicroLamports: computeUnitPriceMicroLamports || null,
-      inlineTipLamports: inlineTipLamports || null,
-      inlineTipAccount: inlineTipLamports && inlineTipAccount ? inlineTipAccount : null,
+      inlineTipLamports: appliesTip ? inlineTipLamports : null,
+      inlineTipAccount: appliesTip && inlineTipAccount ? inlineTipAccount : null,
       serializedLength: Buffer.from(serializeTransaction(transaction), "base64").length,
     };
   });
+}
+
+function txConfigForBundleIndex(txConfig, index, total) {
+  if (!txConfig || !txConfig.singleBundleTipLastTx || total <= 1 || index === total - 1) {
+    return txConfig;
+  }
+  return {
+    ...txConfig,
+    tipLamports: 0,
+    tipAccount: "",
+  };
 }
 
 function sleep(ms) {
@@ -845,65 +859,116 @@ function isAtomicMessageOverflowError(error) {
     || message.includes("encoding overruns");
 }
 
-async function ensureInlineTipOnTransaction(connection, owner, transaction, txConfig) {
+function hasJitoDontFrontAccount(instruction) {
+  return Boolean(
+    instruction
+    && Array.isArray(instruction.keys)
+    && instruction.keys.some((key) => key && key.pubkey && key.pubkey.equals(JITODONTFRONT_ACCOUNT))
+  );
+}
+
+function ensureJitoDontFrontOnInstruction(instruction) {
+  if (!instruction || !Array.isArray(instruction.keys) || hasJitoDontFrontAccount(instruction)) {
+    return false;
+  }
+  instruction.keys.push({
+    pubkey: JITODONTFRONT_ACCOUNT,
+    isSigner: false,
+    isWritable: false,
+  });
+  return true;
+}
+
+async function ensureTxConfigOnTransaction(connection, owner, transaction, txConfig, extraSigners = [], requestContext = null) {
+  const wantDontFront = Boolean(txConfig && txConfig.jitodontfront);
   const tipInstruction = buildInlineTipInstruction(
     owner.publicKey,
     txConfig && txConfig.tipAccount,
     txConfig && txConfig.tipLamports,
   );
-  if (!tipInstruction) {
+  if (!wantDontFront && !tipInstruction) {
     return transaction;
   }
   if (transaction instanceof VersionedTransaction) {
-    const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction);
-    if (instructions.some((instruction) => (
+    const { instructions, addressLookupTableAccounts } = await decompileTransactionInstructions(connection, transaction, requestContext);
+    let modified = false;
+    if (wantDontFront) {
+      for (const instruction of instructions) {
+        modified = ensureJitoDontFrontOnInstruction(instruction) || modified;
+      }
+    }
+    const hasTip = instructions.some((instruction) => (
       isInlineTipInstruction(
         instruction,
         owner.publicKey,
         txConfig && txConfig.tipAccount,
         txConfig && txConfig.tipLamports,
       )
-    ))) {
+    ));
+    if (tipInstruction && !hasTip) {
+      instructions.push(tipInstruction);
+      modified = true;
+    }
+    if (!modified) {
       return transaction;
     }
     const rebuilt = new VersionedTransaction(
       new TransactionMessage({
         payerKey: owner.publicKey,
         recentBlockhash: readTransactionBlockhash(transaction),
-        instructions: [...instructions, tipInstruction],
+        instructions,
       }).compileToV0Message(addressLookupTableAccounts),
     );
-    rebuilt.sign([owner]);
+    rebuilt.sign([owner, ...extraSigners]);
     return rebuilt;
   }
   const instructions = transaction.instructions || [];
-  if (instructions.some((instruction) => (
+  let modified = false;
+  if (wantDontFront) {
+    for (const instruction of instructions) {
+      modified = ensureJitoDontFrontOnInstruction(instruction) || modified;
+    }
+  }
+  const hasTip = instructions.some((instruction) => (
     isInlineTipInstruction(
       instruction,
       owner.publicKey,
       txConfig && txConfig.tipAccount,
       txConfig && txConfig.tipLamports,
     )
-  ))) {
+  ));
+  if (tipInstruction && !hasTip) {
+    instructions.push(tipInstruction);
+    modified = true;
+  }
+  if (!modified) {
     return transaction;
   }
   const rebuilt = new Transaction();
   rebuilt.feePayer = owner.publicKey;
   rebuilt.recentBlockhash = readTransactionBlockhash(transaction);
   instructions.forEach((instruction) => rebuilt.add(instruction));
-  rebuilt.add(tipInstruction);
-  rebuilt.sign(owner);
+  rebuilt.sign(owner, ...extraSigners);
   return rebuilt;
 }
 
-async function ensureInlineTipOnSwapResult(connection, owner, result, txConfig) {
+async function ensureTxConfigOnSwapResult(connection, owner, result, txConfig, extraSigners = [], requestContext = null) {
   const transactions = extractTransactions(result);
-  if (!transactions.length || !txConfig || !txConfig.tipLamports || !txConfig.tipAccount) {
+  if (!transactions.length) {
     return result;
   }
   const rebuiltTransactions = [];
-  for (const transaction of transactions) {
-    rebuiltTransactions.push(await ensureInlineTipOnTransaction(connection, owner, transaction, txConfig));
+  for (const [index, transaction] of transactions.entries()) {
+    rebuiltTransactions.push(
+      await ensureTxConfigOnTransaction(
+        connection,
+        owner,
+        transaction,
+        txConfigForBundleIndex(txConfig, index, transactions.length),
+        extraSigners,
+        requestContext,
+      )
+    );
   }
   return rebuiltTransactions.length === 1
     ? { transaction: rebuiltTransactions[0] }
@@ -1956,7 +2021,7 @@ async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuo
     txTipConfig: buildTipConfig(request.txConfig),
     feePayer: owner.publicKey,
   });
-  const normalizedSwapResult = await ensureInlineTipOnSwapResult(
+  const normalizedSwapResult = await ensureTxConfigOnSwapResult(
     connection,
     owner,
     swapResult,
@@ -2009,13 +2074,21 @@ async function buildUsd1Topup(request) {
       usd1QuoteMetrics: prepared && prepared.usd1QuoteMetrics ? prepared.usd1QuoteMetrics : undefined,
     };
   }
+  const topupTransactions = extractTransactions(prepared.swapResult);
   const remappedTopupTransactions = await Promise.all(
-    extractTransactions(prepared.swapResult).map((transaction) => (
-      preferBonkUsd1LookupTableOnTransaction(
+    topupTransactions.map(async (transaction, index) => (
+      ensureTxConfigOnTransaction(
         connection,
         owner,
-        request,
-        transaction,
+        await preferBonkUsd1LookupTableOnTransaction(
+          connection,
+          owner,
+          request,
+          transaction,
+          [],
+          usd1QuoteContext,
+        ),
+        txConfigForBundleIndex(request.txConfig, index, topupTransactions.length),
         [],
         usd1QuoteContext,
       )
@@ -2030,6 +2103,7 @@ async function buildUsd1Topup(request) {
       inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
+      singleBundleTipLastTx: Boolean(request.txConfig && request.txConfig.singleBundleTipLastTx),
     })[0],
     requiredQuoteAmount: prepared.requiredQuoteAmount,
     currentQuoteAmount: prepared.currentQuoteAmount,
@@ -2146,6 +2220,7 @@ async function buildLaunch(request) {
   const topupTransactions = usd1Topup && usd1Topup.swapResult
     ? extractTransactions(usd1Topup.swapResult)
     : [];
+  const launchBundleTransactionCount = topupTransactions.length + launchTransactions.length;
   const latestBlockhash = await connection.getLatestBlockhash(request.commitment || "confirmed");
   const { lastValidBlockHeight } = latestBlockhash;
   let compiledTransactions;
@@ -2165,7 +2240,15 @@ async function buildLaunch(request) {
           usd1QuoteContext,
         );
         atomicCombined = true;
-        compiledTransactions = normalizeTransactions({ transactions: [combined.transaction] }, {
+        const securedCombinedTransaction = await ensureTxConfigOnTransaction(
+          connection,
+          owner,
+          combined.transaction,
+          request.txConfig,
+          [mintKeypair],
+          usd1QuoteContext,
+        );
+        compiledTransactions = normalizeTransactions({ transactions: [securedCombinedTransaction] }, {
           labelPrefix: "launch",
           computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
           computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
@@ -2181,12 +2264,23 @@ async function buildLaunch(request) {
     }
   }
   if (!compiledTransactions) {
-    const remappedLaunchTransactions = await Promise.all(launchTransactions.map((transaction, index) => (
-      preferBonkUsd1LookupTableOnTransaction(
+    const remappedLaunchTransactions = await Promise.all(launchTransactions.map(async (transaction, index, transactions) => (
+      ensureTxConfigOnTransaction(
         connection,
         owner,
-        request,
-        transaction,
+        await preferBonkUsd1LookupTableOnTransaction(
+          connection,
+          owner,
+          request,
+          transaction,
+          index === 0 ? [mintKeypair] : [],
+          usd1QuoteContext,
+        ),
+        txConfigForBundleIndex(
+          request.txConfig,
+          launchBundleTransactionCount > 0 ? topupTransactions.length + index : index,
+          launchBundleTransactionCount > 0 ? launchBundleTransactionCount : transactions.length,
+        ),
         index === 0 ? [mintKeypair] : [],
         usd1QuoteContext,
       )
@@ -2198,14 +2292,26 @@ async function buildLaunch(request) {
       inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
+      singleBundleTipLastTx: Boolean(request.txConfig && request.txConfig.singleBundleTipLastTx),
     });
     if (topupTransactions.length) {
-      const remappedTopupTransactions = await Promise.all(topupTransactions.map((transaction) => (
-        preferBonkUsd1LookupTableOnTransaction(
+      const remappedTopupTransactions = await Promise.all(topupTransactions.map(async (transaction, index, transactions) => (
+        ensureTxConfigOnTransaction(
           connection,
           owner,
-          request,
-          transaction,
+          await preferBonkUsd1LookupTableOnTransaction(
+            connection,
+            owner,
+            request,
+            transaction,
+            [],
+            usd1QuoteContext,
+          ),
+          txConfigForBundleIndex(
+            request.txConfig,
+            index,
+            launchBundleTransactionCount > 0 ? launchBundleTransactionCount : transactions.length,
+          ),
           [],
           usd1QuoteContext,
         )
@@ -2214,8 +2320,12 @@ async function buildLaunch(request) {
         labelPrefix: request.labelPrefix || "launch-usd1-topup",
         computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
         computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
-        inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
-        inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
+        inlineTipLamports: request.txConfig && request.txConfig.singleBundleTipLastTx
+          ? null
+          : request.txConfig && request.txConfig.tipLamports,
+        inlineTipAccount: request.txConfig && request.txConfig.singleBundleTipLastTx
+          ? null
+          : request.txConfig && request.txConfig.tipAccount,
         lastValidBlockHeight,
       }));
       if (!atomicFallbackReason) {
@@ -2333,8 +2443,16 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
         latestBlockhash,
         usd1QuoteContext,
       );
+      const securedCombinedTransaction = await ensureTxConfigOnTransaction(
+        connection,
+        owner,
+        combined.transaction,
+        request.txConfig,
+        [],
+        usd1QuoteContext,
+      );
       return {
-        compiledTransaction: normalizeTransactions({ transactions: [combined.transaction] }, {
+        compiledTransaction: normalizeTransactions({ transactions: [securedCombinedTransaction] }, {
           labelPrefix,
           computeUnitLimit: request.txConfig && request.txConfig.computeUnitLimit,
           computeUnitPriceMicroLamports: request.txConfig && request.txConfig.computeUnitPriceMicroLamports,
@@ -2347,13 +2465,21 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
     }
   }
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const buyTransactions = extractTransactions(buildResult);
   const remappedBuyTransactions = await Promise.all(
-    extractTransactions(buildResult).map((transaction) => (
-      preferBonkUsd1LookupTableOnTransaction(
+    buyTransactions.map(async (transaction, index) => (
+      ensureTxConfigOnTransaction(
         connection,
         owner,
-        request,
-        transaction,
+        await preferBonkUsd1LookupTableOnTransaction(
+          connection,
+          owner,
+          request,
+          transaction,
+          [],
+          quote.asset === "usd1" ? usd1QuoteContext : null,
+        ),
+        txConfigForBundleIndex(request.txConfig, index, buyTransactions.length),
         [],
         quote.asset === "usd1" ? usd1QuoteContext : null,
       )
@@ -2367,6 +2493,7 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
       inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
+      singleBundleTipLastTx: Boolean(request.txConfig && request.txConfig.singleBundleTipLastTx),
     })[0],
     usd1QuoteMetrics: formatUsd1QuoteMetrics(usd1QuoteContext.metrics),
   };
@@ -2436,13 +2563,21 @@ async function compileFollowSell(request) {
     checkCreateATAOwner: true,
   });
   const { lastValidBlockHeight } = await connection.getLatestBlockhash(request.commitment || "confirmed");
+  const sellTransactions = extractTransactions(buildResult);
   const remappedSellTransactions = await Promise.all(
-    extractTransactions(buildResult).map((transaction) => (
-      preferBonkUsd1LookupTableOnTransaction(
+    sellTransactions.map(async (transaction, index) => (
+      ensureTxConfigOnTransaction(
         connection,
         owner,
-        request,
-        transaction,
+        await preferBonkUsd1LookupTableOnTransaction(
+          connection,
+          owner,
+          request,
+          transaction,
+          [],
+          requestContext,
+        ),
+        txConfigForBundleIndex(request.txConfig, index, sellTransactions.length),
         [],
         requestContext,
       )
@@ -2456,6 +2591,7 @@ async function compileFollowSell(request) {
       inlineTipLamports: request.txConfig && request.txConfig.tipLamports,
       inlineTipAccount: request.txConfig && request.txConfig.tipAccount,
       lastValidBlockHeight,
+      singleBundleTipLastTx: Boolean(request.txConfig && request.txConfig.singleBundleTipLastTx),
     })[0],
   };
 }

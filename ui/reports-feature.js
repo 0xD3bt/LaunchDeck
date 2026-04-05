@@ -37,6 +37,7 @@
       reportsTransactionsButton,
       reportsLaunchesButton,
       reportsActiveJobsButton,
+      reportsActiveLogsButton,
     } = elements;
 
     const {
@@ -262,13 +263,28 @@
           }
         });
       }
+      if (reportsActiveLogsButton) {
+        reportsActiveLogsButton.addEventListener("click", async () => {
+          if (getView() === "active-logs") return;
+          setView("active-logs");
+          try {
+            await refreshReports({ preserveSelection: false });
+          } catch (error) {
+            if (reportsTerminalOutput) {
+              state.activePayload = null;
+              state.activeText = error.message || "Failed to load active logs.";
+              renderOutput();
+            }
+          }
+        });
+      }
       if (reportsTerminalList) {
         reportsTerminalList.addEventListener("click", async (event) => {
           if (getView() !== "transactions") return;
           const button = event.target.closest("[data-report-id]");
           if (!button) return;
           try {
-            await loadEntry(button.getAttribute("data-report-id") || "", { syncMainOutput: true });
+            await loadEntry(button.getAttribute("data-report-id") || "");
           } catch (error) {
             if (reportsTerminalOutput) {
               state.activePayload = null;

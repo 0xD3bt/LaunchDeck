@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use crate::provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -182,6 +183,10 @@ pub struct RawExecution {
     #[serde(default)]
     pub policy: String,
     #[serde(default)]
+    pub mevProtect: Option<Value>,
+    #[serde(default)]
+    pub mevMode: Option<Value>,
+    #[serde(default)]
     pub autoGas: Option<Value>,
     #[serde(default)]
     pub autoMode: String,
@@ -199,6 +204,10 @@ pub struct RawExecution {
     pub buyEndpointProfile: String,
     #[serde(default)]
     pub buyPolicy: String,
+    #[serde(default)]
+    pub buyMevProtect: Option<Value>,
+    #[serde(default)]
+    pub buyMevMode: Option<Value>,
     #[serde(default)]
     pub buyAutoGas: Option<Value>,
     #[serde(default)]
@@ -223,6 +232,10 @@ pub struct RawExecution {
     pub sellEndpointProfile: String,
     #[serde(default)]
     pub sellPolicy: String,
+    #[serde(default)]
+    pub sellMevProtect: Option<Value>,
+    #[serde(default)]
+    pub sellMevMode: Option<Value>,
     #[serde(default)]
     pub sellPriorityFeeSol: String,
     #[serde(default)]
@@ -343,7 +356,11 @@ pub struct RawFollowLaunchMarketCapTrigger {
     pub scanTimeoutSeconds: Option<Value>,
     #[serde(default)]
     pub timeoutAction: String,
-    #[serde(default, rename = "scanTimeoutMinutes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "scanTimeoutMinutes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacyScanTimeoutMinutes: Option<Value>,
 }
 
@@ -568,6 +585,12 @@ pub struct NormalizedExecution {
     pub trackSendBlockHeight: bool,
     pub provider: String,
     pub endpointProfile: String,
+    #[serde(default)]
+    pub mevProtect: bool,
+    #[serde(default)]
+    pub mevMode: String,
+    #[serde(default)]
+    pub jitodontfront: bool,
     pub autoGas: bool,
     pub autoMode: String,
     pub priorityFeeSol: String,
@@ -576,6 +599,12 @@ pub struct NormalizedExecution {
     pub maxTipSol: String,
     pub buyProvider: String,
     pub buyEndpointProfile: String,
+    #[serde(default)]
+    pub buyMevProtect: bool,
+    #[serde(default)]
+    pub buyMevMode: String,
+    #[serde(default)]
+    pub buyJitodontfront: bool,
     pub buyAutoGas: bool,
     pub buyAutoMode: String,
     pub buyPriorityFeeSol: String,
@@ -587,6 +616,12 @@ pub struct NormalizedExecution {
     pub sellAutoMode: String,
     pub sellProvider: String,
     pub sellEndpointProfile: String,
+    #[serde(default)]
+    pub sellMevProtect: bool,
+    #[serde(default)]
+    pub sellMevMode: String,
+    #[serde(default)]
+    pub sellJitodontfront: bool,
     pub sellPriorityFeeSol: String,
     pub sellTipSol: String,
     pub sellSlippagePercent: String,
@@ -720,6 +755,26 @@ fn configured_track_send_block_height_default() -> bool {
     ) && configured_track_send_block_height_env_enabled()
 }
 
+fn configured_hellomoon_mev_protect_default() -> bool {
+    matches!(
+        env::var("HELLOMOON_MEV_PROTECT")
+            .or_else(|_| env::var("LUNAR_LANDER_MEV_PROTECT"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn configured_hellomoon_mev_mode_default() -> String {
+    if configured_hellomoon_mev_protect_default() {
+        "reduced".to_string()
+    } else {
+        "off".to_string()
+    }
+}
+
 fn configured_compute_unit_limit_env(name: &str, fallback: u64) -> u64 {
     env::var(name)
         .ok()
@@ -783,6 +838,49 @@ fn parse_bool(value: &Option<Value>, fallback: bool) -> bool {
         Some(Value::Null) => fallback,
         Some(_) => fallback,
     }
+}
+
+fn parse_mev_mode(value: &Option<Value>, fallback: &str) -> String {
+    match value {
+        None | Some(Value::Null) => fallback.to_string(),
+        Some(Value::Bool(v)) => {
+            if *v {
+                "reduced".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        Some(Value::String(v)) => match v.trim().to_ascii_lowercase().as_str() {
+            "off" => "off".to_string(),
+            "reduced" => "reduced".to_string(),
+            "secure" => "secure".to_string(),
+            "true" => "reduced".to_string(),
+            "false" => "off".to_string(),
+            _ => fallback.to_string(),
+        },
+        Some(Value::Number(n)) => {
+            if n.as_i64().unwrap_or_default() != 0 {
+                "reduced".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        Some(_) => fallback.to_string(),
+    }
+}
+
+fn mev_mode_enables_hellomoon_protect(mode: &str) -> bool {
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "reduced" | "secure"
+    )
+}
+
+fn mev_mode_enables_jitodontfront(mode: &str) -> bool {
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "reduced" | "secure"
+    )
 }
 
 fn parse_int(
@@ -908,10 +1006,11 @@ fn parse_choice(
     }
 }
 
-const REQUIRED_PROVIDER_TIP_LAMPORTS: u64 = 200_000;
-
 fn provider_requires_tip_and_priority(provider: &str) -> bool {
-    matches!(provider.trim(), "helius-sender" | "jito-bundle")
+    matches!(
+        provider.trim(),
+        "helius-sender" | "hellomoon" | "jito-bundle"
+    )
 }
 
 fn parse_sol_decimal_to_lamports(value: &str, label: &str) -> Result<u64, ConfigError> {
@@ -970,11 +1069,12 @@ fn validate_manual_provider_fee_fields(
             "{label_prefix}PriorityFeeSol must be greater than 0 when {label_prefix}Provider is {provider}."
         )));
     }
-    let tip_lamports =
-        parse_sol_decimal_to_lamports(tip_sol, &format!("{label_prefix}TipSol"))?;
-    if tip_lamports < REQUIRED_PROVIDER_TIP_LAMPORTS {
+    let tip_lamports = parse_sol_decimal_to_lamports(tip_sol, &format!("{label_prefix}TipSol"))?;
+    let minimum_tip_lamports = provider_required_tip_lamports(provider).unwrap_or(0);
+    if tip_lamports < minimum_tip_lamports {
         return Err(ConfigError::Message(format!(
-            "{label_prefix}TipSol must be at least 0.0002 SOL when {label_prefix}Provider is {provider}."
+            "{label_prefix}TipSol must be at least {} SOL when {label_prefix}Provider is {provider}.",
+            provider_min_tip_sol_label(provider)
         )));
     }
     Ok(())
@@ -1273,8 +1373,10 @@ fn normalize_follow_sell(
     )?
     .map(|value| value as u8);
     let direction = "gte".to_string();
-    let scan_timeout_seconds =
-        parse_market_cap_scan_timeout_seconds(&raw.marketCap, &format!("{fallback_action_id}.marketCap"))?;
+    let scan_timeout_seconds = parse_market_cap_scan_timeout_seconds(
+        &raw.marketCap,
+        &format!("{fallback_action_id}.marketCap"),
+    )?;
     let timeout_action = parse_choice(
         &raw.marketCap.timeoutAction,
         &format!("{fallback_action_id}.marketCap.timeoutAction"),
@@ -1374,13 +1476,13 @@ fn legacy_follow_launch(
             .unwrap_or(100) as u8,
             delayMs: Some(
                 (parse_int(
-                &raw.postLaunch.automaticDevSell.delaySeconds,
-                "postLaunch.automaticDevSell.delaySeconds",
-                Some(0),
-                Some(10),
-                Some(0),
-            )?
-            .unwrap_or(0) as u64)
+                    &raw.postLaunch.automaticDevSell.delaySeconds,
+                    "postLaunch.automaticDevSell.delaySeconds",
+                    Some(0),
+                    Some(10),
+                    Some(0),
+                )?
+                .unwrap_or(0) as u64)
                     * 1000,
             ),
             targetBlockOffset: None,
@@ -1503,8 +1605,7 @@ fn normalize_follow_launch(
     let explicit_enabled = parse_bool(&follow.enabled, false);
     let has_enabled_snipes = snipes.iter().any(|snipe| snipe.enabled);
     let has_enabled_dev_auto_sell = dev_auto_sell.as_ref().is_some_and(|sell| sell.enabled);
-    let has_explicit_payload =
-        explicit_enabled || has_enabled_snipes || has_enabled_dev_auto_sell;
+    let has_explicit_payload = explicit_enabled || has_enabled_snipes || has_enabled_dev_auto_sell;
     if !has_explicit_payload {
         return legacy_follow_launch(raw, post_launch_strategy);
     }
@@ -1587,6 +1688,42 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         normalize_recipients(&raw.feeSharing.recipients, "feeSharing recipient", false)?;
     let mut agent_fee_recipients =
         normalize_recipients(&raw.agent.feeRecipients, "agent recipient", true)?;
+    let default_mev_mode = configured_hellomoon_mev_mode_default();
+    let creation_mev_mode = parse_mev_mode(
+        if raw.execution.mevMode.is_some() {
+            &raw.execution.mevMode
+        } else {
+            &raw.execution.mevProtect
+        },
+        &default_mev_mode,
+    );
+    let buy_mev_mode = parse_mev_mode(
+        if raw.execution.buyMevMode.is_some() {
+            &raw.execution.buyMevMode
+        } else {
+            &raw.execution.buyMevProtect
+        },
+        &default_mev_mode,
+    );
+    let sell_mev_mode = parse_mev_mode(
+        if raw.execution.sellMevMode.is_some() {
+            &raw.execution.sellMevMode
+        } else {
+            &raw.execution.sellMevProtect
+        },
+        &default_mev_mode,
+    );
+
+    let execution_provider = parse_choice(
+        &raw.execution.provider,
+        "execution.provider",
+        &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
+        "helius-sender",
+    )?;
+    // All supported send paths either require skip preflight (Sender / Hello Moon), use bundle APIs
+    // without Solana RPC preflight (Jito), or use standard-rpc fanout which sets skip in TransportPlan.
+    // Keep execution.skipPreflight true so reports and follow jobs stay consistent.
+    let execution_skip_preflight = true;
 
     let mut normalized = NormalizedConfig {
         mode: mode.clone(),
@@ -1695,25 +1832,23 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                 &["processed", "confirmed", "finalized"],
                 "confirmed",
             )?,
-            skipPreflight: parse_bool(&raw.execution.skipPreflight, false),
+            skipPreflight: execution_skip_preflight,
             trackSendBlockHeight: parse_bool(
                 &raw.execution.trackSendBlockHeight,
                 configured_track_send_block_height_default(),
             ),
-            provider: parse_choice(
-                &raw.execution.provider,
-                "execution.provider",
-                &["standard-rpc", "helius-sender", "jito-bundle"],
-                "helius-sender",
-            )?,
+            provider: execution_provider,
             endpointProfile: if is_blank(&raw.execution.endpointProfile) {
                 String::new()
             } else {
-                crate::endpoint_profile::parse_config_endpoint_profile(&raw.execution.endpointProfile)
-                    .map_err(|msg| {
-                        ConfigError::Message(format!("execution.endpointProfile: {msg}"))
-                    })?
+                crate::endpoint_profile::parse_config_endpoint_profile(
+                    &raw.execution.endpointProfile,
+                )
+                .map_err(|msg| ConfigError::Message(format!("execution.endpointProfile: {msg}")))?
             },
+            mevProtect: mev_mode_enables_hellomoon_protect(&creation_mev_mode),
+            mevMode: creation_mev_mode.clone(),
+            jitodontfront: mev_mode_enables_jitodontfront(&creation_mev_mode),
             autoGas: parse_bool(&raw.execution.autoGas, true),
             autoMode: if is_blank(&raw.execution.autoMode) {
                 "launchAuto".to_string()
@@ -1727,7 +1862,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             buyProvider: parse_choice(
                 &raw.execution.buyProvider,
                 "execution.buyProvider",
-                &["standard-rpc", "helius-sender", "jito-bundle"],
+                &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
                 "helius-sender",
             )?,
             buyEndpointProfile: if is_blank(&raw.execution.buyEndpointProfile) {
@@ -1740,6 +1875,9 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     ConfigError::Message(format!("execution.buyEndpointProfile: {msg}"))
                 })?
             },
+            buyMevProtect: mev_mode_enables_hellomoon_protect(&buy_mev_mode),
+            buyMevMode: buy_mev_mode.clone(),
+            buyJitodontfront: mev_mode_enables_jitodontfront(&buy_mev_mode),
             buyAutoGas: parse_bool(&raw.execution.buyAutoGas, true),
             buyAutoMode: if is_blank(&raw.execution.buyAutoMode) {
                 "buyAuto".to_string()
@@ -1760,7 +1898,7 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
             sellProvider: parse_choice(
                 &raw.execution.sellProvider,
                 "execution.sellProvider",
-                &["standard-rpc", "helius-sender", "jito-bundle"],
+                &["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"],
                 "helius-sender",
             )?,
             sellEndpointProfile: if is_blank(&raw.execution.sellEndpointProfile) {
@@ -1773,6 +1911,9 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
                     ConfigError::Message(format!("execution.sellEndpointProfile: {msg}"))
                 })?
             },
+            sellMevProtect: mev_mode_enables_hellomoon_protect(&sell_mev_mode),
+            sellMevMode: sell_mev_mode.clone(),
+            sellJitodontfront: mev_mode_enables_jitodontfront(&sell_mev_mode),
             sellPriorityFeeSol: raw.execution.sellPriorityFeeSol.trim().to_string(),
             sellTipSol: raw.execution.sellTipSol.trim().to_string(),
             sellSlippagePercent: raw.execution.sellSlippagePercent.trim().to_string(),
@@ -1883,41 +2024,45 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         ));
     }
     if provider_requires_tip_and_priority(&normalized.execution.provider) {
+        let minimum_tip_lamports =
+            provider_required_tip_lamports(&normalized.execution.provider).unwrap_or(200_000);
         if normalized.tx.computeUnitPriceMicroLamports.unwrap_or(0) <= 0 {
             return Err(ConfigError::Message(format!(
                 "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is {}.",
                 normalized.execution.provider
             )));
         }
-        if normalized.tx.jitoTipLamports < REQUIRED_PROVIDER_TIP_LAMPORTS as i64 {
+        if normalized.tx.jitoTipLamports < minimum_tip_lamports as i64 {
             return Err(ConfigError::Message(format!(
                 "tx.jitoTipLamports must be at least {} when execution.provider is {}.",
-                REQUIRED_PROVIDER_TIP_LAMPORTS,
-                normalized.execution.provider
+                minimum_tip_lamports, normalized.execution.provider
             )));
         }
     }
-    if normalized.execution.provider == "helius-sender" {
-        if !normalized.execution.skipPreflight {
-            return Err(ConfigError::Message(
-                "execution.skipPreflight must be true when execution.provider is helius-sender."
-                    .to_string(),
-            ));
-        }
+    if normalized.execution.provider == "helius-sender"
+        || normalized.execution.provider == "hellomoon"
+    {
         if normalized.tx.computeUnitPriceMicroLamports.unwrap_or(0) <= 0 {
-            return Err(ConfigError::Message(
-                "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is helius-sender."
-                    .to_string(),
-            ));
+            return Err(ConfigError::Message(format!(
+                "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is {}.",
+                normalized.execution.provider
+            )));
         }
-        if normalized.tx.jitoTipLamports < 200_000 {
-            return Err(ConfigError::Message(
-                "tx.jitoTipLamports must be at least 200000 when execution.provider is helius-sender."
-                    .to_string(),
-            ));
+        let minimum_tip_lamports =
+            provider_required_tip_lamports(&normalized.execution.provider).unwrap_or(200_000);
+        if normalized.tx.jitoTipLamports < minimum_tip_lamports as i64 {
+            return Err(ConfigError::Message(format!(
+                "tx.jitoTipLamports must be at least {} when execution.provider is {}.",
+                minimum_tip_lamports, normalized.execution.provider
+            )));
         }
     }
-    if normalized.followLaunch.snipes.iter().any(|snipe| snipe.enabled) {
+    if normalized
+        .followLaunch
+        .snipes
+        .iter()
+        .any(|snipe| snipe.enabled)
+    {
         validate_manual_provider_fee_fields(
             &normalized.execution.buyProvider,
             normalized.execution.buyAutoGas,
@@ -2087,16 +2232,76 @@ mod tests {
     }
 
     #[test]
-    fn helius_sender_requires_priority_tip_and_skip_preflight() {
+    fn execution_skip_preflight_always_true_for_all_providers() {
+        for provider in ["standard-rpc", "helius-sender", "hellomoon", "jito-bundle"] {
+            let mut raw = sample_raw_config();
+            raw.execution.provider = provider.to_string();
+            raw.execution.skipPreflight = Some(json!(false));
+            match provider {
+                "hellomoon" => {
+                    raw.tx.jitoTipLamports = Some(json!(1_000_000));
+                    raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+                }
+                "jito-bundle" => {
+                    raw.tx.jitoTipLamports = Some(json!(200_000));
+                    raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+                }
+                _ => {}
+            }
+            let normalized = normalize_raw_config(raw).unwrap_or_else(|err| {
+                panic!("normalize failed for provider {provider}: {err}");
+            });
+            assert!(
+                normalized.execution.skipPreflight,
+                "skipPreflight should be true for provider {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn hellomoon_mev_modes_normalize_to_expected_flags() {
         let mut raw = sample_raw_config();
-        raw.tx.jitoTipLamports = Some(json!(200_000));
-        raw.tx.jitoTipAccount = "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE".to_string();
-        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
-        raw.execution.skipPreflight = Some(json!(false));
-        let error = normalize_raw_config(raw).expect_err("sender should require skipPreflight");
+        raw.execution.provider = "hellomoon".to_string();
+        raw.tx.jitoTipLamports = Some(json!(1_000_000));
+        raw.execution.mevMode = Some(json!("off"));
+        raw.execution.buyMevMode = Some(json!("reduced"));
+        raw.execution.sellMevMode = Some(json!("secure"));
+
+        let normalized = normalize_raw_config(raw).expect("hellomoon mev modes should normalize");
+
+        assert_eq!(normalized.execution.mevMode, "off");
+        assert!(!normalized.execution.mevProtect);
+        assert!(!normalized.execution.jitodontfront);
+
+        assert_eq!(normalized.execution.buyMevMode, "reduced");
+        assert!(normalized.execution.buyMevProtect);
+        assert!(normalized.execution.buyJitodontfront);
+
+        assert_eq!(normalized.execution.sellMevMode, "secure");
+        assert!(normalized.execution.sellMevProtect);
+        assert!(normalized.execution.sellJitodontfront);
+    }
+
+    #[test]
+    fn hellomoon_requires_priority_and_minimum_tip() {
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "hellomoon".to_string();
+        raw.tx.jitoTipLamports = Some(json!(1_000_000));
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(0));
+        let error = normalize_raw_config(raw).expect_err("hellomoon should require priority");
         assert_eq!(
             error.to_string(),
-            "execution.skipPreflight must be true when execution.provider is helius-sender."
+            "tx.computeUnitPriceMicroLamports must be greater than 0 when execution.provider is hellomoon."
+        );
+
+        let mut raw = sample_raw_config();
+        raw.execution.provider = "hellomoon".to_string();
+        raw.tx.jitoTipLamports = Some(json!(999_999));
+        raw.tx.computeUnitPriceMicroLamports = Some(json!(1));
+        let error = normalize_raw_config(raw).expect_err("hellomoon should require minimum tip");
+        assert_eq!(
+            error.to_string(),
+            "tx.jitoTipLamports must be at least 1000000 when execution.provider is hellomoon."
         );
     }
 
@@ -2155,10 +2360,52 @@ mod tests {
         raw.execution.buyAutoGas = Some(json!(false));
         raw.execution.buyPriorityFeeSol = "0.001".to_string();
         raw.execution.buyTipSol = "0.0001".to_string();
-        let error = normalize_raw_config(raw).expect_err("manual buy tip floor should be validated");
+        let error =
+            normalize_raw_config(raw).expect_err("manual buy tip floor should be validated");
         assert_eq!(
             error.to_string(),
             "execution.buyTipSol must be at least 0.0002 SOL when execution.buyProvider is jito-bundle."
+        );
+    }
+
+    #[test]
+    fn manual_hellomoon_buy_fees_must_satisfy_provider_minimums() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.buyProvider = "hellomoon".to_string();
+        raw.execution.buyAutoGas = Some(json!(false));
+        raw.execution.buyPriorityFeeSol = String::new();
+        raw.execution.buyTipSol = "0.001".to_string();
+        let error = normalize_raw_config(raw)
+            .expect_err("manual hellomoon buy priority should be required");
+        assert_eq!(
+            error.to_string(),
+            "execution.buyPriorityFeeSol must be greater than 0 when execution.buyProvider is hellomoon."
+        );
+
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.buyProvider = "hellomoon".to_string();
+        raw.execution.buyAutoGas = Some(json!(false));
+        raw.execution.buyPriorityFeeSol = "0.001".to_string();
+        raw.execution.buyTipSol = "0.000999999".to_string();
+        let error = normalize_raw_config(raw)
+            .expect_err("manual hellomoon buy tip floor should be validated");
+        assert_eq!(
+            error.to_string(),
+            "execution.buyTipSol must be at least 0.001 SOL when execution.buyProvider is hellomoon."
         );
     }
 
@@ -2168,7 +2415,7 @@ mod tests {
         raw.execution.provider = "auto".to_string();
         let error = normalize_raw_config(raw).expect_err("auto should be rejected");
         assert!(error.to_string().contains(
-            "execution.provider must be one of standard-rpc, helius-sender, jito-bundle"
+            "execution.provider must be one of standard-rpc, helius-sender, hellomoon, jito-bundle"
         ));
     }
 
@@ -2329,7 +2576,8 @@ mod tests {
         }))
         .expect("follow launch raw");
 
-        let normalized = normalize_raw_config(raw).expect("disabled follow launch should normalize");
+        let normalized =
+            normalize_raw_config(raw).expect("disabled follow launch should normalize");
         assert!(!normalized.followLaunch.enabled);
         assert!(normalized.followLaunch.snipes.is_empty());
         assert!(normalized.followLaunch.devAutoSell.is_none());
@@ -2357,7 +2605,8 @@ mod tests {
         }))
         .expect("follow launch raw");
 
-        let normalized = normalize_raw_config(raw).expect("market-cap follow sell should normalize");
+        let normalized =
+            normalize_raw_config(raw).expect("market-cap follow sell should normalize");
         let dev_auto_sell = normalized
             .followLaunch
             .devAutoSell
@@ -2407,11 +2656,21 @@ mod tests {
 
     #[test]
     fn track_send_block_height_default_only_runs_in_full_mode() {
-        assert!(!benchmark_mode_allows_track_send_block_height_default("off"));
-        assert!(!benchmark_mode_allows_track_send_block_height_default("light"));
-        assert!(!benchmark_mode_allows_track_send_block_height_default("basic"));
-        assert!(!benchmark_mode_allows_track_send_block_height_default("unexpected"));
-        assert!(benchmark_mode_allows_track_send_block_height_default("full"));
+        assert!(!benchmark_mode_allows_track_send_block_height_default(
+            "off"
+        ));
+        assert!(!benchmark_mode_allows_track_send_block_height_default(
+            "light"
+        ));
+        assert!(!benchmark_mode_allows_track_send_block_height_default(
+            "basic"
+        ));
+        assert!(!benchmark_mode_allows_track_send_block_height_default(
+            "unexpected"
+        ));
+        assert!(benchmark_mode_allows_track_send_block_height_default(
+            "full"
+        ));
         assert!(benchmark_mode_allows_track_send_block_height_default(""));
     }
 

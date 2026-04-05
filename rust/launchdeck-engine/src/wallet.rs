@@ -628,7 +628,8 @@ async fn enrich_wallet_statuses_batched(
     if valid_indices.is_empty() {
         return Ok(results);
     }
-    let usd1_ata_accounts = resolve_cached_associated_token_accounts(&public_keys, &usd1_mint_pubkey)?;
+    let usd1_ata_accounts =
+        resolve_cached_associated_token_accounts(&public_keys, &usd1_mint_pubkey)?;
     let (balance_result, usd1_accounts_result) = tokio::join!(
         fetch_multiple_balance_lamports_with_client(client, rpc_url, &public_keys, "confirmed"),
         fetch_multiple_account_data_with_client(client, rpc_url, &usd1_ata_accounts, "confirmed"),
@@ -675,8 +676,14 @@ async fn enrich_wallet_statuses_batched(
             async move {
                 (
                     position,
-                    fetch_token_balance_with_client(&client, &rpc_url, &public_key, &usd1_mint, "confirmed")
-                        .await,
+                    fetch_token_balance_with_client(
+                        &client,
+                        &rpc_url,
+                        &public_key,
+                        &usd1_mint,
+                        "confirmed",
+                    )
+                    .await,
                 )
             }
         });
@@ -725,6 +732,8 @@ pub async fn enrich_wallet_statuses(
     };
     match enrich_wallet_statuses_batched(&client, rpc_url, usd1_mint, wallets).await {
         Ok(wallets) => wallets,
-        Err(_error) => enrich_wallet_statuses_individual(&client, rpc_url, usd1_mint, wallets).await,
+        Err(_error) => {
+            enrich_wallet_statuses_individual(&client, rpc_url, usd1_mint, wallets).await
+        }
     }
 }

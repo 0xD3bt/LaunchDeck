@@ -18,7 +18,8 @@
     "stop": "node ./scripts/runtime-control.js stop",
     "restart": "node ./scripts/runtime-control.js restart",
     "analyze": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- analyze-launch",
-    "trace-agent": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- trace-agent-account"
+    "trace-agent": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml --bin launchdeck-debug-cli -- trace-agent-account",
+    "ws-bench": "node ./Benchmarking/Benchmark.js"
   },
   "dependencies": {
     "@bagsfm/bags-sdk": "^1.3.4",
@@ -30,6 +31,7 @@
     "dotenv": "^17.3.1"
   },
   "devDependencies": {
-    "playwright": "^1.58.2"
+    "playwright": "^1.58.2",
+    "ws": "^8.18.0"
   }
 }

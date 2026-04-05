@@ -117,10 +117,10 @@ If you do not want Sender rules, switch to `Standard RPC`.
 
 For the best current Sender path:
 
-1. use Helius for `SOLANA_RPC_URL`
-2. use the matching Helius websocket for `SOLANA_WS_URL`
+1. use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
+2. use Helius standard websocket for `SOLANA_WS_URL`
 3. use a Shyft RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-4. use Helius dev tier if you want the strongest performance and watcher behavior
+4. use Helius dev tier if you want the strongest performance and watcher behavior, especially with multiple snipes or heavy follow automation
 
 ### Sender “connection warm” or startup Sender checks fail
 

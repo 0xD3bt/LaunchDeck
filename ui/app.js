@@ -121,6 +121,7 @@ const devBuyQuotePrefixIcon = document.getElementById("dev-buy-quote-prefix-icon
 const devBuyQuotePrefixText = document.getElementById("dev-buy-quote-prefix-text");
 const creationTipInput = document.getElementById("creation-tip-input");
 const creationPriorityInput = document.getElementById("creation-priority-input");
+const creationMevModeSelect = document.getElementById("creation-mev-mode-select");
 const creationAutoFeeInput = document.getElementById("creation-auto-fee-input");
 const creationAutoFeeButton = document.getElementById("creation-auto-fee-button");
 const creationMaxFeeInput = document.getElementById("creation-max-fee-input");
@@ -133,16 +134,20 @@ const platformRuntimeIndicators = document.getElementById("platform-runtime-indi
 const buyPriorityFeeInput = document.getElementById("buy-priority-fee-input");
 const buyTipInput = document.getElementById("buy-tip-input");
 const buySlippageInput = document.getElementById("buy-slippage-input");
+const buyMevModeSelect = document.getElementById("buy-mev-mode-select");
 const buyAutoFeeInput = document.getElementById("buy-auto-fee-input");
 const buyAutoFeeButton = document.getElementById("buy-auto-fee-button");
 const buyMaxFeeInput = document.getElementById("buy-max-fee-input");
+const buyHelloMoonMevWarning = document.getElementById("buy-hellomoon-mev-warning");
 const buyStandardRpcWarning = document.getElementById("buy-standard-rpc-warning");
 const sellPriorityFeeInput = document.getElementById("sell-priority-fee-input");
 const sellTipInput = document.getElementById("sell-tip-input");
 const sellSlippageInput = document.getElementById("sell-slippage-input");
+const sellMevModeSelect = document.getElementById("sell-mev-mode-select");
 const sellAutoFeeInput = document.getElementById("sell-auto-fee-input");
 const sellAutoFeeButton = document.getElementById("sell-auto-fee-button");
 const sellMaxFeeInput = document.getElementById("sell-max-fee-input");
+const sellHelloMoonMevWarning = document.getElementById("sell-hellomoon-mev-warning");
 const sellStandardRpcWarning = document.getElementById("sell-standard-rpc-warning");
 const settingsPresetChipBar = document.getElementById("settings-preset-chip-bar");
 const presetEditToggle = document.getElementById("preset-edit-toggle");
@@ -187,6 +192,7 @@ const reportsRefreshButton = document.getElementById("reports-refresh-button");
 const reportsTransactionsButton = document.getElementById("reports-transactions-button");
 const reportsLaunchesButton = document.getElementById("reports-launches-button");
 const reportsActiveJobsButton = document.getElementById("reports-active-jobs-button");
+const reportsActiveLogsButton = document.getElementById("reports-active-logs-button");
 const openSettingsButton = document.getElementById("open-settings-button");
 const saveSettingsButton = document.getElementById("save-settings-button");
 const settingsModal = document.getElementById("settings-modal");
@@ -250,6 +256,8 @@ let vampInFlightAddress = "";
 const OUTPUT_SECTION_VISIBILITY_KEY = "launchdeck.outputSectionVisible";
 const REPORTS_TERMINAL_VISIBILITY_KEY = "launchdeck.reportsTerminalVisible";
 const REPORTS_TERMINAL_LIST_WIDTH_KEY = "launchdeck.reportsTerminalListWidth";
+const REPORTS_TERMINAL_VIEW_KEY = "launchdeck.reportsTerminalView";
+const REPORTS_ACTIVE_LOGS_VIEW_KEY = "launchdeck.reportsActiveLogsView";
 const THEME_MODE_STORAGE_KEY = "launchdeck.themeMode";
 const SELECTED_WALLET_STORAGE_KEY = "launchdeck.selectedWalletKey";
 const SELECTED_LAUNCHPAD_STORAGE_KEY = "launchdeck.selectedLaunchpad";
@@ -388,6 +396,12 @@ setOutputSectionVisible(
 );
 setImageLayoutCompact(getStoredImageLayoutCompact(), { persist: false });
 
+if (!isPopoutMode) {
+  if (output) output.textContent = "";
+  if (metaNode) metaNode.textContent = "";
+  setStatusLabel("");
+}
+
 let uploadedImage = null;
 let latestWalletStatus = null;
 let latestRuntimeStatus = null;
@@ -445,6 +459,7 @@ const requestStates = {
   walletStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   runtimeStatus: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   followJobs: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  logs: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   reports: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   reportView: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   images: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
@@ -474,6 +489,8 @@ let warmActivityState = {
   debounceTimer: null,
   inFlightPromise: null,
   lastSentAtMs: 0,
+  /** When true, run another flush after the current POST finishes (latest DOM/config). */
+  pendingFlush: false,
 };
 let imageLibraryState = {
   images: [],
@@ -505,6 +522,12 @@ let reportsTerminalState = {
   allEntries: [],
   entries: [],
   launches: [],
+  activeLogs: {
+    live: [],
+    errors: [],
+    error: "",
+    updatedAtMs: 0,
+  },
   launchBundles: {},
   launchMetadataByUri: {},
   activeId: "",
@@ -513,7 +536,8 @@ let reportsTerminalState = {
   activeBenchmarkSnapshot: null,
   activeText: "",
   activeTab: "overview",
-  view: "transactions",
+  view: getStoredReportsTerminalView(),
+  activeLogsView: getStoredActiveLogsView(),
   sort: "newest",
 };
 let reportsTerminalLoadSerial = 0;
@@ -555,11 +579,17 @@ const SNIPER_BALANCE_PRESETS = [
 ];
 const PROVIDER_LABELS = {
   "helius-sender": "Helius Sender",
+  hellomoon: "Hello Moon QUIC",
   "standard-rpc": "Standard RPC",
   "jito-bundle": "Jito Bundle",
 };
 const ROUTE_CAPABILITIES = {
   "helius-sender": {
+    creation: { tip: true, priority: true, slippage: false },
+    buy: { tip: true, priority: true, slippage: true },
+    sell: { tip: true, priority: true, slippage: true },
+  },
+  hellomoon: {
     creation: { tip: true, priority: true, slippage: false },
     buy: { tip: true, priority: true, slippage: true },
     sell: { tip: true, priority: true, slippage: true },
@@ -577,6 +607,7 @@ const ROUTE_CAPABILITIES = {
 };
 const PROVIDER_FEE_REQUIREMENTS = {
   "helius-sender": { minTipSol: 0.0002, priorityRequired: true },
+  hellomoon: { minTipSol: 0.001, priorityRequired: true },
   "jito-bundle": { minTipSol: 0.0002, priorityRequired: true },
 };
 const TOTAL_SUPPLY_TOKENS = 1_000_000_000n;
@@ -1222,6 +1253,7 @@ const reportsFeature = window.ReportsFeature.create({
     reportsTransactionsButton,
     reportsLaunchesButton,
     reportsActiveJobsButton,
+    reportsActiveLogsButton,
   },
   storage: {
     visibilityKey: REPORTS_TERMINAL_VISIBILITY_KEY,
@@ -1243,12 +1275,11 @@ const reportsFeature = window.ReportsFeature.create({
   refreshOnVisible: () => refreshReportsTerminal({ showLoading: false }),
   renderOutput: () => renderReportsTerminalOutput(),
   renderList: () => renderReportsTerminalList(),
-  loadEntry: (id, options) => loadReportsTerminalEntry(id, options),
+    loadEntry: (id) => loadReportsTerminalEntry(id),
   refreshReports: (options) => refreshReportsTerminal(options),
   getView: () => reportsTerminalState.view,
   setView: (value) => {
-    reportsTerminalState.view = normalizeReportsTerminalView(value);
-    syncReportsTerminalChrome();
+    setReportsTerminalView(value);
   },
   reuseEntry: (id) => reuseFromHistory(id),
   relaunchEntry: (id) => relaunchFromHistory(id),
@@ -1268,6 +1299,18 @@ if (reportsTerminalOutput) {
         reportsTerminalState.activeTab = nextTab;
         renderReportsTerminalOutput();
         scheduleLiveSyncBroadcast();
+      }
+      return;
+    }
+    const activeLogsViewButton = event.target.closest("[data-active-logs-view]");
+    if (activeLogsViewButton) {
+      const nextView = normalizeActiveLogsView(activeLogsViewButton.getAttribute("data-active-logs-view"));
+      if (nextView !== reportsTerminalState.activeLogsView) {
+        setReportsActiveLogsView(nextView);
+        renderReportsTerminalOutput();
+        if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
+          refreshActiveLogs({ showLoading: false }).catch(() => {});
+        }
       }
       return;
     }
@@ -1315,8 +1358,20 @@ function setReportsTerminalListWidth(width, options) {
 
 function setReportsTerminalVisible(isVisible, options) {
   const result = reportsFeature.setVisible(isVisible, options);
+  syncReportsTerminalLayoutHeight();
   scheduleLiveSyncBroadcast({ immediate: true });
   return result;
+}
+
+function setReportsTerminalView(view, { persist = true } = {}) {
+  reportsTerminalState.view = normalizeReportsTerminalView(view);
+  if (persist) setStoredReportsTerminalView(reportsTerminalState.view);
+  syncReportsTerminalChrome();
+}
+
+function setReportsActiveLogsView(view, { persist = true } = {}) {
+  reportsTerminalState.activeLogsView = normalizeActiveLogsView(view);
+  if (persist) setStoredActiveLogsView(reportsTerminalState.activeLogsView);
 }
 setReportsTerminalVisible(
   getStoredReportsTerminalVisible(),
@@ -1324,6 +1379,9 @@ setReportsTerminalVisible(
 );
 setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: false });
 syncReportsTerminalChrome();
+window.addEventListener("resize", () => {
+  syncReportsTerminalLayoutHeight();
+});
 
 const imagesFeature = window.ImagesFeature.create({
   elements: {
@@ -1858,6 +1916,7 @@ function createFallbackConfig() {
           provider: "helius-sender",
           tipSol: "0.01",
           priorityFeeSol: "0.001",
+          mevMode: "off",
           autoFee: false,
           maxFeeSol: "",
           devBuySol: amount,
@@ -1867,6 +1926,7 @@ function createFallbackConfig() {
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
+          mevMode: "off",
           autoFee: false,
           maxFeeSol: "",
           snipeBuyAmountSol: "",
@@ -1876,6 +1936,7 @@ function createFallbackConfig() {
           priorityFeeSol: "0.009",
           tipSol: "0.01",
           slippagePercent: "90",
+          mevMode: "off",
           autoFee: false,
           maxFeeSol: "",
         },
@@ -3005,6 +3066,7 @@ function buildLiveSyncPayload() {
     },
     reportsTerminalSnapshot: {
       ...reportsTerminalState,
+      activeLogs: reportsTerminalState.activeLogs,
       activePayload: reportsTerminalState.activePayload,
       activeBenchmarkSnapshot: reportsTerminalState.activeBenchmarkSnapshot,
     },
@@ -3058,6 +3120,7 @@ function buildPersistedLiveSyncPayload(payload = buildLiveSyncPayload()) {
           allEntries: Array.isArray(payload.reportsTerminalSnapshot.allEntries) ? payload.reportsTerminalSnapshot.allEntries : [],
           entries: Array.isArray(payload.reportsTerminalSnapshot.entries) ? payload.reportsTerminalSnapshot.entries : [],
           launches: Array.isArray(payload.reportsTerminalSnapshot.launches) ? payload.reportsTerminalSnapshot.launches : [],
+          activeLogs: payload.reportsTerminalSnapshot.activeLogs || { live: [], errors: [], error: "", updatedAtMs: 0 },
           launchBundles: payload.reportsTerminalSnapshot.launchBundles || {},
           launchMetadataByUri: payload.reportsTerminalSnapshot.launchMetadataByUri || {},
           activeId: payload.reportsTerminalSnapshot.activeId || "",
@@ -3067,6 +3130,7 @@ function buildPersistedLiveSyncPayload(payload = buildLiveSyncPayload()) {
           activeText: payload.reportsTerminalSnapshot.activeText || "",
           activeTab: payload.reportsTerminalSnapshot.activeTab || "overview",
           view: payload.reportsTerminalSnapshot.view || "transactions",
+          activeLogsView: payload.reportsTerminalSnapshot.activeLogsView || "live",
           sort: payload.reportsTerminalSnapshot.sort || "newest",
         }
       : null,
@@ -3243,7 +3307,12 @@ function applyLiveSyncFormControls(formControls) {
   });
 }
 
-function applyIncomingLiveSyncPayload(payload, { allowBeforeReady = false } = {}) {
+function applyIncomingLiveSyncPayload(payload, {
+  allowBeforeReady = false,
+  skipVisibilityState = false,
+  skipDashboardViewState = false,
+  restoreOutputFromSync = true,
+} = {}) {
   if (!allowBeforeReady && !liveSyncReady) return;
   if (!payload || typeof payload !== "object" || payload.sourceId === LIVE_SYNC_SOURCE_ID) return;
   isApplyingLiveSync = true;
@@ -3251,10 +3320,10 @@ function applyIncomingLiveSyncPayload(payload, { allowBeforeReady = false } = {}
     if (payload.themeMode === "light" || payload.themeMode === "dark") {
       setThemeMode(payload.themeMode);
     }
-    if (typeof payload.outputVisible === "boolean") {
+    if (!skipVisibilityState && typeof payload.outputVisible === "boolean") {
       setOutputSectionVisible(payload.outputVisible);
     }
-    if (typeof payload.reportsVisible === "boolean") {
+    if (!skipVisibilityState && typeof payload.reportsVisible === "boolean") {
       setReportsTerminalVisible(payload.reportsVisible);
     }
     if (Number.isFinite(payload.reportsListWidth)) {
@@ -3268,6 +3337,7 @@ function applyIncomingLiveSyncPayload(payload, { allowBeforeReady = false } = {}
       setConfig(nextConfig);
       setPresetEditing(isPresetEditing(nextConfig));
       applyPresetToSettingsInputs(getActivePreset(nextConfig), { syncToMainForm: false });
+      queueWarmActivity({ immediate: true });
     }
     if (payload.startupWarmSnapshot && typeof payload.startupWarmSnapshot === "object") {
       startupWarmState = {
@@ -3306,10 +3376,14 @@ function applyIncomingLiveSyncPayload(payload, { allowBeforeReady = false } = {}
         ...reportsTerminalState,
         ...payload.reportsTerminalSnapshot,
       };
+      if (skipDashboardViewState) {
+        reportsTerminalState.view = getStoredReportsTerminalView();
+        reportsTerminalState.activeLogsView = getStoredActiveLogsView();
+      }
       renderReportsTerminalList();
       renderReportsTerminalOutput();
     }
-    if (payload.outputSnapshot && typeof payload.outputSnapshot === "object") {
+    if (restoreOutputFromSync && payload.outputSnapshot && typeof payload.outputSnapshot === "object") {
       setStatusLabel(payload.outputSnapshot.statusLabel || "");
       if (metaNode) metaNode.textContent = String(payload.outputSnapshot.metaText || "");
       if (output) output.textContent = String(payload.outputSnapshot.outputText || "");
@@ -3329,7 +3403,11 @@ function enableLiveSync() {
   liveSyncReady = true;
   const storedPayload = readStoredLiveSyncPayload();
   if (storedPayload) {
-    applyIncomingLiveSyncPayload(storedPayload);
+    applyIncomingLiveSyncPayload(storedPayload, {
+      skipVisibilityState: true,
+      skipDashboardViewState: true,
+      restoreOutputFromSync: isPopoutMode,
+    });
   }
   scheduleLiveSyncBroadcast({ immediate: true });
 }
@@ -3342,7 +3420,12 @@ function preloadLiveSyncSnapshot() {
     || readSessionLiveSyncPayload()
     || readStoredLiveSyncPayload();
   if (!payload) return false;
-  applyIncomingLiveSyncPayload(payload, { allowBeforeReady: true });
+  applyIncomingLiveSyncPayload(payload, {
+    allowBeforeReady: true,
+    skipVisibilityState: true,
+    skipDashboardViewState: true,
+    restoreOutputFromSync: isPopoutMode,
+  });
   return true;
 }
 
@@ -4012,10 +4095,60 @@ function syncAutoFeeButtonState(button, input) {
   button.disabled = Boolean(input.disabled);
 }
 
+function syncToggleButtonState(button, input) {
+  if (!button || !input) return;
+  button.classList.toggle("active", Boolean(input.checked));
+  button.setAttribute("aria-pressed", input.checked ? "true" : "false");
+  button.disabled = Boolean(input.disabled);
+}
+
 function syncAutoFeeButtons() {
   syncAutoFeeButtonState(creationAutoFeeButton, creationAutoFeeInput);
   syncAutoFeeButtonState(buyAutoFeeButton, buyAutoFeeInput);
   syncAutoFeeButtonState(sellAutoFeeButton, sellAutoFeeInput);
+}
+
+function isHelloMoonProvider(provider) {
+  return String(provider || "").trim().toLowerCase() === "hellomoon";
+}
+
+function defaultMevModeForProvider(provider) {
+  return isHelloMoonProvider(provider) ? "reduced" : "off";
+}
+
+function normalizeMevMode(value, fallback = "off") {
+  if (typeof value === "boolean") return value ? "reduced" : "off";
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "reduced" || normalized === "secure" || normalized === "off"
+    ? normalized
+    : fallback;
+}
+
+function normalizeSelectableMevMode(provider, value, fallback = "off") {
+  const normalized = normalizeMevMode(value, fallback);
+  if (isHelloMoonProvider(provider) && normalized === "secure") {
+    return "reduced";
+  }
+  return normalized;
+}
+
+function setMevModeOptionAvailability(select, provider) {
+  if (!select) return;
+  const secureOption = Array.from(select.options).find((option) => option.value === "secure");
+  if (!secureOption) return;
+  const disableSecure = isHelloMoonProvider(provider);
+  secureOption.disabled = disableSecure;
+  secureOption.textContent = disableSecure ? "Secure (temporarily unavailable)" : "Secure";
+  secureOption.title = disableSecure ? "Hello Moon secure mode is temporarily unavailable." : "";
+  if (disableSecure && select.value === "secure") {
+    select.value = "reduced";
+  }
+}
+
+function setMevModeSelectValue(select, value, fallback = "off", provider = "") {
+  if (!select) return;
+  setMevModeOptionAvailability(select, provider);
+  select.value = normalizeSelectableMevMode(provider, value, fallback);
 }
 
 function setFieldVisibility(input, visible) {
@@ -4049,9 +4182,13 @@ function ensureStandardRpcSlippageDefault(input, provider) {
 function standardRpcSlippageWarningText(sideLabel, input) {
   const parsed = parseNumericSettingValue(input && input.value);
   const overrideText = parsed != null && parsed > Number(STANDARD_RPC_SLIPPAGE_DEFAULT)
-    ? " Over 20% is only for intentional edge cases."
-    : " Default is 20%."
-  return `Standard RPC ${sideLabel}: higher slip risk.${overrideText}`;
+    ? " Values above 20% should only be used intentionally for edge cases."
+    : " Default slippage is 20%."
+  return `Standard RPC ${sideLabel}: higher MEV and slippage risk.${overrideText}`;
+}
+
+function hellomoonMevWarningText(sideLabel) {
+  return `Hello Moon ${sideLabel}: Off mode uses QUIC without MEV protection and carries higher MEV risk than Reduced.`;
 }
 
 function syncStandardRpcWarnings() {
@@ -4067,6 +4204,25 @@ function syncStandardRpcWarnings() {
     sellStandardRpcWarning.hidden = !sellIsStandardRpc;
     sellStandardRpcWarning.textContent = sellIsStandardRpc
       ? standardRpcSlippageWarningText("sells", sellSlippageInput)
+      : "";
+  }
+}
+
+function syncHelloMoonMevWarnings() {
+  const buyHasHelloMoonOff = isHelloMoonProvider(getBuyProvider())
+    && normalizeMevMode(buyMevModeSelect ? buyMevModeSelect.value : "off") === "off";
+  if (buyHelloMoonMevWarning) {
+    buyHelloMoonMevWarning.hidden = !buyHasHelloMoonOff;
+    buyHelloMoonMevWarning.textContent = buyHasHelloMoonOff
+      ? hellomoonMevWarningText("buys")
+      : "";
+  }
+  const sellHasHelloMoonOff = isHelloMoonProvider(getSellProvider())
+    && normalizeMevMode(sellMevModeSelect ? sellMevModeSelect.value : "off") === "off";
+  if (sellHelloMoonMevWarning) {
+    sellHelloMoonMevWarning.hidden = !sellHasHelloMoonOff;
+    sellHelloMoonMevWarning.textContent = sellHasHelloMoonOff
+      ? hellomoonMevWarningText("sells")
       : "";
   }
 }
@@ -4096,6 +4252,9 @@ function syncAutoFeeControls() {
 
 function syncSettingsCapabilities() {
   const editing = isPresetEditing(getConfig());
+  const creationProvider = getProvider();
+  const buyProvider = getBuyProvider();
+  const sellProvider = getSellProvider();
   const creationCapabilities = getRouteCapabilities(getProvider(), "creation");
   const buyCapabilities = getRouteCapabilities(getBuyProvider(), "buy");
   const sellCapabilities = getRouteCapabilities(getSellProvider(), "sell");
@@ -4105,19 +4264,29 @@ function syncSettingsCapabilities() {
   if (sellProviderSelect) sellProviderSelect.disabled = !editing;
   setFieldVisibility(creationTipInput, creationCapabilities.tip);
   setFieldVisibility(creationPriorityInput, creationCapabilities.priority);
+  setFieldVisibility(creationMevModeSelect, isHelloMoonProvider(creationProvider));
   setFieldVisibility(buyPriorityFeeInput, buyCapabilities.priority);
   setFieldVisibility(buyTipInput, buyCapabilities.tip);
   setFieldVisibility(buySlippageInput, buyCapabilities.slippage);
+  setFieldVisibility(buyMevModeSelect, isHelloMoonProvider(buyProvider));
   setFieldVisibility(sellPriorityFeeInput, sellCapabilities.priority);
   setFieldVisibility(sellTipInput, sellCapabilities.tip);
   setFieldVisibility(sellSlippageInput, sellCapabilities.slippage);
+  setFieldVisibility(sellMevModeSelect, isHelloMoonProvider(sellProvider));
+  setMevModeOptionAvailability(creationMevModeSelect, creationProvider);
+  setMevModeOptionAvailability(buyMevModeSelect, buyProvider);
+  setMevModeOptionAvailability(sellMevModeSelect, sellProvider);
   setFieldEnabled(creationAutoFeeInput, editing && (creationCapabilities.priority || creationCapabilities.tip));
   setFieldEnabled(buyAutoFeeInput, editing && (buyCapabilities.priority || buyCapabilities.tip));
   setFieldEnabled(sellAutoFeeInput, editing && (sellCapabilities.priority || sellCapabilities.tip));
+  setFieldEnabled(creationMevModeSelect, editing && isHelloMoonProvider(creationProvider));
+  setFieldEnabled(buyMevModeSelect, editing && isHelloMoonProvider(buyProvider));
+  setFieldEnabled(sellMevModeSelect, editing && isHelloMoonProvider(sellProvider));
   setFieldEnabled(buySlippageInput, editing && buyCapabilities.slippage);
   setFieldEnabled(sellSlippageInput, editing && sellCapabilities.slippage);
   syncAutoFeeControls();
   syncStandardRpcWarnings();
+  syncHelloMoonMevWarnings();
 }
 
 function applyPresetToSettingsInputs(preset, options = {}) {
@@ -4127,18 +4296,36 @@ function applyPresetToSettingsInputs(preset, options = {}) {
   if (providerSelect) providerSelect.value = preset.creationSettings.provider || "helius-sender";
   if (creationTipInput) creationTipInput.value = preset.creationSettings.tipSol || "";
   if (creationPriorityInput) creationPriorityInput.value = preset.creationSettings.priorityFeeSol || "";
+  setMevModeSelectValue(
+    creationMevModeSelect,
+    preset.creationSettings.mevMode,
+    defaultMevModeForProvider(preset.creationSettings.provider),
+    preset.creationSettings.provider
+  );
   if (creationAutoFeeInput) creationAutoFeeInput.checked = Boolean(preset.creationSettings.autoFee);
   if (creationMaxFeeInput) creationMaxFeeInput.value = preset.creationSettings.maxFeeSol || "";
   if (buyProviderSelect) buyProviderSelect.value = preset.buySettings.provider || "helius-sender";
   if (buyPriorityFeeInput) buyPriorityFeeInput.value = preset.buySettings.priorityFeeSol || "";
   if (buyTipInput) buyTipInput.value = preset.buySettings.tipSol || "";
   if (buySlippageInput) buySlippageInput.value = preset.buySettings.slippagePercent || "";
+  setMevModeSelectValue(
+    buyMevModeSelect,
+    preset.buySettings.mevMode ?? preset.buySettings.mevProtect,
+    defaultMevModeForProvider(preset.buySettings.provider),
+    preset.buySettings.provider
+  );
   if (buyAutoFeeInput) buyAutoFeeInput.checked = Boolean(preset.buySettings.autoFee);
   if (buyMaxFeeInput) buyMaxFeeInput.value = preset.buySettings.maxFeeSol || "";
   if (sellProviderSelect) sellProviderSelect.value = preset.sellSettings.provider || "helius-sender";
   if (sellPriorityFeeInput) sellPriorityFeeInput.value = preset.sellSettings.priorityFeeSol || "";
   if (sellTipInput) sellTipInput.value = preset.sellSettings.tipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = preset.sellSettings.slippagePercent || "";
+  setMevModeSelectValue(
+    sellMevModeSelect,
+    preset.sellSettings.mevMode ?? preset.sellSettings.mevProtect,
+    defaultMevModeForProvider(preset.sellSettings.provider),
+    preset.sellSettings.provider
+  );
   if (sellAutoFeeInput) sellAutoFeeInput.checked = Boolean(preset.sellSettings.autoFee);
   if (sellMaxFeeInput) sellMaxFeeInput.value = preset.sellSettings.maxFeeSol || "";
   syncingPresetInputs = false;
@@ -4169,6 +4356,7 @@ function syncActivePresetFromInputs() {
     provider: getProvider(),
     tipSol: creationTipInput ? creationTipInput.value.trim() : "",
     priorityFeeSol: creationPriorityInput ? creationPriorityInput.value.trim() : "",
+    mevMode: normalizeMevMode(creationMevModeSelect ? creationMevModeSelect.value : "off"),
     autoFee: Boolean(creationAutoFeeInput && creationAutoFeeInput.checked),
     maxFeeSol: normalizeAutoFeeCapValue(creationMaxFeeInput ? creationMaxFeeInput.value : ""),
     devBuySol: activePreset.creationSettings && activePreset.creationSettings.devBuySol
@@ -4181,6 +4369,7 @@ function syncActivePresetFromInputs() {
     priorityFeeSol: buyPriorityFeeInput ? buyPriorityFeeInput.value.trim() : "",
     tipSol: buyTipInput ? buyTipInput.value.trim() : "",
     slippagePercent: buySlippageInput ? buySlippageInput.value.trim() : "",
+    mevMode: normalizeMevMode(buyMevModeSelect ? buyMevModeSelect.value : "off"),
     autoFee: Boolean(buyAutoFeeInput && buyAutoFeeInput.checked),
     maxFeeSol: normalizeAutoFeeCapValue(buyMaxFeeInput ? buyMaxFeeInput.value : ""),
   };
@@ -4190,6 +4379,7 @@ function syncActivePresetFromInputs() {
     priorityFeeSol: sellPriorityFeeInput ? sellPriorityFeeInput.value.trim() : "",
     tipSol: sellTipInput ? sellTipInput.value.trim() : "",
     slippagePercent: sellSlippageInput ? sellSlippageInput.value.trim() : "",
+    mevMode: normalizeMevMode(sellMevModeSelect ? sellMevModeSelect.value : "off"),
     autoFee: Boolean(sellAutoFeeInput && sellAutoFeeInput.checked),
     maxFeeSol: normalizeAutoFeeCapValue(sellMaxFeeInput ? sellMaxFeeInput.value : ""),
   };
@@ -4206,6 +4396,8 @@ function setActivePreset(presetId, options = {}) {
   };
   setConfig(config);
   applyPresetToSettingsInputs(getActivePreset(config), options);
+  // Document-level click handler runs in capture phase before this runs; it would post stale routes.
+  queueWarmActivity({ immediate: true });
 }
 
 function setPresetEditing(editing) {
@@ -4225,12 +4417,14 @@ function setPresetEditing(editing) {
     buyPriorityFeeInput,
     buyTipInput,
     buySlippageInput,
+    buyMevModeSelect,
     buyAutoFeeInput,
     buyMaxFeeInput,
     sellProviderSelect,
     sellPriorityFeeInput,
     sellTipInput,
     sellSlippageInput,
+    sellMevModeSelect,
     sellAutoFeeInput,
     sellMaxFeeInput,
   ];
@@ -5459,6 +5653,9 @@ function readForm() {
     provider: getProvider(),
     buyProvider: getBuyProvider(),
     sellProvider: getSellProvider(),
+    creationMevMode: normalizeMevMode(getNamedValue("creationMevMode"), "off"),
+    buyMevMode: normalizeMevMode(getNamedValue("buyMevMode"), "off"),
+    sellMevMode: normalizeMevMode(getNamedValue("sellMevMode"), "off"),
     activePresetId: getActivePresetId(),
     mode,
     name: values.name || "",
@@ -5939,7 +6136,10 @@ async function flushWarmActivity() {
     window.clearTimeout(warmActivityState.debounceTimer);
     warmActivityState.debounceTimer = null;
   }
-  if (warmActivityState.inFlightPromise) return warmActivityState.inFlightPromise;
+  if (warmActivityState.inFlightPromise) {
+    warmActivityState.pendingFlush = true;
+    return warmActivityState.inFlightPromise;
+  }
   warmActivityState.lastSentAtMs = Date.now();
   warmActivityState.inFlightPromise = fetch("/api/warm/activity", {
     method: "POST",
@@ -5965,6 +6165,10 @@ async function flushWarmActivity() {
     .catch(() => {})
     .finally(() => {
       warmActivityState.inFlightPromise = null;
+      if (warmActivityState.pendingFlush) {
+        warmActivityState.pendingFlush = false;
+        flushWarmActivity().catch(() => {});
+      }
     });
   return warmActivityState.inFlightPromise;
 }
@@ -5985,6 +6189,9 @@ function startRuntimeStatusRefreshLoop() {
   if (runtimeStatusRefreshTimer) window.clearInterval(runtimeStatusRefreshTimer);
   runtimeStatusRefreshTimer = window.setInterval(() => {
     refreshRuntimeStatus().catch(() => {});
+    if (reportsTerminalSection && !reportsTerminalSection.hidden && normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
+      refreshActiveLogs({ showLoading: false }).catch(() => {});
+    }
   }, RUNTIME_STATUS_REFRESH_INTERVAL_MS);
 }
 
@@ -6929,12 +7136,7 @@ function applyLiveReportSnapshotToOutput(payload) {
   if (payload && payload.entry && typeof payload.entry === "object") {
     updateReportsTerminalSummaryEntry(payload.entry);
   }
-  if (typeof payload.text === "string" && payload.text) {
-    output.textContent = payload.text;
-  }
-  if (report) {
-    metaNode.textContent = buildOutputMetaTextFromReport(report);
-  }
+  // Main output stays the last Build/Simulate/Deploy result; follow refreshes only update the reports panel.
   if (entryId && outputFollowRefreshState.reportId === entryId) {
     reportsTerminalState.activeId = entryId;
   }
@@ -7106,40 +7308,6 @@ function buildSavedConfigFromForm() {
     },
   };
 
-  base.presets = base.presets || {};
-  base.presets.items = getPresetItems(base).map((preset) => preset.id === f.activePresetId
-    ? {
-        ...preset,
-        creationSettings: {
-          ...preset.creationSettings,
-          provider: f.provider || "helius-sender",
-          tipSol: f.creationTipSol || "",
-          priorityFeeSol: f.priorityFeeSol || "",
-          autoFee: Boolean(f.creationAutoFeeEnabled),
-          maxFeeSol: f.creationMaxFeeSol || "",
-          devBuySol: (preset.creationSettings && preset.creationSettings.devBuySol) || "",
-        },
-        buySettings: {
-          ...preset.buySettings,
-          provider: f.buyProvider || "helius-sender",
-          priorityFeeSol: f.buyPriorityFeeSol || "",
-          tipSol: f.buyTipSol || "",
-          slippagePercent: f.buySlippagePercent || "",
-          autoFee: Boolean(f.buyAutoFeeEnabled),
-          maxFeeSol: f.buyMaxFeeSol || "",
-        },
-        sellSettings: {
-          ...preset.sellSettings,
-          provider: f.sellProvider || "helius-sender",
-          priorityFeeSol: f.sellPriorityFeeSol || "",
-          tipSol: f.sellTipSol || "",
-          slippagePercent: f.sellSlippagePercent || "",
-          autoFee: Boolean(f.sellAutoFeeEnabled),
-          maxFeeSol: f.sellMaxFeeSol || "",
-        },
-      }
-    : preset);
-
   return base;
 }
 
@@ -7157,6 +7325,7 @@ async function saveSettings() {
   }
   setBusy(true, "Saving defaults...");
   try {
+    syncActivePresetFromInputs();
     const configToSave = buildSavedConfigFromForm();
     const result = RequestUtils.fetchJsonLatest
       ? await RequestUtils.fetchJsonLatest("settings-save", "/api/settings", {
@@ -7188,6 +7357,7 @@ async function saveSettings() {
     renderQuickDevBuyButtons(savedConfig);
     populateDevBuyPresetEditor(savedConfig);
     renderBackendRegionSummary(payload.regionRouting);
+    queueWarmActivity({ immediate: true });
     hideSettingsModal("save");
   } catch (error) {
     setStatusLabel("Error");
@@ -7258,6 +7428,7 @@ function setOutputSectionVisible(isVisible) {
   } catch (_error) {
     // Ignore storage access failures and keep the UI functional.
   }
+  syncReportsTerminalLayoutHeight();
   schedulePopoutAutosize();
   scheduleLiveSyncBroadcast({ immediate: true });
 }
@@ -7271,6 +7442,38 @@ function getStoredReportsTerminalVisible() {
     // Ignore storage access failures and fall back to hidden state.
   }
   return false;
+}
+
+function getStoredReportsTerminalView() {
+  try {
+    return normalizeReportsTerminalView(window.localStorage.getItem(REPORTS_TERMINAL_VIEW_KEY));
+  } catch (_error) {
+    return "transactions";
+  }
+}
+
+function setStoredReportsTerminalView(view) {
+  try {
+    window.localStorage.setItem(REPORTS_TERMINAL_VIEW_KEY, normalizeReportsTerminalView(view));
+  } catch (_error) {
+    // Ignore storage failures and keep the UI functional.
+  }
+}
+
+function getStoredActiveLogsView() {
+  try {
+    return normalizeActiveLogsView(window.localStorage.getItem(REPORTS_ACTIVE_LOGS_VIEW_KEY));
+  } catch (_error) {
+    return "live";
+  }
+}
+
+function setStoredActiveLogsView(view) {
+  try {
+    window.localStorage.setItem(REPORTS_ACTIVE_LOGS_VIEW_KEY, normalizeActiveLogsView(view));
+  } catch (_error) {
+    // Ignore storage failures and keep the UI functional.
+  }
 }
 
 function getStoredImageLayoutCompact() {
@@ -7323,7 +7526,12 @@ function normalizeReportsTerminalView(view) {
   const normalized = String(view || "").trim().toLowerCase();
   if (normalized === "launches") return "launches";
   if (normalized === "active-jobs") return "active-jobs";
+  if (normalized === "active-logs") return "active-logs";
   return "transactions";
+}
+
+function normalizeActiveLogsView(view) {
+  return String(view || "").trim().toLowerCase() === "errors" ? "errors" : "live";
 }
 
 function reportsTerminalMetaText(view = reportsTerminalState.view) {
@@ -7338,6 +7546,11 @@ function reportsTerminalMetaText(view = reportsTerminalState.view) {
     }
     return "Live follow-daemon jobs.";
   }
+  if (normalized === "active-logs") {
+    return normalizeActiveLogsView(reportsTerminalState.activeLogsView) === "errors"
+      ? "Persisted historic backend errors."
+      : "Latest 100 in-memory backend activity logs.";
+  }
   return "Latest 25 transactions.";
 }
 
@@ -7347,12 +7560,29 @@ function syncReportsTerminalChrome() {
   if (reportsTerminalSection) {
     reportsTerminalSection.classList.toggle("is-launches-view", view === "launches");
     reportsTerminalSection.classList.toggle("is-active-jobs-view", view === "active-jobs");
+    reportsTerminalSection.classList.toggle("is-active-logs-view", view === "active-logs");
   }
   if (reportsTransactionsButton) reportsTransactionsButton.classList.toggle("active", view === "transactions");
   if (reportsLaunchesButton) reportsLaunchesButton.classList.toggle("active", view === "launches");
   if (reportsActiveJobsButton) reportsActiveJobsButton.classList.toggle("active", view === "active-jobs");
+  if (reportsActiveLogsButton) reportsActiveLogsButton.classList.toggle("active", view === "active-logs");
   if (reportsTerminalMeta) reportsTerminalMeta.textContent = reportsTerminalMetaText(view);
+  syncReportsTerminalLayoutHeight();
   syncFollowStatusChrome();
+}
+
+function syncReportsTerminalLayoutHeight() {
+  if (!reportsTerminalSection || !form) return;
+  const shouldMatchFormHeight = reportsTerminalSection.classList.contains("is-active-logs-view")
+    && !isOutputSectionCurrentlyVisible();
+  if (!shouldMatchFormHeight) {
+    reportsTerminalSection.style.removeProperty("--reports-terminal-match-height");
+    return;
+  }
+  const measuredHeight = Math.round(form.getBoundingClientRect().height || 0);
+  if (measuredHeight > 0) {
+    reportsTerminalSection.style.setProperty("--reports-terminal-match-height", `${measuredHeight}px`);
+  }
 }
 
 function metadataUriToGatewayUrl(uri) {
@@ -7792,6 +8022,41 @@ function formatTipLamportsForReport(value) {
   return `${numeric.toLocaleString()} lamports (${solEquivalent} SOL)`;
 }
 
+function autoFeeActionSignature(action) {
+  if (!action || typeof action !== "object" || !action.enabled) return "";
+  return JSON.stringify([
+    action.provider || "",
+    action.prioritySource || "",
+    parseReportMetricNumber(action.priorityEstimateLamports),
+    parseReportMetricNumber(action.resolvedPriorityLamports),
+    action.tipSource || "",
+    parseReportMetricNumber(action.tipEstimateLamports),
+    parseReportMetricNumber(action.resolvedTipLamports),
+    parseReportMetricNumber(action.capLamports),
+  ]);
+}
+
+function groupAutoFeeActions(autoFee) {
+  const entries = [
+    { label: "Creation", action: autoFee && autoFee.creation },
+    { label: "Buy", action: autoFee && autoFee.buy },
+    { label: "Sell", action: autoFee && autoFee.sell },
+  ].filter((entry) => entry.action && typeof entry.action === "object" && entry.action.enabled);
+  const grouped = [];
+  const indexesBySignature = new Map();
+  entries.forEach((entry) => {
+    const signature = autoFeeActionSignature(entry.action);
+    if (!signature) return;
+    if (indexesBySignature.has(signature)) {
+      grouped[indexesBySignature.get(signature)].labels.push(entry.label);
+      return;
+    }
+    indexesBySignature.set(signature, grouped.length);
+    grouped.push({ labels: [entry.label], action: entry.action });
+  });
+  return grouped;
+}
+
 function buildAutoFeeActionCards(label, action) {
   if (!action || typeof action !== "object" || !action.enabled) return [];
   return [
@@ -7800,26 +8065,31 @@ function buildAutoFeeActionCards(label, action) {
     { label: `${label} Priority Used`, value: action.resolvedPriorityLamports != null ? formatPriorityPriceForReport(action.resolvedPriorityLamports) : "--" },
     { label: `${label} Tip Source`, value: action.tipSource || "--", detail: action.tipEstimateLamports != null ? `${formatTipLamportsForReport(action.tipEstimateLamports)} est` : "" },
     { label: `${label} Tip Used`, value: action.resolvedTipLamports != null ? formatTipLamportsForReport(action.resolvedTipLamports) : "--" },
-    { label: `${label} Priority Cap`, value: action.capLamports != null ? formatPriorityPriceForReport(action.capLamports) : "--" },
+    { label: `${label} Max Auto Fee`, value: action.capLamports != null ? formatTipLamportsForReport(action.capLamports) : "--" },
   ];
 }
 
 function buildAutoFeeBenchmarkSection(autoFee, benchmarkMode) {
   if (!autoFee || benchmarkMode !== "Full") return "";
+  const jitoTipPercentile = String(autoFee.jitoTipPercentile || "p99").trim() || "p99";
   const snapshot = autoFee.snapshot && typeof autoFee.snapshot === "object" ? autoFee.snapshot : {};
   const snapshotCards = [
-    { label: "Launch Template Price", value: snapshot.helius_launch_priority_lamports != null ? formatPriorityPriceForReport(snapshot.helius_launch_priority_lamports) : "--" },
-    { label: "Jito p99 Tip", value: snapshot.jito_tip_p99_lamports != null ? formatTipLamportsForReport(snapshot.jito_tip_p99_lamports) : "--" },
+    { label: "Warm Launch Template Estimate", value: snapshot.helius_launch_priority_lamports != null ? formatPriorityPriceForReport(snapshot.helius_launch_priority_lamports) : "--" },
+    { label: `Warm Jito ${jitoTipPercentile} Tip`, value: snapshot.jito_tip_p99_lamports != null ? formatTipLamportsForReport(snapshot.jito_tip_p99_lamports) : "--" },
   ].filter((card) => card.value !== "--");
-  const actionCards = []
-    .concat(buildAutoFeeActionCards("Creation", autoFee.creation))
-    .concat(buildAutoFeeActionCards("Buy", autoFee.buy))
-    .concat(buildAutoFeeActionCards("Sell", autoFee.sell));
+  const actionCards = groupAutoFeeActions(autoFee)
+    .flatMap(({ labels, action }) => buildAutoFeeActionCards(labels.join(" / "), action));
   return `
     <section class="reports-panel-section">
       <div class="reports-panel-title">Auto-Fee Sources</div>
-      <div class="reports-panel-note">Full benchmark mode only. Shows the warm snapshot values and which source each live auto-fee path used.</div>
-      ${renderReportMetricGrid(snapshotCards.concat(actionCards))}
+      <div class="reports-panel-note">Full benchmark mode only. Shows the final per-action auto-fee values that were actually used.</div>
+      ${renderReportMetricGrid(actionCards)}
+      ${snapshotCards.length ? `
+        <details class="reports-active-log-details">
+          <summary>Auto-Fee Debug Snapshot</summary>
+          ${renderReportMetricGrid(snapshotCards)}
+        </details>
+      ` : ""}
     </section>
   `;
 }
@@ -8041,6 +8311,8 @@ function formatTransportLabel(transportType) {
   const normalized = String(transportType || "").trim().toLowerCase();
   if (!normalized) return "--";
   if (normalized === "helius-sender") return "Helius Sender";
+  if (normalized === "hellomoon-quic") return "Hello Moon QUIC";
+  if (normalized === "hellomoon-bundle") return "Hello Moon Bundle";
   if (normalized.startsWith("standard-rpc")) return "Standard RPC";
   if (normalized === "jito-bundle") return "Jito Bundle";
   return String(transportType || "").trim();
@@ -8849,7 +9121,7 @@ function buildReportsActiveJobsMarkup() {
       <div class="reports-panel-stack">
         <div class="reports-active-jobs-header">
           <div class="reports-active-jobs-heading">
-            <strong>Active Jobs</strong>
+            <strong>Jobs</strong>
             <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
           </div>
           <button
@@ -8868,7 +9140,7 @@ function buildReportsActiveJobsMarkup() {
       <div class="reports-panel-stack">
         <div class="reports-active-jobs-header">
           <div class="reports-active-jobs-heading">
-            <strong>Active Jobs</strong>
+            <strong>Jobs</strong>
             <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
           </div>
         </div>
@@ -8881,7 +9153,7 @@ function buildReportsActiveJobsMarkup() {
       <div class="reports-panel-stack">
         <div class="reports-active-jobs-header">
           <div class="reports-active-jobs-heading">
-            <strong>Active Jobs</strong>
+            <strong>Jobs</strong>
             <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
           </div>
         </div>
@@ -8893,7 +9165,7 @@ function buildReportsActiveJobsMarkup() {
     <div class="reports-panel-stack">
       <div class="reports-active-jobs-header">
         <div class="reports-active-jobs-heading">
-          <strong>Active Jobs</strong>
+          <strong>Jobs</strong>
           <span class="${summaryClassNames}">${escapeHTML(buildFollowJobsSummaryText(snapshot))}</span>
         </div>
         <button
@@ -8977,6 +9249,105 @@ function buildReportsActiveJobsMarkup() {
   `;
 }
 
+function logLevelBadgeTone(level) {
+  const normalized = String(level || "").trim().toLowerCase();
+  if (normalized === "error") return "is-bad";
+  if (normalized === "warn" || normalized === "warning") return "is-warn";
+  return "is-good";
+}
+
+function formatActiveLogLevel(level) {
+  const normalized = String(level || "").trim().toLowerCase();
+  if (!normalized) return "INFO";
+  return normalized.toUpperCase();
+}
+
+function stringifyActiveLogContext(context) {
+  if (context == null) return "";
+  try {
+    return JSON.stringify(context, null, 2);
+  } catch (_error) {
+    return String(context);
+  }
+}
+
+function summarizeActiveLogContext(context) {
+  if (context == null || typeof context !== "object") return "";
+  const entries = Object.entries(context)
+    .filter(([, value]) => value == null || ["string", "number", "boolean"].includes(typeof value))
+    .slice(0, 3)
+    .map(([key, value]) => `${key}: ${String(value)}`);
+  return entries.join(" | ");
+}
+
+function buildActiveLogsMarkup() {
+  const activeLogsView = normalizeActiveLogsView(reportsTerminalState.activeLogsView);
+  const logsState = reportsTerminalState.activeLogs && typeof reportsTerminalState.activeLogs === "object"
+    ? reportsTerminalState.activeLogs
+    : { live: [], errors: [], error: "", updatedAtMs: 0 };
+  const logs = Array.isArray(logsState[activeLogsView]) ? logsState[activeLogsView] : [];
+  const updatedLabel = logsState.updatedAtMs ? formatCompactDateTime(logsState.updatedAtMs) : "";
+  return `
+    <div class="reports-panel-stack">
+      <div class="reports-active-jobs-header">
+        <div class="reports-active-jobs-heading">
+          <strong>Logs</strong>
+          <span class="reports-follow-summary ${logsState.error ? "is-issues" : logs.length ? "is-active" : ""}">
+            ${escapeHTML(
+              logsState.error
+                ? logsState.error
+                : `${logs.length} ${activeLogsView === "errors" ? "saved error" : "live log"} entr${logs.length === 1 ? "y" : "ies"}${updatedLabel ? ` | Updated ${updatedLabel}` : ""}`
+            )}
+          </span>
+        </div>
+        <div class="reports-terminal-tabs reports-active-logs-tabs">
+          <button
+            type="button"
+            class="reports-terminal-tab${activeLogsView === "live" ? " active" : ""}"
+            data-active-logs-view="live"
+          >Live Logs</button>
+          <button
+            type="button"
+            class="reports-terminal-tab${activeLogsView === "errors" ? " active" : ""}"
+            data-active-logs-view="errors"
+          >Errors</button>
+        </div>
+      </div>
+      ${logsState.error ? `<div class="reports-callout is-bad">${escapeHTML(logsState.error)}</div>` : ""}
+      ${logs.length ? `
+        <div class="reports-active-logs-list">
+          ${logs.map((entry) => {
+            const timestamp = formatCompactDateTime(entry && entry.timestampMs);
+            const level = formatActiveLogLevel(entry && entry.level);
+            const source = String(entry && entry.source || "engine").trim() || "engine";
+            const context = stringifyActiveLogContext(entry && entry.context);
+            const contextSummary = summarizeActiveLogContext(entry && entry.context);
+            const message = String(entry && entry.message || "No message recorded.");
+            return `
+              <article class="reports-active-log-entry">
+                <div class="reports-active-log-row">
+                  <span class="reports-state-badge ${logLevelBadgeTone(level)}">${escapeHTML(level)}</span>
+                  <span class="reports-active-log-time">${escapeHTML(timestamp || "Unknown time")}</span>
+                  <strong class="reports-active-log-source">${escapeHTML(source)}</strong>
+                  <span class="reports-active-log-message">${escapeHTML(message)}</span>
+                  ${contextSummary ? `<span class="reports-active-log-context-summary">${escapeHTML(contextSummary)}</span>` : ""}
+                  ${entry && entry.persisted ? '<span class="reports-launch-card-chip">saved</span>' : ""}
+                </div>
+                ${context ? `
+                  <details class="reports-active-log-details">
+                    <summary>View raw details</summary>
+                    <pre class="reports-active-log-context">${escapeHTML(context)}</pre>
+                  </details>
+                ` : ""}
+              </article>
+            `;
+          }).join("")}
+        </div>
+      ` : '<div class="reports-terminal-empty">No log entries recorded yet.</div>'}
+    </div>
+  `;
+}
+
 function buildReportsLaunchesMarkup() {
   if (!reportsTerminalState.launches.length) {
     return '<div class="reports-terminal-empty">No deployed launches found yet.</div>';
@@ -9051,6 +9422,9 @@ function buildReportsTerminalOutputMarkup() {
   if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-jobs") {
     return `<div class="reports-terminal-content">${buildReportsActiveJobsMarkup()}</div>`;
   }
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
+    return `<div class="reports-terminal-content">${buildActiveLogsMarkup()}</div>`;
+  }
   const payload = currentReportsTerminalPayload();
   const tab = normalizeReportsTerminalTab(reportsTerminalState.activeTab);
   const tabs = [
@@ -9109,7 +9483,7 @@ function renderReportsTerminalOutput() {
 function renderReportsTerminalList() {
   if (!reportsTerminalList) return;
   syncReportsTerminalChrome();
-  if (["launches", "active-jobs"].includes(normalizeReportsTerminalView(reportsTerminalState.view))) {
+  if (["launches", "active-jobs", "active-logs"].includes(normalizeReportsTerminalView(reportsTerminalState.view))) {
     if (RenderUtils.setCachedHTML) {
       RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, "");
     } else {
@@ -9144,7 +9518,7 @@ function renderReportsTerminalList() {
   }
 }
 
-async function loadReportsTerminalEntry(id, { syncMainOutput = false, showLoading = true } = {}) {
+async function loadReportsTerminalEntry(id, { showLoading = true } = {}) {
   if (!id || !reportsTerminalOutput) return;
   if (normalizeReportsTerminalView(reportsTerminalState.view) !== "transactions") return;
   const loadSerial = ++reportsTerminalLoadSerial;
@@ -9176,19 +9550,51 @@ async function loadReportsTerminalEntry(id, { syncMainOutput = false, showLoadin
   captureFrozenBenchmarkSnapshot(nextId, rawActivePayload);
   reportsTerminalState.activePayload = applyFrozenBenchmarkSnapshot(nextId, rawActivePayload);
   reportsTerminalState.activeText = payload.text || "Report is empty.";
-  if (syncMainOutput) {
-    output.textContent = reportsTerminalState.activeText;
-    if (reportsTerminalState.activePayload && reportsTerminalState.activePayload.report) {
-      metaNode.textContent = buildOutputMetaTextFromReport(reportsTerminalState.activePayload.report);
-    }
-  }
   renderReportsTerminalOutput();
   renderReportsTerminalList();
+}
+
+async function refreshActiveLogs({ showLoading = true } = {}) {
+  if (!reportsTerminalOutput) return;
+  const activeLogsView = normalizeActiveLogsView(reportsTerminalState.activeLogsView);
+  if (showLoading) {
+    reportsTerminalState.activeLogs.error = "";
+    renderReportsTerminalOutput();
+  }
+  const url = `/api/logs?view=${encodeURIComponent(activeLogsView)}&limit=${encodeURIComponent(activeLogsView === "errors" ? "250" : "100")}`;
+  const result = RequestUtils.fetchJsonLatest
+    ? await RequestUtils.fetchJsonLatest("logs", url, {}, requestStates.logs)
+    : null;
+  if (result && result.aborted) return;
+  const response = result ? result.response : await fetch(url);
+  const payload = result ? result.payload : await response.json();
+  if (result && !result.isLatest) return;
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Failed to load active logs.");
+  }
+  reportsTerminalState.activeLogs[activeLogsView] = Array.isArray(payload.logs) ? payload.logs : [];
+  reportsTerminalState.activeLogs.error = "";
+  reportsTerminalState.activeLogs.updatedAtMs = Date.now();
+  renderReportsTerminalOutput();
 }
 
 async function refreshReportsTerminal({ preserveSelection = true, preferId = "", showLoading = true } = {}) {
   if (!reportsTerminalList || !reportsTerminalOutput) return;
   syncReportsTerminalChrome();
+  if (normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
+    reportsTerminalState.activePayload = null;
+    reportsTerminalState.activeBenchmarkReportId = "";
+    reportsTerminalState.activeBenchmarkSnapshot = null;
+    reportsTerminalState.activeText = "";
+    renderReportsTerminalList();
+    try {
+      await refreshActiveLogs({ showLoading });
+    } catch (error) {
+      reportsTerminalState.activeLogs.error = error && error.message ? error.message : "Failed to load active logs.";
+      renderReportsTerminalOutput();
+    }
+    return;
+  }
   if (showLoading) {
     if (RenderUtils.setCachedHTML) {
       RenderUtils.setCachedHTML(renderCache, "reportsList", reportsTerminalList, '<div class="reports-terminal-empty">Loading reports...</div>');
@@ -9272,16 +9678,34 @@ function applyProvidersFromLaunch(launch) {
   if (sellProviderSelect) sellProviderSelect.value = savedExecution.sellProvider || (launch.execution && launch.execution.sellProvider) || "helius-sender";
   if (creationPriorityInput) creationPriorityInput.value = savedExecution.priorityFeeSol || "";
   if (creationTipInput) creationTipInput.value = savedExecution.tipSol || "";
+  setMevModeSelectValue(
+    creationMevModeSelect,
+    savedExecution.mevMode ?? savedExecution.mevProtect,
+    defaultMevModeForProvider(providerSelect ? providerSelect.value : ""),
+    providerSelect ? providerSelect.value : ""
+  );
   if (creationAutoFeeInput) creationAutoFeeInput.checked = Boolean(savedExecution.autoGas);
   if (creationMaxFeeInput) creationMaxFeeInput.value = savedExecution.maxPriorityFeeSol || savedExecution.maxTipSol || "";
   if (buyPriorityFeeInput) buyPriorityFeeInput.value = savedExecution.buyPriorityFeeSol || "";
   if (buyTipInput) buyTipInput.value = savedExecution.buyTipSol || "";
   if (buySlippageInput) buySlippageInput.value = savedExecution.buySlippagePercent || "";
+  setMevModeSelectValue(
+    buyMevModeSelect,
+    savedExecution.buyMevMode ?? savedExecution.buyMevProtect,
+    defaultMevModeForProvider(buyProviderSelect ? buyProviderSelect.value : ""),
+    buyProviderSelect ? buyProviderSelect.value : ""
+  );
   if (buyAutoFeeInput) buyAutoFeeInput.checked = Boolean(savedExecution.buyAutoGas);
   if (buyMaxFeeInput) buyMaxFeeInput.value = savedExecution.buyMaxPriorityFeeSol || savedExecution.buyMaxTipSol || "";
   if (sellPriorityFeeInput) sellPriorityFeeInput.value = savedExecution.sellPriorityFeeSol || "";
   if (sellTipInput) sellTipInput.value = savedExecution.sellTipSol || "";
   if (sellSlippageInput) sellSlippageInput.value = savedExecution.sellSlippagePercent || "";
+  setMevModeSelectValue(
+    sellMevModeSelect,
+    savedExecution.sellMevMode ?? savedExecution.sellMevProtect,
+    defaultMevModeForProvider(sellProviderSelect ? sellProviderSelect.value : ""),
+    sellProviderSelect ? sellProviderSelect.value : ""
+  );
   if (sellAutoFeeInput) sellAutoFeeInput.checked = Boolean(savedExecution.sellAutoGas);
   if (sellMaxFeeInput) sellMaxFeeInput.value = savedExecution.sellMaxPriorityFeeSol || savedExecution.sellMaxTipSol || "";
   syncSettingsCapabilities();
@@ -9814,16 +10238,25 @@ if (devBuyPercentInput) {
   });
 }
 if (providerSelect) providerSelect.addEventListener("change", () => {
+  if (isHelloMoonProvider(getProvider()) && creationMevModeSelect) {
+    setMevModeSelectValue(creationMevModeSelect, "reduced", "reduced", getProvider());
+  }
   syncActivePresetFromInputs();
   updateJitoVisibility();
   validateProviderFeeFields("creation");
 });
 if (buyProviderSelect) buyProviderSelect.addEventListener("change", () => {
+  if (isHelloMoonProvider(getBuyProvider()) && buyMevModeSelect) {
+    setMevModeSelectValue(buyMevModeSelect, "reduced", "reduced", getBuyProvider());
+  }
   ensureStandardRpcSlippageDefault(buySlippageInput, getBuyProvider());
   syncActivePresetFromInputs();
   validateProviderFeeFields("buy");
 });
 if (sellProviderSelect) sellProviderSelect.addEventListener("change", () => {
+  if (isHelloMoonProvider(getSellProvider()) && sellMevModeSelect) {
+    setMevModeSelectValue(sellMevModeSelect, "reduced", "reduced", getSellProvider());
+  }
   ensureStandardRpcSlippageDefault(sellSlippageInput, getSellProvider());
   syncActivePresetFromInputs();
   validateProviderFeeFields("sell");
@@ -10225,16 +10658,19 @@ if (presetEditToggle) {
 [
   creationTipInput,
   creationPriorityInput,
+  creationMevModeSelect,
   creationAutoFeeInput,
   creationMaxFeeInput,
   buyPriorityFeeInput,
   buyTipInput,
   buySlippageInput,
+  buyMevModeSelect,
   buyAutoFeeInput,
   buyMaxFeeInput,
   sellPriorityFeeInput,
   sellTipInput,
   sellSlippageInput,
+  sellMevModeSelect,
   sellAutoFeeInput,
   sellMaxFeeInput,
 ].forEach((input) => {
@@ -10370,7 +10806,7 @@ Promise.resolve(bootstrapApp())
   .then(() => {
     startRuntimeStatusRefreshLoop();
     enableLiveSync();
-    if (isPopoutMode && isReportsTerminalCurrentlyVisible()) {
+    if (isReportsTerminalCurrentlyVisible()) {
       refreshReportsTerminal({
         preserveSelection: true,
         preferId: reportsTerminalState.activeId,

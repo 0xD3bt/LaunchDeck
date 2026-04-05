@@ -24,3 +24,5 @@ clap = { version = "4.6.0", features = ["derive"] }
 serde_yaml = "0.9.34"
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.32"
+lunar-lander-quic-client = { git = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs" }
+rustls = { version = "0.23", features = ["ring"] }
