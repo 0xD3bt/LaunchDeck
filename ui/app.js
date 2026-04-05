@@ -1,5 +1,6 @@
 const bootOverlay = document.getElementById("boot-overlay");
 const form = document.getElementById("launch-form");
+const launchSurfaceCard = form ? form.querySelector(".launch-surface") : null;
 const output = document.getElementById("output");
 const statusNode = document.getElementById("status");
 const metaNode = document.getElementById("meta");
@@ -200,6 +201,8 @@ const settingsClose = document.getElementById("settings-close");
 const settingsCancel = document.getElementById("settings-cancel");
 const modeSniperButton = document.getElementById("mode-sniper-button");
 const modeVanityButton = document.getElementById("mode-vanity-button");
+let vanityDerivedAddressPill = document.getElementById("mode-vanity-address");
+let vanityDerivedPublicKey = "";
 const devAutoSellButton = document.getElementById("dev-auto-sell-button");
 const devAutoSellPanel = document.getElementById("dev-auto-sell-panel");
 const autoSellEnabledInput = document.getElementById("auto-sell-enabled-input");
@@ -222,7 +225,6 @@ const autoSellMarketCapEnabledInput = document.getElementById("auto-sell-market-
 const autoSellMarketCapSettings = document.getElementById("auto-sell-market-cap-settings");
 const autoSellMarketCapThresholdInput = document.getElementById("auto-sell-market-cap-threshold-input");
 const autoSellMarketCapThresholdValue = document.getElementById("auto-sell-market-cap-threshold-value");
-const autoSellMarketCapDirectionInput = document.getElementById("auto-sell-market-cap-direction-input");
 const autoSellMarketCapTimeoutInput = document.getElementById("auto-sell-market-cap-timeout-input");
 const autoSellMarketCapTimeoutActionInput = document.getElementById("auto-sell-market-cap-timeout-action-input");
 const sniperModal = document.getElementById("sniper-modal");
@@ -482,6 +484,7 @@ let metadataUploadState = {
   staleWhileUploading: false,
   autoRetryFailures: 0,
   autoRetryDisabled: false,
+  lastAlertedWarning: "",
 };
 let runtimeStatusRefreshTimer = null;
 let walletStatusRefreshTimer = null;
@@ -1035,10 +1038,12 @@ function normalizeAutoSellDraft(value) {
   const triggerFamily = normalizeAutoSellTriggerFamily(
     value.triggerFamily || ((Boolean(value.marketCapEnabled) || String(value.marketCapThreshold || "").trim()) ? "market-cap" : "time")
   );
-  const legacyTimeoutMinutes = Math.max(1, Math.min(1440, Math.round(Number(value.marketCapScanTimeoutMinutes || 15) || 15)));
+  const legacyTimeoutMinutesRaw = String(value.marketCapScanTimeoutMinutes || "").trim();
   const timeoutSeconds = value.marketCapScanTimeoutSeconds != null && value.marketCapScanTimeoutSeconds !== ""
-    ? Math.max(1, Math.min(86400, Math.round(Number(value.marketCapScanTimeoutSeconds || 15) || 15)))
-    : legacyTimeoutMinutes * 60;
+    ? Math.max(1, Math.min(86400, Math.round(Number(value.marketCapScanTimeoutSeconds || 30) || 30)))
+    : (legacyTimeoutMinutesRaw
+      ? Math.max(1, Math.min(86400, Math.round((Number(legacyTimeoutMinutesRaw || 15) || 15) * 60)))
+      : 30);
   return {
     enabled: Boolean(value.enabled),
     percent: Math.max(1, Math.min(100, Number(value.percent || 100) || 100)),
@@ -1048,7 +1053,6 @@ function normalizeAutoSellDraft(value) {
     blockOffset: Math.max(0, Math.min(23, Math.round(Number(value.blockOffset || 0) || 0))),
     marketCapEnabled: triggerFamily === "market-cap" || Boolean(value.marketCapEnabled),
     marketCapThreshold: String(value.marketCapThreshold || "").trim(),
-    marketCapDirection: String(value.marketCapDirection || "").trim().toLowerCase() === "lte" ? "lte" : "gte",
     marketCapScanTimeoutSeconds: timeoutSeconds,
     marketCapTimeoutAction: String(value.marketCapTimeoutAction || "").trim().toLowerCase() === "sell" ? "sell" : "stop",
   };
@@ -1088,7 +1092,6 @@ function applyAutoSellDraft(value, { persist = false } = {}) {
   setNamedValue("automaticDevSellBlockOffset", String(draft.blockOffset));
   setNamedChecked("automaticDevSellMarketCapEnabled", draft.triggerFamily === "market-cap");
   setNamedValue("automaticDevSellMarketCapThreshold", draft.marketCapThreshold);
-  setNamedValue("automaticDevSellMarketCapDirection", draft.marketCapDirection);
   setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", String(draft.marketCapScanTimeoutSeconds));
   setNamedValue("automaticDevSellMarketCapTimeoutAction", draft.marketCapTimeoutAction);
   syncDevAutoSellUI();
@@ -1562,7 +1565,6 @@ const autoSellFeature = window.AutoSellFeature.create({
     autoSellMarketCapSettings,
     autoSellMarketCapThresholdInput,
     autoSellMarketCapThresholdValue,
-    autoSellMarketCapDirectionInput,
     autoSellMarketCapTimeoutInput,
     autoSellMarketCapTimeoutActionInput,
   },
@@ -1584,10 +1586,9 @@ const autoSellFeature = window.AutoSellFeature.create({
     blockOffset: getNamedValue("automaticDevSellBlockOffset") || "0",
     marketCapEnabled: (getNamedValue("automaticDevSellTriggerFamily") || "time") === "market-cap",
     marketCapThreshold: getNamedValue("automaticDevSellMarketCapThreshold") || "",
-    marketCapDirection: getNamedValue("automaticDevSellMarketCapDirection") || "gte",
     marketCapScanTimeoutSeconds: getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds")
       || getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes")
-      || "15",
+      || "30",
     marketCapTimeoutAction: getNamedValue("automaticDevSellMarketCapTimeoutAction") || "stop",
   }),
 });
@@ -1636,6 +1637,15 @@ function getAutoSellSummaryText(formValues = readForm()) {
 
 function syncDevAutoSellUI() {
   autoSellFeature.syncUI();
+}
+
+function hydrateDevAutoSellState() {
+  const storedDraft = getStoredAutoSellDraft();
+  if (storedDraft) {
+    applyAutoSellDraft(storedDraft, { persist: false });
+    return;
+  }
+  syncDevAutoSellUI();
 }
 
 function toggleDevAutoSellPanel(forceOpen) {
@@ -1949,8 +1959,7 @@ function createFallbackConfig() {
           targetBlockOffset: 0,
           marketCapEnabled: false,
           marketCapThreshold: "",
-          marketCapDirection: "gte",
-          marketCapScanTimeoutSeconds: 15,
+          marketCapScanTimeoutSeconds: 30,
           marketCapTimeoutAction: "stop",
         },
         postLaunchStrategy: "none",
@@ -2141,6 +2150,29 @@ function normalizeWarmTargets(values) {
     : [];
 }
 
+function tonePriority(tone) {
+  switch (String(tone || "").trim()) {
+    case "red":
+      return 5;
+    case "yellow":
+      return 4;
+    case "blue":
+      return 3;
+    case "green":
+      return 2;
+    case "gray":
+    default:
+      return 1;
+  }
+}
+
+function strongestIndicatorTone(tones = []) {
+  return tones
+    .map((tone) => String(tone || "").trim())
+    .filter(Boolean)
+    .sort((left, right) => tonePriority(right) - tonePriority(left))[0] || "gray";
+}
+
 function formatWarmTargetName(target) {
   const label = String(target && target.label || target && target.provider || "Target").trim() || "Target";
   const rawTarget = String(target && target.target || "").trim();
@@ -2200,6 +2232,84 @@ function summarizeStartupWarmFailures(targets, limit = 2) {
     items.push(`+${targets.length - limit} more`);
   }
   return items.join(" | ");
+}
+
+function buildWarmTooltipRowsFromTargets(targets, nowMs) {
+  return normalizeWarmTargets(targets).map((target) => {
+    const label = formatWarmTargetName(target);
+    if (String(target && target.lastError || "").trim()) {
+      return {
+        tone: "red",
+        label,
+        detail: truncateStatusText(target.lastError || "", 120) || "Failed",
+      };
+    }
+    if (isWarmTelemetryTargetRateLimited(target)) {
+      return {
+        tone: "yellow",
+        label,
+        detail: truncateStatusText(target.lastRateLimitMessage || "", 120) || "Reachable but rate-limited",
+      };
+    }
+    if (isWarmTelemetryTargetHealthy(target, nowMs)) {
+      return {
+        tone: "green",
+        label,
+        detail: `Healthy${target && target.lastSuccessAtMs ? ` • last success ${formatWarmTimestamp(target.lastSuccessAtMs)}` : ""}`,
+      };
+    }
+    if (target && target.active) {
+      return {
+        tone: "yellow",
+        label,
+        detail: `Waiting for a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s)`,
+      };
+    }
+    return {
+      tone: "gray",
+      label,
+      detail: "Inactive",
+    };
+  });
+}
+
+function buildStartupWarmTooltipRows(targets) {
+  return Array.isArray(targets)
+    ? targets.map((target) => ({
+        tone: target && target.ok ? "green" : String(target && target.error || "").trim() ? "red" : "yellow",
+        label: String(target && target.label || "Target").trim() || "Target",
+        detail: target && target.ok
+          ? "Healthy"
+          : truncateStatusText(target && target.error || "", 120) || "Waiting",
+      }))
+    : [];
+}
+
+function renderRuntimeIndicatorTooltipSections(sections = []) {
+  return sections
+    .filter((section) => section && Array.isArray(section.rows) && section.rows.length > 0)
+    .map((section) => {
+      const rowsMarkup = section.rows.map((row) => {
+        const tone = ["green", "yellow", "blue", "red", "gray"].includes(row && row.tone) ? row.tone : "gray";
+        const label = String(row && row.label || "Item").trim() || "Item";
+        const detail = String(row && row.detail || "").trim();
+        return `
+          <div class="runtime-indicator-tooltip-row">
+            <span class="runtime-indicator-tooltip-dot is-${tone}" aria-hidden="true"></span>
+            <div class="runtime-indicator-tooltip-copy">
+              <div class="runtime-indicator-tooltip-row-label">${escapeHTML(label)}</div>
+              ${detail ? `<div class="runtime-indicator-tooltip-row-detail">${escapeHTML(detail)}</div>` : ""}
+            </div>
+          </div>
+        `;
+      }).join("");
+      return `
+        <div class="runtime-indicator-tooltip-section">
+          <div class="runtime-indicator-tooltip-head">${escapeHTML(String(section.title || "").trim() || "Status")}</div>
+          ${rowsMarkup}
+        </div>
+      `;
+    }).join("");
 }
 
 function describeWarmReason(reason) {
@@ -2280,6 +2390,10 @@ function startupWarmSnapshot() {
       disabled: true,
       stateTargets: [],
       endpointTargets: [],
+      watchTargets: [],
+      stateFailures: [],
+      endpointFailures: [],
+      watchFailures: [],
       error: "",
     };
   }
@@ -2314,6 +2428,13 @@ function startupWarmSnapshot() {
           error: entry && entry.error ? String(entry.error) : "",
         }))
       : [];
+  const watchTargets = summary && summary.watchTargets && typeof summary.watchTargets === "object"
+    ? Array.from({ length: Number(summary.watchTargets.total || 0) }, (_, index) => ({
+        label: String(summary.watchTargets.label || "Watcher WS warm").trim() || "Watcher WS warm",
+        ok: index < Number(summary.watchTargets.healthy || 0),
+        error: "",
+      }))
+    : [];
   const stateFailures = summary && Array.isArray(summary.stateFailures)
     ? summary.stateFailures.map((entry) => ({
         label: String(entry && entry.label || "Startup state target").trim() || "Startup state target",
@@ -2326,12 +2447,20 @@ function startupWarmSnapshot() {
         error: entry && entry.error ? String(entry.error) : "",
       }))
     : [];
+  const watchFailures = summary && Array.isArray(summary.watchFailures)
+    ? summary.watchFailures.map((entry) => ({
+        label: String(entry && entry.label || summary && summary.watchTargets && summary.watchTargets.label || "Watcher WS warm").trim() || "Watcher WS warm",
+        error: entry && entry.error ? String(entry.error) : "",
+      }))
+    : [];
   return {
     disabled: false,
     stateTargets,
     endpointTargets,
+    watchTargets,
     stateFailures,
     endpointFailures,
+    watchFailures,
     error: String(startupWarmState.backendError || "").trim(),
   };
 }
@@ -2404,18 +2533,25 @@ function buildPlatformRuntimeIndicatorState() {
   const nowMs = Date.now();
   const stateTargets = normalizeWarmTargets(warm && warm.stateTargets);
   const endpointTargets = normalizeWarmTargets(warm && warm.endpointTargets);
+  const watchTargets = normalizeWarmTargets(warm && warm.watchTargets);
   const activeStateTargets = stateTargets.filter((target) => Boolean(target && target.active));
   const activeEndpointTargets = endpointTargets.filter((target) => Boolean(target && target.active));
+  const activeWatchTargets = watchTargets.filter((target) => Boolean(target && target.active));
   const healthyStateTargets = stateTargets.filter((target) => isWarmTelemetryTargetHealthy(target, nowMs));
   const healthyEndpointTargets = endpointTargets.filter((target) => isWarmTelemetryTargetHealthy(target, nowMs));
+  const healthyWatchTargets = watchTargets.filter((target) => isWarmTelemetryTargetHealthy(target, nowMs));
   const rateLimitedActiveStateTargets = activeStateTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
   const rateLimitedActiveEndpointTargets = activeEndpointTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
+  const rateLimitedActiveWatchTargets = activeWatchTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
   const staleActiveStateTargets = activeStateTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
   const staleActiveEndpointTargets = activeEndpointTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
+  const staleActiveWatchTargets = activeWatchTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
   const failingActiveStateTargets = activeStateTargets.filter((target) => String(target && target.lastError || "").trim());
   const failingActiveEndpointTargets = activeEndpointTargets.filter((target) => String(target && target.lastError || "").trim());
+  const failingActiveWatchTargets = activeWatchTargets.filter((target) => String(target && target.lastError || "").trim());
   const failingStateTargets = stateTargets.filter((target) => String(target && target.lastError || "").trim());
   const failingEndpointTargets = endpointTargets.filter((target) => String(target && target.lastError || "").trim());
+  const failingWatchTargets = watchTargets.filter((target) => String(target && target.lastError || "").trim());
   const endpointTargetProviders = uniqueWarmTargetProviders(activeEndpointTargets.length ? activeEndpointTargets : endpointTargets);
   const senderConnectionWarm = (endpointTargetProviders.length === 1 && endpointTargetProviders[0] === "helius-sender")
     || (!endpointTargetProviders.length && startupWarm.endpointTargets.length > 0);
@@ -2434,6 +2570,9 @@ function buildPlatformRuntimeIndicatorState() {
   const startupEndpointFailures = startupWarm.endpointFailures && startupWarm.endpointFailures.length
     ? startupWarm.endpointFailures
     : startupWarm.endpointTargets.filter((target) => !target.ok && target.error);
+  const startupWatchFailures = startupWarm.watchFailures && startupWarm.watchFailures.length
+    ? startupWarm.watchFailures
+    : startupWarm.watchTargets.filter((target) => !target.ok && target.error);
 
   let stateWarm = {
     tone: startupWarmInProgress ? "yellow" : "gray",
@@ -2615,23 +2754,156 @@ function buildPlatformRuntimeIndicatorState() {
     }
   }
 
-  return [
+
+  let watchPrewarm = {
+    tone: startupWarmInProgress ? "yellow" : "gray",
+    title: startupWarmInProgress ? "Watcher WS warm: starting." : "Watcher WS warm: disabled.",
+  };
+  if (useStartupWarmFallback) {
+    if (startupWarm.disabled) {
+      watchPrewarm = {
+        tone: "gray",
+        title: "Watcher WS warm: disabled by user.",
+      };
+    } else if (startupWatchFailures.length > 0) {
+      watchPrewarm = {
+        tone: startupWatchFailures.length < startupWarm.watchTargets.length ? "yellow" : "red",
+        title: startupWatchFailures.length < startupWarm.watchTargets.length
+          ? `Watcher WS warm: partial. ${startupWatchFailures.length}/${startupWarm.watchTargets.length} startup target${startupWarm.watchTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupWatchFailures)}`
+          : `Watcher WS warm: failing. ${startupWatchFailures.length}/${startupWarm.watchTargets.length} startup target${startupWarm.watchTargets.length === 1 ? "" : "s"} failed. ${summarizeStartupWarmFailures(startupWatchFailures)}`,
+      };
+    } else if (startupWarm.watchTargets.length > 0) {
+      watchPrewarm = {
+        tone: "green",
+        title: `Watcher WS warm: healthy. ${startupWarm.watchTargets.length} startup target${startupWarm.watchTargets.length === 1 ? "" : "s"} succeeded.`,
+      };
+    } else if (startupWarm.error) {
+      watchPrewarm = {
+        tone: "red",
+        title: `Watcher WS warm: failing. ${startupWarm.error}`,
+      };
+    }
+  } else if (warm) {
+    if (warmDisabledByUser || (!activeWatchTargets.length && !watchTargets.length)) {
+      watchPrewarm = {
+        tone: "gray",
+        title: "Watcher WS warm: disabled by user.",
+      };
+    } else if (failingActiveWatchTargets.length > 0) {
+      watchPrewarm = {
+        tone: failingActiveWatchTargets.length < activeWatchTargets.length ? "yellow" : "red",
+        title: failingActiveWatchTargets.length < activeWatchTargets.length
+          ? `Watcher WS warm: partial. ${failingActiveWatchTargets.length}/${activeWatchTargets.length} active target${activeWatchTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveWatchTargets)}`
+          : `Watcher WS warm: failing. ${failingActiveWatchTargets.length}/${activeWatchTargets.length} active target${activeWatchTargets.length === 1 ? "" : "s"} failed. ${summarizeWarmFailures(failingActiveWatchTargets)}`,
+      };
+    } else if (rateLimitedActiveWatchTargets.length > 0) {
+      watchPrewarm = {
+        tone: "yellow",
+        title: rateLimitedActiveWatchTargets.length < activeWatchTargets.length
+          ? `Watcher WS warm: degraded. ${rateLimitedActiveWatchTargets.length}/${activeWatchTargets.length} active target${activeWatchTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveWatchTargets)}`
+          : `Watcher WS warm: rate-limited. ${rateLimitedActiveWatchTargets.length}/${activeWatchTargets.length} active target${activeWatchTargets.length === 1 ? "" : "s"} reachable but rate-limited. ${summarizeWarmRateLimits(rateLimitedActiveWatchTargets)}`,
+      };
+    } else if (staleActiveWatchTargets.length > 0) {
+      watchPrewarm = {
+        tone: "yellow",
+        title: `Watcher WS warm: waiting. ${staleActiveWatchTargets.length} active target${staleActiveWatchTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
+      };
+    } else if (activeWatchTargets.length > 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeWatchTargets));
+      watchPrewarm = {
+        tone: "green",
+        title: `Watcher WS warm: healthy. ${activeWatchTargets.length} active target${activeWatchTargets.length === 1 ? "" : "s"}. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyWatchTargets.length > 0 && failingWatchTargets.length === 0) {
+      const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(healthyWatchTargets));
+      watchPrewarm = {
+        tone: "green",
+        title: `Watcher WS warm: healthy. Warm watch routing is enabled and ready. ${healthyWatchTargets.length} target${healthyWatchTargets.length === 1 ? "" : "s"} succeeded. Last success ${latestSuccess}.`,
+      };
+    } else if (warm.active && healthyWatchTargets.length > 0 && failingWatchTargets.length > 0) {
+      watchPrewarm = {
+        tone: "yellow",
+        title: `Watcher WS warm: partial. Warm watch routing is enabled, but some targets failed. ${summarizeWarmFailures(failingWatchTargets)}`,
+      };
+    } else {
+      const warmReasonText = describeWarmReason(warmReason);
+      watchPrewarm = {
+        tone: isWarmAutoPausedReason(warmReason) ? "blue" : "yellow",
+        title: watchTargets.length > 0
+          ? `Watcher WS warm: auto-paused. ${warmReasonText}.`
+          : startupWarmInProgress
+            ? "Watcher WS warm: starting."
+            : isWarmAutoPausedReason(warmReason)
+              ? `Watcher WS warm: auto-paused. ${warmReasonText}.`
+              : `Watcher WS warm: waiting. ${warmReasonText}.`,
+      };
+    }
+  }
+
+  const watchPath = currentWatchPathSnapshot();
+  const componentRows = [
     {
-      key: "state-warm",
+      tone: stateWarm.tone,
       label: "State warm",
-      ...stateWarm,
+      detail: stateWarm.title.replace(/^[^:]+:\s*/, ""),
     },
     {
-      key: "endpoint-prewarm",
+      tone: endpointPrewarm.tone,
       label: endpointWarmLabel,
-      ...endpointPrewarm,
+      detail: endpointPrewarm.title.replace(/^[^:]+:\s*/, ""),
     },
     {
-      key: "watch-path",
+      tone: watchPrewarm.tone,
+      label: "Watcher WS warm",
+      detail: watchPrewarm.title.replace(/^[^:]+:\s*/, ""),
+    },
+    {
+      tone: watchPath.tone,
       label: "Watch path",
-      ...currentWatchPathSnapshot(),
+      detail: watchPath.title.replace(/^[^:]+:\s*/, ""),
     },
   ];
+  const connectionRows = useStartupWarmFallback
+    ? [
+        ...buildStartupWarmTooltipRows(startupWarm.endpointTargets),
+        ...buildStartupWarmTooltipRows(startupWarm.watchTargets),
+      ]
+    : [
+        ...buildWarmTooltipRowsFromTargets(activeEndpointTargets.length ? activeEndpointTargets : endpointTargets, nowMs),
+        ...buildWarmTooltipRowsFromTargets(activeWatchTargets.length ? activeWatchTargets : watchTargets, nowMs),
+      ];
+  const stateRows = useStartupWarmFallback
+    ? buildStartupWarmTooltipRows(startupWarm.stateTargets)
+    : buildWarmTooltipRowsFromTargets(activeStateTargets.length ? activeStateTargets : stateTargets, nowMs);
+  const overallTone = strongestIndicatorTone(componentRows.map((row) => row.tone));
+  const failingComponents = componentRows.filter((row) => row.tone === "red").length;
+  const degradedComponents = componentRows.filter((row) => row.tone === "yellow" || row.tone === "blue").length;
+  const healthyComponents = componentRows.filter((row) => row.tone === "green").length;
+  let title = "Warm: disabled.";
+  if (overallTone === "red") {
+    title = `Warm: failing. ${failingComponents}/${componentRows.length} warm checks failing.`;
+  } else if (overallTone === "yellow" || overallTone === "blue") {
+    title = startupWarmInProgress
+      ? "Warm: starting."
+      : `Warm: partial. ${degradedComponents}/${componentRows.length} warm checks need attention.`;
+  } else if (overallTone === "green") {
+    title = `Warm: healthy. ${healthyComponents}/${componentRows.length} warm checks healthy.`;
+  } else if (startupWarmInProgress) {
+    title = "Warm: starting.";
+  }
+  return {
+    warm: {
+      key: "warm",
+      label: "Warm",
+      tone: overallTone,
+      title,
+      sections: [
+        { title: "Summary", rows: componentRows },
+        { title: "Warm connections", rows: connectionRows },
+        { title: "State caches", rows: stateRows },
+      ].filter((section) => section.rows.length > 0),
+    },
+  };
 }
 
 function formatRpcRequestsPerMinuteLabel() {
@@ -2671,15 +2943,36 @@ function formatRpcRequestsPerMinuteLabel() {
 
 function renderPlatformRuntimeIndicators() {
   if (!platformRuntimeIndicators) return;
-  const indicators = buildPlatformRuntimeIndicatorState();
-  const dotsMarkup = indicators.map((indicator) => {
-    const tone = ["green", "yellow", "blue", "red", "gray"].includes(indicator.tone) ? indicator.tone : "gray";
-    const title = `${indicator.label}: ${indicator.title.replace(/^[^:]+:\s*/, "")}`;
-    return `<span class="runtime-indicator-dot is-${tone}" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"></span>`;
-  }).join("");
+  const indicatorState = buildPlatformRuntimeIndicatorState();
+  const warmIndicator = indicatorState && indicatorState.warm ? indicatorState.warm : {
+    label: "Warm",
+    tone: "gray",
+    title: "Warm: disabled.",
+    sections: [],
+  };
+  const warmTone = ["green", "yellow", "blue", "red", "gray"].includes(warmIndicator.tone) ? warmIndicator.tone : "gray";
+  const warmTooltipSections = renderRuntimeIndicatorTooltipSections(warmIndicator.sections);
+  const dotsMarkup = `
+    <span class="runtime-indicator-popover" tabindex="0" aria-label="${escapeHTML(warmIndicator.title)}">
+      <span class="runtime-indicator-dot is-${warmTone}" aria-hidden="true"></span>
+      <span class="runtime-indicator-tooltip" role="tooltip">
+        <span class="runtime-indicator-tooltip-title">${escapeHTML(warmIndicator.title)}</span>
+        ${warmTooltipSections || '<span class="runtime-indicator-tooltip-empty">No active warm targets right now.</span>'}
+      </span>
+    </span>
+  `;
   const rpcLabel = formatRpcRequestsPerMinuteLabel();
   const rpcClass = `runtime-rpc-rate${rpcLabel.muted ? " is-muted" : ""}`;
-  const markup = `${dotsMarkup}<span class="${rpcClass}" title="${escapeHTML(rpcLabel.title)}">${escapeHTML(rpcLabel.text)}</span>`;
+  const rpcMarkup = `
+    <span class="runtime-rpc-rate-popover" tabindex="0" aria-label="${escapeHTML(rpcLabel.title)}">
+      <span class="${rpcClass}">${escapeHTML(rpcLabel.text)}</span>
+      <span class="runtime-rpc-tooltip" role="tooltip">
+        <span class="runtime-rpc-tooltip-title">Requests per minute</span>
+        <span class="runtime-rpc-tooltip-body">${escapeHTML(rpcLabel.title)}</span>
+      </span>
+    </span>
+  `;
+  const markup = `${dotsMarkup}${rpcMarkup}`;
   if (RenderUtils.setCachedHTML) {
     RenderUtils.setCachedHTML(renderCache, "platformRuntimeIndicators", platformRuntimeIndicators, markup);
   } else {
@@ -3026,7 +3319,30 @@ function getLiveSyncControlKey(control) {
 function getLiveSyncControls() {
   if (!form) return [];
   return Array.from(form.querySelectorAll("input, select, textarea"))
-    .filter((control) => control instanceof HTMLElement && String(control.getAttribute("type") || "").toLowerCase() !== "file");
+    .filter((control) => {
+      if (!(control instanceof HTMLElement)) return false;
+      if (String(control.getAttribute("type") || "").toLowerCase() === "file") return false;
+      return control.getAttribute("name") !== "vanityPrivateKey";
+    });
+}
+
+function isRefreshPersistedFormControlKey(key) {
+  return /^name:launchpad:value:/.test(key)
+    || /^name:mode:value:/.test(key)
+    || key === "name:mayhemMode:value:"
+    || key === "name:quoteAsset"
+    || key === "name:postLaunchStrategy"
+    || key === "name:sniperEnabled"
+    || key === "name:automaticDevSellEnabled:value:"
+    || key === "name:feeSplitEnabled:value:"
+    || key === "name:bagsIdentityMode";
+}
+
+function filterRefreshPersistedFormControls(formControls) {
+  if (!formControls || typeof formControls !== "object") return {};
+  return Object.fromEntries(
+    Object.entries(formControls).filter(([key]) => isRefreshPersistedFormControlKey(key)),
+  );
 }
 
 function buildLiveSyncFormControls() {
@@ -3311,13 +3627,16 @@ function applyIncomingLiveSyncPayload(payload, {
   allowBeforeReady = false,
   skipVisibilityState = false,
   skipDashboardViewState = false,
+  skipThemeMode = false,
+  skipFormControls = false,
+  restorePersistedFormControlsOnly = false,
   restoreOutputFromSync = true,
 } = {}) {
   if (!allowBeforeReady && !liveSyncReady) return;
   if (!payload || typeof payload !== "object" || payload.sourceId === LIVE_SYNC_SOURCE_ID) return;
   isApplyingLiveSync = true;
   try {
-    if (payload.themeMode === "light" || payload.themeMode === "dark") {
+    if (!skipThemeMode && (payload.themeMode === "light" || payload.themeMode === "dark")) {
       setThemeMode(payload.themeMode);
     }
     if (!skipVisibilityState && typeof payload.outputVisible === "boolean") {
@@ -3392,7 +3711,11 @@ function applyIncomingLiveSyncPayload(payload, {
       walletSelect.value = payload.selectedWalletKey;
       walletSelect.dispatchEvent(new Event("change", { bubbles: true }));
     }
-    applyLiveSyncFormControls(payload.formControls);
+    if (restorePersistedFormControlsOnly) {
+      applyLiveSyncFormControls(filterRefreshPersistedFormControls(payload.formControls));
+    } else if (!skipFormControls) {
+      applyLiveSyncFormControls(payload.formControls);
+    }
   } finally {
     isApplyingLiveSync = false;
     schedulePopoutAutosize();
@@ -3404,6 +3727,9 @@ function enableLiveSync() {
   const storedPayload = readStoredLiveSyncPayload();
   if (storedPayload) {
     applyIncomingLiveSyncPayload(storedPayload, {
+      skipThemeMode: true,
+      skipFormControls: false,
+      restorePersistedFormControlsOnly: !isPopoutMode,
       skipVisibilityState: true,
       skipDashboardViewState: true,
       restoreOutputFromSync: isPopoutMode,
@@ -3422,6 +3748,9 @@ function preloadLiveSyncSnapshot() {
   if (!payload) return false;
   applyIncomingLiveSyncPayload(payload, {
     allowBeforeReady: true,
+    skipThemeMode: true,
+    skipFormControls: false,
+    restorePersistedFormControlsOnly: !isPopoutMode,
     skipVisibilityState: true,
     skipDashboardViewState: true,
     restoreOutputFromSync: isPopoutMode,
@@ -4125,24 +4454,17 @@ function normalizeMevMode(value, fallback = "off") {
 }
 
 function normalizeSelectableMevMode(provider, value, fallback = "off") {
-  const normalized = normalizeMevMode(value, fallback);
-  if (isHelloMoonProvider(provider) && normalized === "secure") {
-    return "reduced";
-  }
-  return normalized;
+  return normalizeMevMode(value, fallback);
 }
 
 function setMevModeOptionAvailability(select, provider) {
   if (!select) return;
   const secureOption = Array.from(select.options).find((option) => option.value === "secure");
   if (!secureOption) return;
-  const disableSecure = isHelloMoonProvider(provider);
-  secureOption.disabled = disableSecure;
-  secureOption.textContent = disableSecure ? "Secure (temporarily unavailable)" : "Secure";
-  secureOption.title = disableSecure ? "Hello Moon secure mode is temporarily unavailable." : "";
-  if (disableSecure && select.value === "secure") {
-    select.value = "reduced";
-  }
+  void provider;
+  secureOption.disabled = false;
+  secureOption.textContent = "Secure";
+  secureOption.title = "";
 }
 
 function setMevModeSelectValue(select, value, fallback = "off", provider = "") {
@@ -4438,7 +4760,25 @@ function setPresetEditing(editing) {
 
 function renderVanityButtonState() {
   if (!modeVanityButton) return;
-  modeVanityButton.classList.toggle("active", Boolean(getNamedValue("vanityPrivateKey").trim()));
+  const hasVanityKey = Boolean(getNamedValue("vanityPrivateKey").trim());
+  modeVanityButton.classList.toggle("active", hasVanityKey);
+  if (!vanityDerivedAddressPill && modeVanityButton.parentElement) {
+    vanityDerivedAddressPill = document.createElement("div");
+    vanityDerivedAddressPill.id = "mode-vanity-address";
+    vanityDerivedAddressPill.className = "vanity-derived-address";
+    vanityDerivedAddressPill.hidden = true;
+    modeVanityButton.parentElement.insertAdjacentElement("afterend", vanityDerivedAddressPill);
+  }
+  if (!vanityDerivedAddressPill) return;
+  if (!hasVanityKey || !vanityDerivedPublicKey || modeVanityButton.hidden) {
+    vanityDerivedAddressPill.hidden = true;
+    vanityDerivedAddressPill.textContent = "";
+    vanityDerivedAddressPill.removeAttribute("title");
+    return;
+  }
+  vanityDerivedAddressPill.hidden = false;
+  vanityDerivedAddressPill.textContent = `Vanity CA: ${vanityDerivedPublicKey}`;
+  vanityDerivedAddressPill.title = vanityDerivedPublicKey;
 }
 
 
@@ -4587,10 +4927,30 @@ async function importVampToken() {
   }
 }
 
-function applyVanityValue(rawValue) {
+function applyVanityValue(rawValue, options = {}) {
   const nextValue = String(rawValue || "").trim();
   if (vanityPrivateKeyInput) vanityPrivateKeyInput.value = nextValue;
+  if (!nextValue) {
+    vanityDerivedPublicKey = "";
+  } else if (options && typeof options.publicKey === "string" && options.publicKey.trim()) {
+    vanityDerivedPublicKey = options.publicKey.trim();
+  }
   renderVanityButtonState();
+}
+
+async function validateVanityPrivateKey(rawValue) {
+  const nextValue = String(rawValue || "").trim();
+  if (!nextValue) return { ok: true, normalizedPrivateKey: "" };
+  const response = await fetch("/api/vanity/validate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ privateKey: nextValue }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Invalid vanity private key.");
+  }
+  return payload;
 }
 
 function hydrateModeActionState() {
@@ -4756,6 +5116,33 @@ function walletDisplayName(wallet) {
   }
   const index = walletIndexFromEnvKey(wallet.envKey);
   return `#${index}`;
+}
+
+function normalizeVisibleWallets(wallets) {
+  const seen = new Set();
+  return (Array.isArray(wallets) ? wallets : [])
+    .filter((wallet) => wallet && typeof wallet === "object")
+    .filter((wallet) => {
+      const envKey = String(wallet.envKey || "").trim();
+      const publicKey = String(wallet.publicKey || "").trim();
+      if (!envKey || !publicKey || seen.has(envKey)) return false;
+      seen.add(envKey);
+      return true;
+    })
+    .map((wallet) => ({
+      ...wallet,
+      envKey: String(wallet.envKey || "").trim(),
+      publicKey: String(wallet.publicKey || "").trim(),
+    }));
+}
+
+function resolveVisibleSelectedWalletKey(selectedKey, wallets) {
+  const normalizedKey = String(selectedKey || "").trim();
+  const visibleWallets = normalizeVisibleWallets(wallets);
+  if (normalizedKey && visibleWallets.some((wallet) => wallet.envKey === normalizedKey)) {
+    return normalizedKey;
+  }
+  return visibleWallets[0] ? visibleWallets[0].envKey : "";
 }
 
 function formatWalletHistoryLabel(envKey) {
@@ -5495,11 +5882,7 @@ function applyLaunchpadAvailability(launchpads = {}) {
     input.disabled = unavailable;
     if (label) {
       label.classList.toggle("is-disabled", unavailable);
-      if (entry && entry.reason) {
-        label.title = entry.reason;
-      } else {
-        label.removeAttribute("title");
-      }
+      label.removeAttribute("title");
     }
     if (titleNode) {
       const baseLabel = input.value === "bagsapp"
@@ -5528,8 +5911,8 @@ function applyPersistentDefaults(config) {
   const storedMode = getStoredLaunchMode();
   const storedLaunchpad = getStoredLaunchpad();
   const storedBonkQuoteAsset = getStoredBonkQuoteAsset();
-  const storedFeeSplitDraft = getStoredFeeSplitDraft();
-  const storedAgentSplitDraft = getStoredAgentSplitDraft();
+  const storedFeeSplitDraft = isPopoutMode ? getStoredFeeSplitDraft() : null;
+  const storedAgentSplitDraft = isPopoutMode ? getStoredAgentSplitDraft() : null;
   const storedAutoSellDraft = getStoredAutoSellDraft();
   const resolvedMode = storedMode || defaultMode;
   const resolvedFeeSplitDraft = storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null;
@@ -5560,10 +5943,11 @@ function applyPersistentDefaults(config) {
       marketCapEnabled: Boolean(defaults.automaticDevSell.marketCapEnabled)
         || Boolean(defaults.automaticDevSell.marketCapThreshold),
       marketCapThreshold: defaults.automaticDevSell.marketCapThreshold || "",
-      marketCapDirection: defaults.automaticDevSell.marketCapDirection || "gte",
       marketCapScanTimeoutSeconds: defaults.automaticDevSell.marketCapScanTimeoutSeconds != null
         ? defaults.automaticDevSell.marketCapScanTimeoutSeconds
-        : ((defaults.automaticDevSell.marketCapScanTimeoutMinutes || 15) * 60),
+        : (defaults.automaticDevSell.marketCapScanTimeoutMinutes != null
+          ? (defaults.automaticDevSell.marketCapScanTimeoutMinutes * 60)
+          : 30),
       marketCapTimeoutAction: defaults.automaticDevSell.marketCapTimeoutAction || "stop",
     }, { persist: false });
   }
@@ -5721,10 +6105,9 @@ function readForm() {
     automaticDevSellBlockOffset: String(getAutoSellBlockOffset()),
     automaticDevSellMarketCapEnabled: getAutoSellTriggerFamily() === "market-cap",
     automaticDevSellMarketCapThreshold: getNamedValue("automaticDevSellMarketCapThreshold") || "",
-    automaticDevSellMarketCapDirection: getNamedValue("automaticDevSellMarketCapDirection") || "gte",
     automaticDevSellMarketCapScanTimeoutSeconds: getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds")
       || getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes")
-      || "15",
+      || "30",
     automaticDevSellMarketCapTimeoutAction: getNamedValue("automaticDevSellMarketCapTimeoutAction") || "stop",
     vanityPrivateKey: getNamedValue("vanityPrivateKey") || "",
     imageFileName: uploadedImage ? uploadedImage.fileName : "",
@@ -5775,6 +6158,7 @@ function clearMetadataUploadCache({ clearInput = false } = {}) {
   metadataUploadState.lastCanPreupload = false;
   metadataUploadState.autoRetryFailures = 0;
   metadataUploadState.autoRetryDisabled = false;
+  metadataUploadState.lastAlertedWarning = "";
   if (clearInput && metadataUri) {
     metadataUri.value = "";
   }
@@ -5786,6 +6170,7 @@ function markMetadataUploadDirty() {
   metadataUploadState.completedFingerprint = "";
   metadataUploadState.autoRetryFailures = 0;
   metadataUploadState.autoRetryDisabled = false;
+  metadataUploadState.lastAlertedWarning = "";
   if (metadataUri) {
     metadataUri.value = "";
   }
@@ -5795,6 +6180,15 @@ function currentMetadataRetryDelayMs() {
   return metadataUploadState.autoRetryFailures >= 2
     ? METADATA_PREUPLOAD_DEBOUNCE_MS * 2
     : METADATA_PREUPLOAD_DEBOUNCE_MS;
+}
+
+function surfaceMetadataWarning(warning) {
+  const message = String(warning || "").trim();
+  if (!message) return;
+  imageStatus.textContent = message;
+  if (metadataUploadState.lastAlertedWarning === message) return;
+  metadataUploadState.lastAlertedWarning = message;
+  window.alert(message);
 }
 
 async function uploadMetadataForCurrentForm(source = "background") {
@@ -5847,10 +6241,11 @@ async function uploadMetadataForCurrentForm(source = "background") {
         metadataUploadState.completedFingerprint = fingerprint;
         metadataUploadState.autoRetryFailures = 0;
         metadataUploadState.autoRetryDisabled = false;
-        imageStatus.textContent = "Metadata ready.";
+        imageStatus.textContent = payload.metadataWarning ? payload.metadataWarning : "Metadata ready.";
       } else {
         metadataUploadState.staleWhileUploading = true;
       }
+      surfaceMetadataWarning(payload.metadataWarning);
       return payload.metadataUri || "";
     })
     .catch((error) => {
@@ -6042,10 +6437,10 @@ function applyBootstrapFastPayload(payload) {
   renderPlatformRuntimeIndicators();
   const previousWalletStatus = latestWalletStatus || null;
   const previousWallets = previousWalletStatus && Array.isArray(previousWalletStatus.wallets)
-    ? previousWalletStatus.wallets
+    ? normalizeVisibleWallets(previousWalletStatus.wallets)
     : [];
-  const nextWallets = Array.isArray(payload.wallets) && payload.wallets.length
-    ? payload.wallets.map((wallet) => {
+  const nextWallets = Array.isArray(payload.wallets)
+    ? normalizeVisibleWallets(payload.wallets).map((wallet) => {
         const previous = previousWallets.find((entry) => entry && entry.envKey === (wallet && wallet.envKey));
         return {
           ...(previous || {}),
@@ -6062,21 +6457,26 @@ function applyBootstrapFastPayload(payload) {
         };
       })
     : previousWallets;
+  const selectedWalletKeyValue = resolveVisibleSelectedWalletKey(
+    payload.selectedWalletKey || (previousWalletStatus && previousWalletStatus.selectedWalletKey) || "",
+    nextWallets,
+  );
+  const selectedWalletRecord = nextWallets.find((wallet) => wallet.envKey === selectedWalletKeyValue) || null;
   latestWalletStatus = {
     ...(previousWalletStatus || {}),
-    selectedWalletKey: payload.selectedWalletKey || (previousWalletStatus && previousWalletStatus.selectedWalletKey) || "",
+    selectedWalletKey: selectedWalletKeyValue,
     wallets: nextWallets,
-    wallet: payload.wallet || (previousWalletStatus && previousWalletStatus.wallet) || null,
-    connected: Boolean(payload.connected),
-    balanceLamports: payload.balanceLamports == null
-      ? ((previousWalletStatus && previousWalletStatus.balanceLamports) ?? null)
-      : payload.balanceLamports,
-    balanceSol: payload.balanceSol == null
-      ? ((previousWalletStatus && previousWalletStatus.balanceSol) ?? null)
-      : payload.balanceSol,
-    usd1Balance: payload.usd1Balance == null
-      ? ((previousWalletStatus && previousWalletStatus.usd1Balance) ?? null)
-      : payload.usd1Balance,
+    wallet: selectedWalletRecord ? selectedWalletRecord.publicKey : null,
+    connected: Boolean(selectedWalletRecord && selectedWalletRecord.publicKey),
+    balanceLamports: selectedWalletRecord && selectedWalletRecord.balanceLamports != null
+      ? selectedWalletRecord.balanceLamports
+      : null,
+    balanceSol: selectedWalletRecord && selectedWalletRecord.balanceSol != null
+      ? selectedWalletRecord.balanceSol
+      : null,
+    usd1Balance: selectedWalletRecord && selectedWalletRecord.usd1Balance != null
+      ? selectedWalletRecord.usd1Balance
+      : null,
     config: payload.config || (previousWalletStatus && previousWalletStatus.config) || null,
     regionRouting: payload.regionRouting || (previousWalletStatus && previousWalletStatus.regionRouting) || null,
     providers: payload.providers || (previousWalletStatus && previousWalletStatus.providers) || {},
@@ -6124,10 +6524,13 @@ function currentWarmActivityPayload() {
   return {
     creationProvider: providerSelect ? providerSelect.value : "",
     creationEndpointProfile: String(creationSettings.endpointProfile || "").trim(),
+    creationMevMode: normalizeMevMode(creationMevModeSelect ? creationMevModeSelect.value : "off", "off"),
     buyProvider: buyProviderSelect ? buyProviderSelect.value : "",
     buyEndpointProfile: String(buySettings.endpointProfile || "").trim(),
+    buyMevMode: normalizeMevMode(buyMevModeSelect ? buyMevModeSelect.value : "off", "off"),
     sellProvider: sellProviderSelect ? sellProviderSelect.value : "",
     sellEndpointProfile: String(sellSettings.endpointProfile || "").trim(),
+    sellMevMode: normalizeMevMode(sellMevModeSelect ? sellMevModeSelect.value : "off", "off"),
   };
 }
 
@@ -6415,17 +6818,35 @@ function activeFollowJobForTraceId(traceId) {
 }
 
 function applyWalletStatusPayload(payload) {
+  const normalizedWallets = normalizeVisibleWallets(payload.wallets || []);
+  const selectedWalletKeyValue = resolveVisibleSelectedWalletKey(
+    payload.selectedWalletKey || (latestWalletStatus && latestWalletStatus.selectedWalletKey) || "",
+    normalizedWallets,
+  );
+  const selectedWalletRecord = normalizedWallets.find((wallet) => wallet.envKey === selectedWalletKeyValue) || null;
   latestWalletStatus = {
     ...(latestWalletStatus || {}),
     ...payload,
+    selectedWalletKey: selectedWalletKeyValue,
+    wallets: normalizedWallets,
+    wallet: selectedWalletRecord ? selectedWalletRecord.publicKey : null,
+    connected: Boolean(selectedWalletRecord && selectedWalletRecord.publicKey),
+    balanceLamports: selectedWalletRecord && selectedWalletRecord.balanceLamports != null
+      ? selectedWalletRecord.balanceLamports
+      : null,
+    balanceSol: selectedWalletRecord && selectedWalletRecord.balanceSol != null
+      ? selectedWalletRecord.balanceSol
+      : null,
+    usd1Balance: selectedWalletRecord && selectedWalletRecord.usd1Balance != null
+      ? selectedWalletRecord.usd1Balance
+      : null,
     config: payload.config || (latestWalletStatus && latestWalletStatus.config) || null,
     regionRouting: payload.regionRouting || (latestWalletStatus && latestWalletStatus.regionRouting) || null,
     providers: payload.providers || (latestWalletStatus && latestWalletStatus.providers) || {},
     launchpads: payload.launchpads || (latestWalletStatus && latestWalletStatus.launchpads) || {},
   };
   const wallets = latestWalletStatus.wallets || [];
-  const selectedWalletKeyValue = latestWalletStatus.selectedWalletKey || "";
-  renderWalletOptions(wallets, selectedWalletKeyValue, latestWalletStatus.balanceSol);
+  renderWalletOptions(wallets, latestWalletStatus.selectedWalletKey || "", latestWalletStatus.balanceSol);
   renderSniperUI();
   markBootstrapState({ walletsLoaded: true });
   if (!latestWalletStatus.connected) {
@@ -6468,12 +6889,13 @@ async function bootstrapApp() {
   setBootOverlayMessage(null, "Syncing wallets, runtime status, and warm caches…");
   const startupWarmPromise = beginStartupWarmup().catch(() => {});
   const runtimeHydrationPromise = refreshRuntimeStatus().catch(() => {});
+  const walletStatusPromise = refreshWalletStatus(true, true).catch(() => {});
   refreshBagsIdentityStatus().catch(() => {});
   await Promise.allSettled([
     startupWarmPromise,
     runtimeHydrationPromise,
+    walletStatusPromise,
   ]);
-  await refreshWalletStatus(true, true).catch(() => {});
 }
 
 async function refreshRuntimeStatus() {
@@ -6752,9 +7174,9 @@ const fieldValidators = {
   },
   automaticDevSellMarketCapThreshold(v) {
     if (!isNamedChecked("automaticDevSellEnabled") || getAutoSellTriggerFamily() !== "market-cap") return "";
-    if (!String(v || "").trim()) return "Market cap is required";
+    if (!String(v || "").trim()) return "USD market cap is required";
     const normalized = parseAutoSellMarketCapThreshold(v);
-    if (!Number.isFinite(normalized) || normalized <= 0) return "Use a positive number like 100000 or 100k";
+    if (!Number.isFinite(normalized) || normalized <= 0) return "Use a positive USD amount like 100000 or 100k";
     return "";
   },
   automaticDevSellMarketCapScanTimeoutSeconds(v) {
@@ -7230,6 +7652,7 @@ async function run(action) {
     if (payload.metadataUri) {
       metadataUploadState.completedFingerprint = metadataFingerprintFromForm(readForm());
     }
+    surfaceMetadataWarning(payload.metadataWarning);
     output.textContent = payload.text;
     setBusy(false, currentStatusLabel());
     if (payload.sendLogPath) {
@@ -7257,6 +7680,11 @@ async function run(action) {
       }
     }
     if (actualAction === "send") {
+      if (formPayload && String(formPayload.vanityPrivateKey || "").trim()) {
+        if (vanityPrivateKeyText) vanityPrivateKeyText.value = "";
+        if (vanityModalError) vanityModalError.textContent = "";
+        applyVanityValue("", { publicKey: "" });
+      }
       refreshWalletStatus(true, true).catch(() => {});
     }
   } catch (error) {
@@ -7299,11 +7727,10 @@ function buildSavedConfigFromForm() {
       targetBlockOffset: Number(f.automaticDevSellBlockOffset || 0),
       marketCapEnabled: normalizeAutoSellTriggerFamily(f.automaticDevSellTriggerFamily) === "market-cap",
       marketCapThreshold: f.automaticDevSellMarketCapThreshold || "",
-      marketCapDirection: f.automaticDevSellMarketCapDirection || "gte",
       marketCapScanTimeoutSeconds: Number(
         f.automaticDevSellMarketCapScanTimeoutSeconds
-          || ((Number(f.automaticDevSellMarketCapScanTimeoutMinutes || 15) || 15) * 60)
-      ) || 15,
+          || ((Number(f.automaticDevSellMarketCapScanTimeoutMinutes || 0) || 0) * 60)
+      ) || 30,
       marketCapTimeoutAction: f.automaticDevSellMarketCapTimeoutAction || "stop",
     },
   };
@@ -7572,17 +7999,18 @@ function syncReportsTerminalChrome() {
 }
 
 function syncReportsTerminalLayoutHeight() {
-  if (!reportsTerminalSection || !form) return;
-  const shouldMatchFormHeight = reportsTerminalSection.classList.contains("is-active-logs-view")
-    && !isOutputSectionCurrentlyVisible();
-  if (!shouldMatchFormHeight) {
+  if (!reportsTerminalSection || !launchSurfaceCard) return;
+  const launchSurfaceHeight = Math.round(launchSurfaceCard.getBoundingClientRect().height || 0);
+  const outputVisible = Boolean(outputSection && !outputSection.hidden);
+  const outputHeight = outputVisible
+    ? Math.round(outputSection.getBoundingClientRect().height || 0)
+    : 0;
+  const measuredHeight = Math.max(0, launchSurfaceHeight - outputHeight);
+  if (measuredHeight <= 0) {
     reportsTerminalSection.style.removeProperty("--reports-terminal-match-height");
     return;
   }
-  const measuredHeight = Math.round(form.getBoundingClientRect().height || 0);
-  if (measuredHeight > 0) {
-    reportsTerminalSection.style.setProperty("--reports-terminal-match-height", `${measuredHeight}px`);
-  }
+  reportsTerminalSection.style.setProperty("--reports-terminal-match-height", `${measuredHeight}px`);
 }
 
 function metadataUriToGatewayUrl(uri) {
@@ -8239,7 +8667,7 @@ function formatReportLatencyDelta(startMs, endMs) {
 
 function reportStateClass(state) {
   const normalized = String(state || "").trim().toLowerCase();
-  if (["confirmed", "completed", "success", "healthy"].includes(normalized)) return "is-good";
+  if (["confirmed", "completed", "success", "healthy", "stopped"].includes(normalized)) return "is-good";
   if (["running", "eligible", "armed", "queued", "sent"].includes(normalized)) return "is-warn";
   if (["failed", "cancelled", "expired", "completed-with-failures"].includes(normalized)) return "is-bad";
   return "";
@@ -8542,7 +8970,7 @@ function renderReportMetricGrid(items = []) {
       ${visible.map((item) => `
         <div class="reports-metric-card${item.tone ? ` is-${escapeHTML(String(item.tone))}` : ""}">
           <span class="reports-metric-label">${escapeHTML(item.label || "")}</span>
-          <strong class="reports-metric-value">${escapeHTML(String(item.value))}</strong>
+          <strong class="reports-metric-value">${item.renderValue ? item.renderValue : escapeHTML(String(item.value))}</strong>
           ${item.detail ? `<span class="reports-metric-note">${escapeHTML(String(item.detail))}</span>` : ""}
         </div>
       `).join("")}
@@ -8577,7 +9005,13 @@ function buildReportsOverviewMarkup() {
   };
   const overviewCards = [
     { label: "Action", value: entry && entry.action ? entry.action : payload && payload.action ? payload.action : "--" },
-    { label: "Mint", value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--" },
+    {
+      label: "Mint",
+      value: entry && entry.mint ? shortenAddress(entry.mint, 6) : report && report.mint ? shortenAddress(report.mint, 6) : "--",
+      renderValue: entry && entry.mint
+        ? renderCopyableHash(entry.mint, "Copy mint")
+        : (report && report.mint ? renderCopyableHash(report.mint, "Copy mint") : "--"),
+    },
     { label: providerCardLabel, value: execution.resolvedProvider || execution.provider || "--" },
     { label: transportCardLabel, value: execution.transportType || (entry && entry.transportType) || "--" },
     { label: "Signatures", value: entry ? String(entry.signatureCount || 0) : String(Array.isArray(payload && payload.signatures) ? payload.signatures.length : 0) },
@@ -8998,7 +9432,7 @@ function formatFollowStateLabel(value) {
 
 function followStateBadgeTone(state) {
   const normalized = String(state || "").trim().toLowerCase();
-  if (["running", "sent", "confirmed", "completed"].includes(normalized)) return "is-good";
+  if (["running", "sent", "confirmed", "completed", "stopped"].includes(normalized)) return "is-good";
   if (["failed", "cancelled", "completed-with-failures", "expired"].includes(normalized)) return "is-bad";
   if (["armed", "eligible", "reserved"].includes(normalized)) return "is-warn";
   return "";
@@ -9033,15 +9467,17 @@ function summarizeFollowJobProgress(job) {
     }
     return accumulator;
   }, {});
-  const doneCount = (counts.confirmed || 0) + (counts.sent || 0);
+  const doneCount = (counts.confirmed || 0) + (counts.sent || 0) + (counts.stopped || 0);
   const activeCount = (counts.running || 0) + (counts.eligible || 0);
   const queuedCount = (counts.queued || 0) + (counts.armed || 0);
+  const stoppedCount = counts.stopped || 0;
   const failedCount = counts.failed || 0;
   const cancelledCount = counts.cancelled || 0;
   const expiredCount = counts.expired || 0;
   const parts = [`${doneCount}/${actions.length} done`];
   if (activeCount > 0) parts.push(`${activeCount} active`);
   if (queuedCount > 0) parts.push(`${queuedCount} queued`);
+  if (stoppedCount > 0) parts.push(`${stoppedCount} stopped`);
   if (failedCount > 0) parts.push(`${failedCount} failed`);
   if (cancelledCount > 0) parts.push(`${cancelledCount} cancelled`);
   if (expiredCount > 0) parts.push(`${expiredCount} expired`);
@@ -9834,10 +10270,6 @@ async function applyLaunchHistoryEntryToForm(id) {
     String(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.threshold ? devAutoSell.marketCap.threshold : "")
   );
   setNamedValue(
-    "automaticDevSellMarketCapDirection",
-    String(devAutoSell && devAutoSell.marketCap && devAutoSell.marketCap.direction ? devAutoSell.marketCap.direction : "gte")
-  );
-  setNamedValue(
     "automaticDevSellMarketCapScanTimeoutSeconds",
     String(
       devAutoSell
@@ -9846,7 +10278,7 @@ async function applyLaunchHistoryEntryToForm(id) {
         ? (devAutoSell.marketCap.scanTimeoutSeconds != null
           ? devAutoSell.marketCap.scanTimeoutSeconds
           : devAutoSell.marketCap.scanTimeoutMinutes * 60)
-        : 15
+        : 30
     )
   );
   setNamedValue(
@@ -10744,11 +11176,21 @@ if (agentSplitModal) {
   });
 }
 if (vanitySave) {
-  vanitySave.addEventListener("click", () => {
+  vanitySave.addEventListener("click", async () => {
     const nextValue = vanityPrivateKeyText ? vanityPrivateKeyText.value.trim() : "";
     if (vanityModalError) vanityModalError.textContent = "";
-    applyVanityValue(nextValue);
-    hideVanityModal();
+    try {
+      const payload = await validateVanityPrivateKey(nextValue);
+      applyVanityValue(
+        payload && payload.normalizedPrivateKey ? payload.normalizedPrivateKey : nextValue,
+        { publicKey: payload && payload.publicKey ? payload.publicKey : "" },
+      );
+      hideVanityModal();
+    } catch (error) {
+      if (vanityModalError) {
+        vanityModalError.textContent = error && error.message ? error.message : "Invalid vanity private key.";
+      }
+    }
   });
 }
 if (vanityClear) {
@@ -10794,7 +11236,7 @@ deployModal.addEventListener("click", (event) => {
 
 updateModeVisibility();
 updateJitoVisibility();
-syncDevAutoSellUI();
+hydrateDevAutoSellState();
 hydrateModeActionState();
 updateTokenFieldCounts();
 updateDescriptionDisclosure();

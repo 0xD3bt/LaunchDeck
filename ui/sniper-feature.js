@@ -76,7 +76,7 @@
       return {
         selected: Boolean(entry.selected),
         amountSol: normalizeDecimalInput(entry.amountSol || ""),
-        triggerMode,
+        triggerMode: entry && entry.triggerMode ? triggerMode : "block-offset",
         submitDelayMs: normalizeDelayMs(entry.submitDelayMs),
         targetBlockOffset: normalizeBlockOffset(entry.targetBlockOffset),
         retryOnce: Boolean(entry.retryOnce),
@@ -453,7 +453,7 @@
             </div>
             <div class="sniper-wallet-trigger-detail"${state.triggerMode === "block-offset" ? "" : " hidden"}>
               <div class="sniper-wallet-trigger-grid sniper-wallet-block-grid">
-                ${[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].map((offset) => `
+                ${[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23].map((offset) => `
                   <button type="button" class="sniper-trigger-chip${state.targetBlockOffset === offset ? " active" : ""}" data-sniper-block-offset="${escapeHTML(wallet.envKey)}" data-sniper-block-value="${offset}">${offset}</button>
                 `).join("")}
               </div>
@@ -517,8 +517,8 @@
         const delayMs = Number(entry.submitDelayMs || 0);
         if (entry.targetBlockOffset != null) {
           const blockOffset = Number(entry.targetBlockOffset);
-          if (!Number.isFinite(blockOffset) || blockOffset < 0 || blockOffset > 2) {
-            errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} needs block offset 0-5.`);
+          if (!Number.isFinite(blockOffset) || blockOffset < 0 || blockOffset > 23) {
+            errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} needs block offset 0-23.`);
           }
         } else if (!Number.isFinite(delayMs) || delayMs < 0 || delayMs > 1500) {
           errors.push(`Sniper wallet #${walletIndexFromEnvKey(entry.envKey)} needs delay 0-1500ms.`);
@@ -553,6 +553,9 @@
             ...normalizeWalletState(sniperState.wallets[envKey] || {}),
             selected: checkbox.checked,
             amountSol: checkbox.checked ? (sniperState.wallets[envKey] && sniperState.wallets[envKey].amountSol) || "" : "",
+            triggerMode: checkbox.checked
+              ? normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset")
+              : normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset"),
           };
           setModalError("");
           renderUI();
@@ -568,6 +571,7 @@
             ...normalizeWalletState(sniperState.wallets[envKey] || {}),
             selected: true,
             amountSol: normalized,
+            triggerMode: normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset"),
           };
           applyStateToForm();
           renderButtonState();
@@ -590,6 +594,7 @@
             ...normalizeWalletState(sniperState.wallets[envKey] || {}),
             selected: true,
             amountSol: amount,
+            triggerMode: normalizeTriggerMode((sniperState.wallets[envKey] && sniperState.wallets[envKey].triggerMode) || "block-offset"),
           };
           setModalError("");
           renderUI();

@@ -639,7 +639,7 @@ Additional network/infra endpoints:
 - Recommended LaunchDeck wording:
   - `Off`: fastest path, no Hello Moon MEV filtering, no `jitodontfront`.
   - `Reduced`: uses Hello Moon QUIC with `mev_protect=true` and adds `jitodontfront` where the transaction builder supports it.
-  - `Secure`: currently shown but disabled in the UI while that path is being worked on.
+  - `Secure`: uses the Hello Moon bundle path with stronger protection-focused routing, but slower execution and bundle-specific constraints.
 - Support Jito/Harmonic bundle control accounts as transaction modifiers, not as interchangeable provider-level guarantees.
 - Document clearly that protection semantics differ per provider and that `jitodontfront` is bundle-position protection, not universal chain-wide protection.
 

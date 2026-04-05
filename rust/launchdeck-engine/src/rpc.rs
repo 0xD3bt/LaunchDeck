@@ -833,11 +833,16 @@ async fn open_subscription_socket(endpoint: &str) -> Result<WsStream, String> {
         .map_err(|error| error.to_string())
 }
 
-async fn subscribe(ws: &mut WsStream, method: &str, params: Value) -> Result<(), String> {
+async fn send_jsonrpc_request(
+    ws: &mut WsStream,
+    request_id: i64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": request_id,
             "method": method,
             "params": params,
         })
@@ -848,13 +853,66 @@ async fn subscribe(ws: &mut WsStream, method: &str, params: Value) -> Result<(),
     .map_err(|error| error.to_string())?;
     loop {
         let payload = next_json_message(ws).await?;
-        if payload.get("id").and_then(Value::as_i64) == Some(1) {
+        if payload.get("id").and_then(Value::as_i64) == Some(request_id) {
             if payload.get("error").is_some() {
-                return Err(format!("Subscription failed: {payload}"));
+                return Err(format!("JSON-RPC request failed: {payload}"));
             }
-            return Ok(());
+            return Ok(payload);
         }
     }
+}
+
+async fn subscribe(ws: &mut WsStream, method: &str, params: Value) -> Result<(), String> {
+    send_jsonrpc_request(ws, 1, method, params).await.map(|_| ())
+}
+
+fn jsonrpc_subscription_id(payload: &Value, method: &str) -> Result<i64, String> {
+    payload
+        .get("result")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("{method} ack missing subscription id: {payload}"))
+}
+
+pub async fn prewarm_watch_websocket_endpoint(endpoint: &str) -> Result<(), String> {
+    let mut ws = open_subscription_socket(endpoint).await?;
+    let subscribe_payload =
+        send_jsonrpc_request(&mut ws, 70_001, "slotSubscribe", json!([])).await?;
+    let subscription_id = jsonrpc_subscription_id(&subscribe_payload, "slotSubscribe")?;
+    let _ = send_jsonrpc_request(&mut ws, 70_002, "slotUnsubscribe", json!([subscription_id]))
+        .await;
+    Ok(())
+}
+
+pub async fn prewarm_helius_transaction_subscribe_endpoint(endpoint: &str) -> Result<(), String> {
+    let mut ws = open_subscription_socket(endpoint).await?;
+    let subscribe_payload = send_jsonrpc_request(
+        &mut ws,
+        71_001,
+        "transactionSubscribe",
+        json!([
+            {
+                "failed": false,
+                "vote": false
+            },
+            {
+                "commitment": "processed",
+                "encoding": "jsonParsed",
+                "transactionDetails": "none",
+                "showRewards": false,
+                "maxSupportedTransactionVersion": 0
+            }
+        ]),
+    )
+    .await?;
+    let subscription_id = jsonrpc_subscription_id(&subscribe_payload, "transactionSubscribe")?;
+    let _ = send_jsonrpc_request(
+        &mut ws,
+        71_002,
+        "transactionUnsubscribe",
+        json!([subscription_id]),
+    )
+    .await;
+    Ok(())
 }
 
 async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
@@ -2445,6 +2503,30 @@ pub async fn prewarm_hellomoon_quic_endpoint(
     cached_hellomoon_quic_client(endpoint, &api_key, mev_protect)
         .await
         .map(|_| ())
+}
+
+pub async fn prewarm_hellomoon_bundle_endpoint(endpoint: &str) -> Result<(), String> {
+    let api_key = configured_hellomoon_api_key();
+    if api_key.trim().is_empty() {
+        return Err("Hello Moon bundle prewarm requires HELLOMOON_API_KEY.".to_string());
+    }
+    crate::observability::record_outbound_provider_http_request();
+    let response = shared_http_client()
+        .get(format!("{endpoint}?api-key={api_key}"))
+        .send()
+        .await
+        .map_err(|error| format!("Hello Moon bundle prewarm failed for {endpoint}: {error}"))?;
+    let status = response.status();
+    let _ = response.bytes().await.map_err(|error| {
+        format!("Hello Moon bundle prewarm body read failed for {endpoint}: {error}")
+    })?;
+    if status.is_server_error() {
+        return Err(format!(
+            "Hello Moon bundle prewarm failed for {endpoint}: status {}",
+            status
+        ));
+    }
+    Ok(())
 }
 
 async fn send_transaction_hellomoon_quic_endpoint(

@@ -70,8 +70,11 @@ use crate::{
     rpc::{
         CompiledTransaction, JitoWarmResult, configured_warm_rpc_url,
         confirm_submitted_transactions_for_transport, confirm_transactions_with_websocket_fallback,
-        fetch_current_block_height, prewarm_hellomoon_quic_endpoint, prewarm_jito_bundle_endpoint,
-        prewarm_rpc_endpoint, refresh_latest_blockhash_cache, send_transactions_bundle,
+        fetch_current_block_height, prewarm_helius_transaction_subscribe_endpoint,
+        prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
+        prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint,
+        prewarm_watch_websocket_endpoint, refresh_latest_blockhash_cache,
+        send_transactions_bundle,
         simulate_transactions, submit_independent_transactions_for_transport,
         submit_transactions_for_transport, submit_transactions_sequential,
     },
@@ -82,11 +85,16 @@ use crate::{
     strategies::strategy_registry,
     transport::{
         build_transport_plan, configured_helius_sender_endpoint,
+        configured_enable_helius_transaction_subscribe,
         configured_helius_sender_endpoints_for_profile, configured_hellomoon_mev_protect,
+        configured_hellomoon_bundle_endpoints_for_profile,
         configured_hellomoon_quic_endpoints_for_profile, configured_jito_bundle_endpoints,
         configured_jito_bundle_endpoints_for_profile, configured_provider_region,
+        prefers_helius_transaction_subscribe_path,
         configured_shared_region, configured_standard_rpc_submit_endpoints,
-        default_endpoint_profile, default_endpoint_profile_for_provider,
+        resolved_helius_transaction_subscribe_ws_url,
+        configured_watch_endpoints_for_provider, default_endpoint_profile,
+        default_endpoint_profile_for_provider,
         estimate_transaction_count, helius_sender_endpoint_override_active,
         jito_bundle_endpoint_override_active, resolved_helius_priority_fee_rpc_url,
     },
@@ -98,7 +106,7 @@ use crate::{
     wallet::{
         enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key,
         public_key_from_secret, selected_wallet_key_or_default,
-        selected_wallet_key_or_default_from_wallets,
+        selected_wallet_key_or_default_from_wallets, read_keypair_bytes,
     },
 };
 use axum::{
@@ -147,6 +155,7 @@ struct WarmControlState {
 struct WarmRouteSelection {
     provider: String,
     endpoint_profile: String,
+    hellomoon_mev_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -198,6 +207,20 @@ struct WarmTargetAttempt {
     result: WarmAttemptResult,
 }
 
+#[derive(Debug, Clone)]
+struct WatchWarmTarget {
+    label: String,
+    target: String,
+    transport: WatchWarmTransport,
+    fallback_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchWarmTransport {
+    StandardWs,
+    HeliusTransactionSubscribe,
+}
+
 #[derive(Deserialize, Default)]
 struct WarmActivityRequest {
     #[serde(default)]
@@ -207,17 +230,26 @@ struct WarmActivityRequest {
     #[serde(rename = "creationEndpointProfile")]
     creation_endpoint_profile: Option<String>,
     #[serde(default)]
+    #[serde(rename = "creationMevMode")]
+    creation_mev_mode: Option<String>,
+    #[serde(default)]
     #[serde(rename = "buyProvider")]
     buy_provider: Option<String>,
     #[serde(default)]
     #[serde(rename = "buyEndpointProfile")]
     buy_endpoint_profile: Option<String>,
     #[serde(default)]
+    #[serde(rename = "buyMevMode")]
+    buy_mev_mode: Option<String>,
+    #[serde(default)]
     #[serde(rename = "sellProvider")]
     sell_provider: Option<String>,
     #[serde(default)]
     #[serde(rename = "sellEndpointProfile")]
     sell_endpoint_profile: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "sellMevMode")]
+    sell_mev_mode: Option<String>,
 }
 
 struct WarmInFlightGuard {
@@ -608,6 +640,12 @@ struct VampRequest {
 
 #[allow(non_snake_case)]
 #[derive(Deserialize, Default)]
+struct VanityValidateRequest {
+    privateKey: Option<String>,
+}
+
+#[allow(non_snake_case)]
+#[derive(Deserialize, Default)]
 struct ImagesQuery {
     search: Option<String>,
     category: Option<String>,
@@ -780,24 +818,42 @@ fn normalize_warm_endpoint_profile(provider: &str, endpoint_profile: &str) -> St
         .unwrap_or_else(|_| default_endpoint_profile_for_provider(&normalized_provider))
 }
 
+fn normalize_warm_hellomoon_mev_mode(provider: &str, mev_mode: &str) -> String {
+    if provider != "hellomoon" {
+        return String::new();
+    }
+    if mev_mode.trim().eq_ignore_ascii_case("secure") {
+        "secure".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn push_unique_warm_route(
     values: &mut Vec<WarmRouteSelection>,
     provider: &str,
     endpoint_profile: &str,
+    mev_mode: &str,
 ) {
     let Some(provider) = normalize_warm_provider(provider) else {
         return;
     };
     let endpoint_profile = normalize_warm_endpoint_profile(&provider, endpoint_profile);
+    let hellomoon_mev_mode = normalize_warm_hellomoon_mev_mode(&provider, mev_mode);
     if values
         .iter()
-        .any(|entry| entry.provider == provider && entry.endpoint_profile == endpoint_profile)
+        .any(|entry| {
+            entry.provider == provider
+                && entry.endpoint_profile == endpoint_profile
+                && entry.hellomoon_mev_mode == hellomoon_mev_mode
+        })
     {
         return;
     }
     values.push(WarmRouteSelection {
         provider,
         endpoint_profile,
+        hellomoon_mev_mode,
     });
 }
 
@@ -829,10 +885,14 @@ fn configured_active_warm_routes() -> Vec<WarmRouteSelection> {
             .and_then(|value| value.get("endpointProfile"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        push_unique_warm_route(&mut routes, provider, endpoint_profile);
+        let mev_mode = settings
+            .and_then(|value| value.get("mevMode"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        push_unique_warm_route(&mut routes, provider, endpoint_profile, mev_mode);
     }
     if routes.is_empty() {
-        push_unique_warm_route(&mut routes, "helius-sender", "");
+        push_unique_warm_route(&mut routes, "helius-sender", "", "");
     }
     routes
 }
@@ -840,7 +900,12 @@ fn configured_active_warm_routes() -> Vec<WarmRouteSelection> {
 fn merged_warm_routes(selected: &[WarmRouteSelection]) -> Vec<WarmRouteSelection> {
     let mut routes = configured_active_warm_routes();
     for route in selected {
-        push_unique_warm_route(&mut routes, &route.provider, &route.endpoint_profile);
+        push_unique_warm_route(
+            &mut routes,
+            &route.provider,
+            &route.endpoint_profile,
+            &route.hellomoon_mev_mode,
+        );
     }
     routes
 }
@@ -855,22 +920,30 @@ fn warm_route_providers(routes: &[WarmRouteSelection]) -> Vec<String> {
 
 fn activity_routes(payload: &WarmActivityRequest) -> Vec<WarmRouteSelection> {
     let mut routes = Vec::new();
-    for (provider, endpoint_profile) in [
+    for (provider, endpoint_profile, mev_mode) in [
         (
             payload.creation_provider.as_deref(),
             payload.creation_endpoint_profile.as_deref(),
+            payload.creation_mev_mode.as_deref(),
         ),
         (
             payload.buy_provider.as_deref(),
             payload.buy_endpoint_profile.as_deref(),
+            payload.buy_mev_mode.as_deref(),
         ),
         (
             payload.sell_provider.as_deref(),
             payload.sell_endpoint_profile.as_deref(),
+            payload.sell_mev_mode.as_deref(),
         ),
     ] {
         if let Some(provider) = provider {
-            push_unique_warm_route(&mut routes, provider, endpoint_profile.unwrap_or_default());
+            push_unique_warm_route(
+                &mut routes,
+                provider,
+                endpoint_profile.unwrap_or_default(),
+                mev_mode.unwrap_or_default(),
+            );
         }
     }
     routes
@@ -885,11 +958,56 @@ fn startup_warm_routes(payload: &WarmActivityRequest) -> Vec<WarmRouteSelection>
     }
 }
 
-fn primary_standard_rpc_warm_endpoint(main_rpc_url: &str) -> String {
-    configured_standard_rpc_submit_endpoints()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| main_rpc_url.to_string())
+fn configured_standard_rpc_warm_endpoints(main_rpc_url: &str) -> Vec<String> {
+    let mut endpoints = configured_standard_rpc_submit_endpoints();
+    if endpoints.is_empty() {
+        endpoints.push(main_rpc_url.to_string());
+    }
+    endpoints
+}
+
+fn configured_watch_warm_targets(routes: &[WarmRouteSelection]) -> Vec<WatchWarmTarget> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    let helius_transaction_subscribe_enabled = configured_enable_helius_transaction_subscribe();
+    for route in routes {
+        for endpoint in configured_watch_endpoints_for_provider(&route.provider, &route.endpoint_profile)
+        {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if prefers_helius_transaction_subscribe_path(
+                helius_transaction_subscribe_enabled,
+                Some(trimmed),
+            ) {
+                if let Some(helius_endpoint) =
+                    resolved_helius_transaction_subscribe_ws_url(Some(trimmed))
+                {
+                    let key = format!("helius-transaction-subscribe:{helius_endpoint}");
+                    if seen.insert(key) {
+                        targets.push(WatchWarmTarget {
+                            label: "Helius transactionSubscribe WS".to_string(),
+                            target: helius_endpoint,
+                            transport: WatchWarmTransport::HeliusTransactionSubscribe,
+                            fallback_target: Some(trimmed.to_string()),
+                        });
+                    }
+                    continue;
+                }
+            }
+            let key = format!("standard-ws:{trimmed}");
+            if seen.insert(key) {
+                targets.push(WatchWarmTarget {
+                    label: "Watcher WS".to_string(),
+                    target: trimmed.to_string(),
+                    transport: WatchWarmTransport::StandardWs,
+                    fallback_target: None,
+                });
+            }
+        }
+    }
+    targets
 }
 
 fn warm_succeeded_recently(warm: &WarmControlState, now_ms: u128) -> bool {
@@ -909,8 +1027,12 @@ fn mark_operator_activity(state: &Arc<AppState>, routes: Vec<WarmRouteSelection>
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let route_matches_current = routes.is_empty() || routes == warm.selected_routes;
-    let should_trigger_immediate_rewarm = !warm_gate_state(&warm, now, 0).0
-        && !(route_matches_current && warm_succeeded_recently(&warm, now));
+    let warm_is_active = warm_gate_state(&warm, now, 0).0;
+    let should_trigger_immediate_rewarm = if !route_matches_current {
+        true
+    } else {
+        !warm_is_active && !warm_succeeded_recently(&warm, now)
+    };
     warm.last_activity_at_ms = now;
     warm.browser_active = true;
     if should_trigger_immediate_rewarm {
@@ -1017,6 +1139,7 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
     let selected_providers = warm_route_providers(&selected_routes);
     let state_targets = payload_warm_targets(&warm, "state", active);
     let endpoint_targets = payload_warm_targets(&warm, "endpoint", active);
+    let watch_targets = payload_warm_targets(&warm, "watch-endpoint", active);
     json!({
         "startupEnabled": configured_startup_warm_enabled(),
         "continuousEnabled": configured_continuous_warm_enabled(),
@@ -1039,6 +1162,7 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         "lastError": warm.last_error.clone(),
         "stateTargets": state_targets,
         "endpointTargets": endpoint_targets,
+        "watchTargets": watch_targets,
     })
 }
 
@@ -1123,22 +1247,23 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
     ));
 
     if routes.iter().any(|route| route.provider == "standard-rpc") {
-        let endpoint = primary_standard_rpc_warm_endpoint(&main_rpc_url);
-        let result = prewarm_rpc_endpoint(&endpoint).await;
-        match &result {
-            Ok(()) => success_count += 1,
-            Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
+        for endpoint in configured_standard_rpc_warm_endpoints(&main_rpc_url) {
+            let result = prewarm_rpc_endpoint(&endpoint).await;
+            match &result {
+                Ok(()) => success_count += 1,
+                Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
+            }
+            attempts.push(build_warm_target_attempt(
+                "endpoint",
+                Some("standard-rpc"),
+                "Standard RPC",
+                endpoint,
+                match result {
+                    Ok(()) => WarmAttemptResult::Success,
+                    Err(error) => WarmAttemptResult::Error(error),
+                },
+            ));
         }
-        attempts.push(build_warm_target_attempt(
-            "endpoint",
-            Some("standard-rpc"),
-            "Standard RPC",
-            endpoint,
-            match result {
-                Ok(()) => WarmAttemptResult::Success,
-                Err(error) => WarmAttemptResult::Error(error),
-            },
-        ));
     }
     if routes.iter().any(|route| route.provider == "helius-sender") {
         let mut seen = HashSet::new();
@@ -1173,12 +1298,20 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
         let mut seen = HashSet::new();
         let mev_protect = configured_hellomoon_mev_protect();
         for route in routes.iter().filter(|route| route.provider == "hellomoon") {
-            for endpoint in configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
-            {
+            let endpoints = if route.hellomoon_mev_mode == "secure" {
+                configured_hellomoon_bundle_endpoints_for_profile(&route.endpoint_profile)
+            } else {
+                configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
+            };
+            for endpoint in endpoints {
                 if !seen.insert(endpoint.clone()) {
                     continue;
                 }
-                let result = prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await;
+                let result = if route.hellomoon_mev_mode == "secure" {
+                    prewarm_hellomoon_bundle_endpoint(&endpoint).await
+                } else {
+                    prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await
+                };
                 match &result {
                     Ok(()) => success_count += 1,
                     Err(error) => errors.push(format!("hellomoon {}: {}", endpoint, error)),
@@ -1186,7 +1319,11 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
                 attempts.push(build_warm_target_attempt(
                     "endpoint",
                     Some("hellomoon"),
-                    "Hello Moon QUIC",
+                    if route.hellomoon_mev_mode == "secure" {
+                        "Hello Moon Bundle"
+                    } else {
+                        "Hello Moon QUIC"
+                    },
                     endpoint,
                     match result {
                         Ok(()) => WarmAttemptResult::Success,
@@ -1223,6 +1360,53 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
                         Ok(JitoWarmResult::RateLimited(message)) => {
                             WarmAttemptResult::RateLimited(message)
                         }
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
+    for target in configured_watch_warm_targets(&routes) {
+        let result = match target.transport {
+            WatchWarmTransport::StandardWs => prewarm_watch_websocket_endpoint(&target.target).await,
+            WatchWarmTransport::HeliusTransactionSubscribe => {
+                prewarm_helius_transaction_subscribe_endpoint(&target.target).await
+            }
+        };
+        match &result {
+            Ok(()) => success_count += 1,
+            Err(error) => errors.push(format!("watch-endpoint {}: {}", target.target, error)),
+        }
+        attempts.push(build_warm_target_attempt(
+            "watch-endpoint",
+            None,
+            &target.label,
+            target.target.clone(),
+            match result {
+                Ok(()) => WarmAttemptResult::Success,
+                Err(error) => WarmAttemptResult::Error(error),
+            },
+        ));
+        if target.transport == WatchWarmTransport::HeliusTransactionSubscribe
+            && attempts
+                .last()
+                .is_some_and(|attempt| matches!(attempt.result, WarmAttemptResult::Error(_)))
+        {
+            if let Some(fallback_endpoint) = target.fallback_target.as_deref() {
+                let fallback_result = prewarm_watch_websocket_endpoint(fallback_endpoint).await;
+                match &fallback_result {
+                    Ok(()) => success_count += 1,
+                    Err(error) => {
+                        errors.push(format!("watch-endpoint {}: {}", fallback_endpoint, error))
+                    }
+                }
+                attempts.push(build_warm_target_attempt(
+                    "watch-endpoint",
+                    None,
+                    "Watcher WS",
+                    fallback_endpoint.to_string(),
+                    match fallback_result {
+                        Ok(()) => WarmAttemptResult::Success,
                         Err(error) => WarmAttemptResult::Error(error),
                     },
                 ));
@@ -3210,6 +3394,7 @@ async fn compile_presigned_follow_actions(
                     && should_use_post_setup_creator_vault_for_buy(
                         matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
                         action,
+                        &normalized.execution.buyMevMode,
                     )
                 {
                     continue;
@@ -3236,6 +3421,12 @@ async fn compile_presigned_follow_actions(
                 if normalized.launchpad == "pump"
                     && action.walletEnvKey == normalized.selectedWalletKey =>
             {
+                let use_post_setup_creator_vault_for_sell =
+                    should_use_post_setup_creator_vault_for_sell(
+                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                        action,
+                        &normalized.execution.sellMevMode,
+                    );
                 let predicted_tokens = match predicted_dev_buy_tokens {
                     Some(value) => value,
                     None => {
@@ -3260,10 +3451,7 @@ async fn compile_presigned_follow_actions(
                         mint,
                         launch_creator,
                         sell_percent,
-                        should_use_post_setup_creator_vault_for_sell(
-                            matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
-                            action,
-                        ),
+                        use_post_setup_creator_vault_for_sell,
                         Some(predicted_tokens),
                         Some(normalized.mode == "cashback"),
                     )
@@ -3585,11 +3773,12 @@ async fn execute_engine_action_payload(
         }));
     }
     let form_prepare_started = Instant::now();
-    let (raw_config_value, prepared_metadata_uri, form_to_raw_config_ms) =
+    let (raw_config_value, prepared_metadata_uri, prepared_metadata_warning, form_to_raw_config_ms) =
         if let Some(raw_config_value) = payload.raw_config {
-            (raw_config_value, None, None)
+            (raw_config_value, None, None, None)
         } else if let Some(form_value) = payload.form.clone() {
-            let (raw_config, metadata_uri) = build_raw_config_from_form(&action, form_value)
+            let (raw_config, metadata_uri, metadata_warning) =
+                build_raw_config_from_form(&action, form_value)
                 .await
                 .map_err(|error| {
                     (
@@ -3614,6 +3803,7 @@ async fn execute_engine_action_payload(
             (
                 raw_config_value,
                 metadata_uri,
+                metadata_warning,
                 Some(form_prepare_started.elapsed().as_millis()),
             )
         } else {
@@ -3892,6 +4082,7 @@ async fn execute_engine_action_payload(
             "sendLogPath": send_log_path,
             "text": render_report_value(&report_value),
             "metadataUri": prepared_metadata_uri,
+            "metadataWarning": prepared_metadata_warning,
         }));
     }
     let compile_started_ms = current_time_ms();
@@ -4228,6 +4419,7 @@ async fn execute_engine_action_payload(
             "sendLogPath": send_log_path,
             "text": render_report_value(&report),
             "metadataUri": prepared_metadata_uri,
+            "metadataWarning": prepared_metadata_warning,
         }));
     }
 
@@ -4285,6 +4477,11 @@ async fn execute_engine_action_payload(
         let mut bags_setup_confirm_ms = 0u128;
         let mut follow_reserve_ms = 0u128;
         let mut follow_arm_ms = 0u128;
+        let must_complete_follow_reserve_before_send = deferred_follow_launch
+            .devAutoSell
+            .as_ref()
+            .and_then(|sell| sell.marketCap.as_ref())
+            .is_some();
         let prebuilt_follow_actions =
             if use_phased_follow_pipeline && deferred_follow_launch.enabled {
                 Some(
@@ -4510,6 +4707,42 @@ async fn execute_engine_action_payload(
         }
         if use_phased_follow_pipeline && !secure_hellomoon_bundle_transport {
             compiled_transactions = creation_transactions.clone();
+        }
+        if must_complete_follow_reserve_before_send {
+            if let Some(task) = reserve_follow_job_task.take() {
+                let (reserved, elapsed_ms) = task
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("Follow daemon reservation task failed: {error}"),
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?
+                    .map_err(|error| {
+                        record_error(
+                            "follow-client",
+                            "Follow daemon reservation failed.",
+                            Some(json!({
+                                "traceId": trace.traceId,
+                                "message": error,
+                            })),
+                        );
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("Follow daemon reservation failed: {error}"),
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?;
+                follow_reserve_ms = elapsed_ms;
+                reserved_follow_job = Some(reserved);
+            }
         }
         let submit_started_ms = current_time_ms();
         let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
@@ -5215,6 +5448,7 @@ async fn execute_engine_action_payload(
             "followDaemonArmed": armed_follow_job,
             "text": render_report_value(&report),
             "metadataUri": prepared_metadata_uri,
+            "metadataWarning": prepared_metadata_warning,
         }));
     }
 
@@ -5244,6 +5478,7 @@ async fn execute_engine_action_payload(
         "report": report_value,
         "text": text_value,
         "metadataUri": prepared_metadata_uri,
+        "metadataWarning": prepared_metadata_warning,
     }))
 }
 
@@ -5899,22 +6134,24 @@ async fn api_startup_warm(
         }),
     };
     let mut startup_endpoint_attempts = Vec::new();
+    let mut startup_watch_attempts = Vec::new();
     if selected_routes
         .iter()
         .any(|route| route.provider == "standard-rpc")
     {
-        let endpoint = primary_standard_rpc_warm_endpoint(&main_rpc_url);
-        let result = prewarm_rpc_endpoint(&endpoint).await;
-        startup_endpoint_attempts.push(build_warm_target_attempt(
-            "endpoint",
-            Some("standard-rpc"),
-            "Standard RPC",
-            endpoint,
-            match result {
-                Ok(()) => WarmAttemptResult::Success,
-                Err(error) => WarmAttemptResult::Error(error),
-            },
-        ));
+        for endpoint in configured_standard_rpc_warm_endpoints(&main_rpc_url) {
+            let result = prewarm_rpc_endpoint(&endpoint).await;
+            startup_endpoint_attempts.push(build_warm_target_attempt(
+                "endpoint",
+                Some("standard-rpc"),
+                "Standard RPC",
+                endpoint,
+                match result {
+                    Ok(()) => WarmAttemptResult::Success,
+                    Err(error) => WarmAttemptResult::Error(error),
+                },
+            ));
+        }
     }
     if selected_routes
         .iter()
@@ -5954,16 +6191,28 @@ async fn api_startup_warm(
             .iter()
             .filter(|route| route.provider == "hellomoon")
         {
-            for endpoint in configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
-            {
+            let endpoints = if route.hellomoon_mev_mode == "secure" {
+                configured_hellomoon_bundle_endpoints_for_profile(&route.endpoint_profile)
+            } else {
+                configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
+            };
+            for endpoint in endpoints {
                 if !seen.insert(endpoint.clone()) {
                     continue;
                 }
-                let result = prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await;
+                let result = if route.hellomoon_mev_mode == "secure" {
+                    prewarm_hellomoon_bundle_endpoint(&endpoint).await
+                } else {
+                    prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await
+                };
                 startup_endpoint_attempts.push(build_warm_target_attempt(
                     "endpoint",
                     Some("hellomoon"),
-                    "Hello Moon QUIC",
+                    if route.hellomoon_mev_mode == "secure" {
+                        "Hello Moon Bundle"
+                    } else {
+                        "Hello Moon QUIC"
+                    },
                     endpoint,
                     match result {
                         Ok(()) => WarmAttemptResult::Success,
@@ -6004,11 +6253,64 @@ async fn api_startup_warm(
             }
         }
     }
+    for target in configured_watch_warm_targets(&selected_routes) {
+        let result = match target.transport {
+            WatchWarmTransport::StandardWs => prewarm_watch_websocket_endpoint(&target.target).await,
+            WatchWarmTransport::HeliusTransactionSubscribe => {
+                prewarm_helius_transaction_subscribe_endpoint(&target.target).await
+            }
+        };
+        startup_watch_attempts.push(build_warm_target_attempt(
+            "watch-endpoint",
+            None,
+            &target.label,
+            target.target.clone(),
+            match result {
+                Ok(()) => WarmAttemptResult::Success,
+                Err(error) => WarmAttemptResult::Error(error),
+            },
+        ));
+        if target.transport == WatchWarmTransport::HeliusTransactionSubscribe
+            && startup_watch_attempts
+                .last()
+                .is_some_and(|attempt| matches!(attempt.result, WarmAttemptResult::Error(_)))
+        {
+            if let Some(fallback_endpoint) = target.fallback_target.as_deref() {
+                let fallback_result = prewarm_watch_websocket_endpoint(fallback_endpoint).await;
+                startup_watch_attempts.push(build_warm_target_attempt(
+                    "watch-endpoint",
+                    None,
+                    "Watcher WS",
+                    fallback_endpoint.to_string(),
+                    match fallback_result {
+                        Ok(()) => WarmAttemptResult::Success,
+                        Err(error) => WarmAttemptResult::Error(error),
+                    },
+                ));
+            }
+        }
+    }
     let startup_endpoint_payload = startup_endpoint_attempts
         .iter()
         .map(|attempt| {
             json!({
                 "provider": attempt.provider,
+                "label": attempt.label,
+                "target": attempt.target,
+                "ok": matches!(attempt.result, WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)),
+                "rateLimited": matches!(attempt.result, WarmAttemptResult::RateLimited(_)),
+                "error": match &attempt.result {
+                    WarmAttemptResult::Success => None::<String>,
+                    WarmAttemptResult::RateLimited(message) => Some(message.clone()),
+                    WarmAttemptResult::Error(error) => Some(error.clone()),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let startup_watch_payload = startup_watch_attempts
+        .iter()
+        .map(|attempt| {
+            json!({
                 "label": attempt.label,
                 "target": attempt.target,
                 "ok": matches!(attempt.result, WarmAttemptResult::Success | WarmAttemptResult::RateLimited(_)),
@@ -6097,6 +6399,21 @@ async fn api_startup_warm(
             })
         })
         .collect::<Vec<_>>();
+    let startup_watch_total = startup_watch_payload.len();
+    let startup_watch_healthy = startup_watch_payload
+        .iter()
+        .filter(|entry| entry.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        .count();
+    let startup_watch_failures = startup_watch_payload
+        .iter()
+        .filter(|entry| !entry.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        .map(|entry| {
+            json!({
+                "label": entry.get("label").and_then(Value::as_str).unwrap_or("Watcher WS warm"),
+                "error": entry.get("error").and_then(Value::as_str).unwrap_or("startup warm target failed"),
+            })
+        })
+        .collect::<Vec<_>>();
     let mut startup_attempts = vec![
         build_warm_target_attempt(
             "state",
@@ -6180,6 +6497,7 @@ async fn api_startup_warm(
         ),
     ];
     startup_attempts.extend(startup_endpoint_attempts.iter().cloned());
+    startup_attempts.extend(startup_watch_attempts.iter().cloned());
     let attempt_at_ms = current_time_ms() as u64;
     {
         let mut warm = state
@@ -6216,14 +6534,22 @@ async fn api_startup_warm(
                     "failing": startup_endpoint_total.saturating_sub(startup_endpoint_healthy),
                     "label": "Endpoint warm",
                 },
+                "watchTargets": {
+                    "total": startup_watch_total,
+                    "healthy": startup_watch_healthy,
+                    "failing": startup_watch_total.saturating_sub(startup_watch_healthy),
+                    "label": "Watcher WS warm",
+                },
                 "stateFailures": startup_state_failures,
                 "endpointFailures": startup_endpoint_failures,
+                "watchFailures": startup_watch_failures,
             },
             "lookupTables": lookup_tables_payload,
             "pumpGlobal": pump_global_payload,
             "bonkState": bonk_state_payload,
             "feeMarket": fee_market_payload,
             "endpointResults": startup_endpoint_payload,
+            "watchResults": startup_watch_payload,
         }),
         started_at_ms,
     ))
@@ -6767,7 +7093,7 @@ async fn api_metadata_upload(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let started_at_ms = current_time_ms();
     let form = payload.form.unwrap_or(Value::Null);
-    let metadata_uri = upload_metadata_from_form(form).await.map_err(|error| {
+    let metadata_outcome = upload_metadata_from_form(form).await.map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -6779,7 +7105,8 @@ async fn api_metadata_upload(
     Ok(Json(attach_timing(
         json!({
             "ok": true,
-            "metadataUri": metadata_uri,
+            "metadataUri": metadata_outcome.metadata_uri,
+            "metadataWarning": metadata_outcome.warning,
         }),
         started_at_ms,
     )))
@@ -6969,6 +7296,61 @@ async fn api_vamp_import(
         },
         "image": image,
         "warning": warning,
+    })))
+}
+
+async fn api_vanity_validate(
+    Json(payload): Json<VanityValidateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let private_key = payload.privateKey.unwrap_or_default();
+    if private_key.trim().is_empty() {
+        return Ok(Json(json!({ "ok": true })));
+    }
+    let bytes = read_keypair_bytes(private_key.trim()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("Invalid vanity private key: {error}"),
+            })),
+        )
+    })?;
+    let keypair = solana_sdk::signature::Keypair::try_from(bytes.as_slice()).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("Invalid vanity private key: {error}"),
+            })),
+        )
+    })?;
+    let keypair_bytes = keypair.to_bytes();
+    let public_key = bs58::encode(&keypair_bytes[32..]).into_string();
+    match crate::rpc::fetch_account_data(&configured_rpc_url(), &public_key, "confirmed").await {
+        Ok(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("This vanity address has already been used on-chain. Generate a fresh one. ({public_key})"),
+                })),
+            ));
+        }
+        Err(error) if error.contains("was not found.") => {}
+        Err(error) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("Unable to verify vanity private key availability: {error}"),
+                })),
+            ));
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "normalizedPrivateKey": bs58::encode(keypair_bytes).into_string(),
+        "publicKey": public_key,
     })))
 }
 
@@ -7169,6 +7551,7 @@ mod tests {
             vec![WarmRouteSelection {
                 provider: "standard-rpc".to_string(),
                 endpoint_profile: String::new(),
+                hellomoon_mev_mode: String::new(),
             }],
         );
         let warm = state
@@ -7183,8 +7566,76 @@ mod tests {
             vec![WarmRouteSelection {
                 provider: "standard-rpc".to_string(),
                 endpoint_profile: String::new(),
+                hellomoon_mev_mode: String::new(),
             }]
         );
+    }
+
+    #[test]
+    fn operator_activity_requests_immediate_rewarm_when_routes_change_while_active() {
+        let now_ms = current_time_ms();
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(1_000),
+            last_warm_success_at_ms: Some(now_ms.saturating_sub(1_000)),
+            current_reason: "active-operator-activity".to_string(),
+            selected_routes: vec![WarmRouteSelection {
+                provider: "helius-sender".to_string(),
+                endpoint_profile: "fra".to_string(),
+                hellomoon_mev_mode: String::new(),
+            }],
+            continuous_active: true,
+            ..WarmControlState::default()
+        });
+
+        let immediate = mark_operator_activity(
+            &state,
+            vec![WarmRouteSelection {
+                provider: "helius-sender".to_string(),
+                endpoint_profile: "ams".to_string(),
+                hellomoon_mev_mode: String::new(),
+            }],
+        );
+        let warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(immediate);
+        assert_eq!(
+            warm.selected_routes,
+            vec![WarmRouteSelection {
+                provider: "helius-sender".to_string(),
+                endpoint_profile: "ams".to_string(),
+                hellomoon_mev_mode: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn operator_activity_skips_immediate_rewarm_when_routes_match_and_warm_is_active() {
+        let now_ms = current_time_ms();
+        let routes = vec![WarmRouteSelection {
+            provider: "hellomoon".to_string(),
+            endpoint_profile: "ewr".to_string(),
+            hellomoon_mev_mode: "secure".to_string(),
+        }];
+        let state = test_state(WarmControlState {
+            last_activity_at_ms: now_ms.saturating_sub(1_000),
+            last_warm_success_at_ms: Some(now_ms.saturating_sub(1_000)),
+            current_reason: "active-operator-activity".to_string(),
+            selected_routes: routes.clone(),
+            continuous_active: true,
+            ..WarmControlState::default()
+        });
+
+        let immediate = mark_operator_activity(&state, routes.clone());
+        let warm = state
+            .warm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(!immediate);
+        assert_eq!(warm.selected_routes, routes);
     }
 
     #[test]
@@ -7192,10 +7643,13 @@ mod tests {
         let routes = activity_routes(&WarmActivityRequest {
             creation_provider: Some("helius-sender".to_string()),
             creation_endpoint_profile: Some("fra,ams".to_string()),
+            creation_mev_mode: None,
             buy_provider: Some("jito-bundle".to_string()),
             buy_endpoint_profile: Some("ny".to_string()),
+            buy_mev_mode: None,
             sell_provider: Some("standard-rpc".to_string()),
             sell_endpoint_profile: Some("eu".to_string()),
+            sell_mev_mode: None,
         });
         assert_eq!(
             routes,
@@ -7203,14 +7657,47 @@ mod tests {
                 WarmRouteSelection {
                     provider: "helius-sender".to_string(),
                     endpoint_profile: "fra,ams".to_string(),
+                    hellomoon_mev_mode: String::new(),
                 },
                 WarmRouteSelection {
                     provider: "jito-bundle".to_string(),
                     endpoint_profile: "ewr".to_string(),
+                    hellomoon_mev_mode: String::new(),
                 },
                 WarmRouteSelection {
                     provider: "standard-rpc".to_string(),
                     endpoint_profile: String::new(),
+                    hellomoon_mev_mode: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_routes_keep_distinct_hellomoon_secure_and_non_secure_routes() {
+        let routes = activity_routes(&WarmActivityRequest {
+            creation_provider: Some("hellomoon".to_string()),
+            creation_endpoint_profile: Some("ewr".to_string()),
+            creation_mev_mode: Some("reduced".to_string()),
+            buy_provider: Some("hellomoon".to_string()),
+            buy_endpoint_profile: Some("ewr".to_string()),
+            buy_mev_mode: Some("secure".to_string()),
+            sell_provider: None,
+            sell_endpoint_profile: None,
+            sell_mev_mode: None,
+        });
+        assert_eq!(
+            routes,
+            vec![
+                WarmRouteSelection {
+                    provider: "hellomoon".to_string(),
+                    endpoint_profile: "ewr".to_string(),
+                    hellomoon_mev_mode: String::new(),
+                },
+                WarmRouteSelection {
+                    provider: "hellomoon".to_string(),
+                    endpoint_profile: "ewr".to_string(),
+                    hellomoon_mev_mode: "secure".to_string(),
                 },
             ]
         );
@@ -7709,6 +8196,7 @@ async fn main() {
         .route("/api/images/categories", post(api_image_category_create))
         .route("/api/images/delete", post(api_image_delete))
         .route("/api/vamp", post(api_vamp_import))
+        .route("/api/vanity/validate", post(api_vanity_validate))
         .route("/engine/status", post(engine_status))
         .route("/engine/quote", post(engine_action))
         .route("/engine/build", post(engine_action))

@@ -39,11 +39,12 @@ use launchdeck_engine::{
     report::{FollowActionTimings, FollowJobTimings, configured_benchmark_mode},
     rpc::{
         confirm_submitted_transactions_for_transport, fetch_current_block_height,
-        fetch_current_block_height_fresh, spawn_blockhash_refresh_task,
-        submit_transactions_for_transport,
+        fetch_account_data, fetch_current_block_height_fresh, prewarm_watch_websocket_endpoint,
+        spawn_blockhash_refresh_task, submit_transactions_for_transport,
     },
     transport::{
-        TransportPlan, build_transport_plan, configured_watch_endpoints_for_provider,
+        TransportPlan, build_transport_plan, configured_enable_helius_transaction_subscribe,
+        configured_watch_endpoints_for_provider,
         prefers_helius_transaction_subscribe_path, resolved_helius_transaction_subscribe_ws_url,
     },
     wallet::{
@@ -51,12 +52,13 @@ use launchdeck_engine::{
         public_key_from_secret, selected_wallet_key_or_default,
     },
 };
+use reqwest::Client;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -67,6 +69,223 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
+const SOL_USD_PYTH_ACCOUNT: &str = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG";
+const USD_MICRO_DECIMALS: u32 = 6;
+const SOL_USD_PRICE_HTTP_URL: &str =
+    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+const SOL_USD_PRICE_CACHE_TTL_MS: u128 = 30_000;
+const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
+const PYTH_MAGIC: u32 = 0xa1b2c3d4;
+const PYTH_VERSION_2: u32 = 2;
+const PYTH_PRICE_ACCOUNT_TYPE: u32 = 3;
+const PYTH_PRICE_STATUS_UNKNOWN: u32 = 0;
+const PYTH_PRICE_STATUS_TRADING: u32 = 1;
+
+#[derive(Clone, Copy)]
+struct CachedSolUsdPrice {
+    micro_usd_per_sol: u64,
+    fetched_at_ms: u128,
+}
+
+fn sol_usd_price_cache() -> &'static StdMutex<Option<CachedSolUsdPrice>> {
+    static CACHE: OnceLock<StdMutex<Option<CachedSolUsdPrice>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(None))
+}
+
+fn configured_sol_usd_pyth_account() -> String {
+    env::var("LAUNCHDECK_SOL_USD_PYTH_ACCOUNT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| SOL_USD_PYTH_ACCOUNT.to_string())
+}
+
+fn configured_sol_usd_http_price_url() -> String {
+    env::var("LAUNCHDECK_SOL_USD_HTTP_PRICE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| SOL_USD_PRICE_HTTP_URL.to_string())
+}
+
+fn stable_quote_asset_decimals(quote_asset: &str) -> Option<u32> {
+    match quote_asset.trim().to_lowercase().as_str() {
+        "usd" | "usd1" | "usdc" | "usdt" => Some(6),
+        _ => None,
+    }
+}
+
+fn read_legacy_pyth_u32(data: &[u8], offset: usize) -> Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| "Pyth account data was shorter than expected.".to_string())?
+        .try_into()
+        .map_err(|_| "Failed to read u32 from Pyth account data.".to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_legacy_pyth_i32(data: &[u8], offset: usize) -> Result<i32, String> {
+    let bytes: [u8; 4] = data
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| "Pyth account data was shorter than expected.".to_string())?
+        .try_into()
+        .map_err(|_| "Failed to read i32 from Pyth account data.".to_string())?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn read_legacy_pyth_i64(data: &[u8], offset: usize) -> Result<i64, String> {
+    let bytes: [u8; 8] = data
+        .get(offset..offset.saturating_add(8))
+        .ok_or_else(|| "Pyth account data was shorter than expected.".to_string())?
+        .try_into()
+        .map_err(|_| "Failed to read i64 from Pyth account data.".to_string())?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn read_legacy_pyth_u64(data: &[u8], offset: usize) -> Result<u64, String> {
+    let bytes: [u8; 8] = data
+        .get(offset..offset.saturating_add(8))
+        .ok_or_else(|| "Pyth account data was shorter than expected.".to_string())?
+        .try_into()
+        .map_err(|_| "Failed to read u64 from Pyth account data.".to_string())?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn scale_value_between_decimals(value: u64, from_decimals: u32, to_decimals: u32) -> Result<u64, String> {
+    if from_decimals == to_decimals {
+        return Ok(value);
+    }
+    let factor = 10u128.pow(from_decimals.abs_diff(to_decimals));
+    let scaled = if from_decimals < to_decimals {
+        u128::from(value).saturating_mul(factor)
+    } else {
+        u128::from(value) / factor
+    };
+    u64::try_from(scaled).map_err(|_| "Scaled market-cap value overflowed u64.".to_string())
+}
+
+fn scale_pyth_price_to_decimals(price: i64, expo: i32, target_decimals: u32) -> Result<u64, String> {
+    if price <= 0 {
+        return Err(format!("SOL/USD oracle returned non-positive price {price}."));
+    }
+    let diff = target_decimals as i32 + expo;
+    let mut scaled = i128::from(price);
+    if diff >= 0 {
+        scaled = scaled
+            .checked_mul(10i128.pow(diff as u32))
+            .ok_or_else(|| "SOL/USD oracle price scaling overflowed.".to_string())?;
+    } else {
+        scaled /= 10i128.pow((-diff) as u32);
+    }
+    u64::try_from(scaled).map_err(|_| "Scaled SOL/USD oracle price overflowed u64.".to_string())
+}
+
+fn decimal_price_to_micro_usd(price: f64) -> Result<u64, String> {
+    if !price.is_finite() || price <= 0.0 {
+        return Err(format!("SOL/USD HTTP price returned invalid value {price}."));
+    }
+    let scaled = (price * 1_000_000_f64).round();
+    if !scaled.is_finite() || scaled <= 0.0 || scaled > u64::MAX as f64 {
+        return Err("Scaled SOL/USD HTTP price overflowed u64.".to_string());
+    }
+    Ok(scaled as u64)
+}
+
+fn sol_quote_units_to_usd_micros(quote_units: u64, micro_usd_per_sol: u64) -> Result<u64, String> {
+    let usd_micros =
+        (u128::from(quote_units) * u128::from(micro_usd_per_sol)) / LAMPORTS_PER_SOL;
+    u64::try_from(usd_micros).map_err(|_| "USD market-cap conversion overflowed u64.".to_string())
+}
+
+async fn fetch_sol_usd_micro_price_http() -> Result<u64, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("Failed to build SOL/USD HTTP client: {error}"))?;
+    let response = client
+        .get(configured_sol_usd_http_price_url())
+        .header("accept", "application/json")
+        .header("user-agent", "launchdeck/sol-usd-price")
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch SOL/USD HTTP price: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "SOL/USD HTTP price request failed with status {}.",
+            response.status()
+        ));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Failed to decode SOL/USD HTTP price response: {error}"))?;
+    let price = payload
+        .get("solana")
+        .and_then(|entry| entry.get("usd"))
+        .or_else(|| payload.get("usd"))
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "SOL/USD HTTP price response was missing a numeric usd field.".to_string())?;
+    decimal_price_to_micro_usd(price)
+}
+
+async fn fetch_sol_usd_micro_price(rpc_url: &str) -> Result<u64, String> {
+    let now_ms = now_ms();
+    if let Ok(cache) = sol_usd_price_cache().lock()
+        && let Some(entry) = *cache
+        && now_ms.saturating_sub(entry.fetched_at_ms) <= SOL_USD_PRICE_CACHE_TTL_MS
+    {
+        return Ok(entry.micro_usd_per_sol);
+    }
+    if let Ok(micro_usd_per_sol) = fetch_sol_usd_micro_price_http().await {
+        if let Ok(mut cache) = sol_usd_price_cache().lock() {
+            *cache = Some(CachedSolUsdPrice {
+                micro_usd_per_sol,
+                fetched_at_ms: now_ms,
+            });
+        }
+        return Ok(micro_usd_per_sol);
+    }
+    let price_account = configured_sol_usd_pyth_account();
+    let account_data = fetch_account_data(rpc_url, &price_account, "confirmed").await?;
+    let magic = read_legacy_pyth_u32(&account_data, 0)?;
+    let version = read_legacy_pyth_u32(&account_data, 4)?;
+    let account_type = read_legacy_pyth_u32(&account_data, 8)?;
+    if magic != PYTH_MAGIC || version != PYTH_VERSION_2 || account_type != PYTH_PRICE_ACCOUNT_TYPE {
+        return Err(format!(
+            "SOL/USD Pyth account {price_account} has an unexpected legacy account layout."
+        ));
+    }
+    let expo = read_legacy_pyth_i32(&account_data, 20)?;
+    let valid_slot = read_legacy_pyth_u64(&account_data, 40)?;
+    let price = read_legacy_pyth_i64(&account_data, 208)?;
+    let status = read_legacy_pyth_u32(&account_data, 224)?;
+    let publish_slot = read_legacy_pyth_u64(&account_data, 232)?;
+    if status != PYTH_PRICE_STATUS_TRADING && status != PYTH_PRICE_STATUS_UNKNOWN {
+        return Err(format!(
+            "SOL/USD oracle status is not trading (status={status}, valid_slot={valid_slot}, publish_slot={publish_slot})."
+        ));
+    }
+    let micro_usd_per_sol = scale_pyth_price_to_decimals(price, expo, USD_MICRO_DECIMALS)?;
+    if let Ok(mut cache) = sol_usd_price_cache().lock() {
+        *cache = Some(CachedSolUsdPrice {
+            micro_usd_per_sol,
+            fetched_at_ms: now_ms,
+        });
+    }
+    Ok(micro_usd_per_sol)
+}
+
+async fn quote_units_to_usd_micros(
+    rpc_url: &str,
+    quote_units: u64,
+    quote_asset: &str,
+) -> Result<u64, String> {
+    if let Some(decimals) = stable_quote_asset_decimals(quote_asset) {
+        return scale_value_between_decimals(quote_units, decimals, USD_MICRO_DECIMALS);
+    }
+    let micro_usd_per_sol = fetch_sol_usd_micro_price(rpc_url).await?;
+    sol_quote_units_to_usd_micros(quote_units, micro_usd_per_sol)
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -860,6 +1079,42 @@ fn build_follow_buy_precheck_action(
     }
 }
 
+fn job_uses_market_cap_trigger(job: &FollowJobRecord) -> bool {
+    job.actions.iter().any(|action| action.marketCap.is_some())
+}
+
+fn job_needs_sol_usd_reference(job: &FollowJobRecord) -> bool {
+    if !job_uses_market_cap_trigger(job) {
+        return false;
+    }
+    if job.launchpad == "pump" {
+        return true;
+    }
+    if job.launchpad == "bonk" {
+        return true;
+    }
+    stable_quote_asset_decimals(&job.quoteAsset).is_none()
+}
+
+async fn warm_market_cap_reference_data(state: &Arc<AppState>, job: &FollowJobRecord) {
+    if !job_needs_sol_usd_reference(job) {
+        return;
+    }
+    if let Err(error) = fetch_sol_usd_micro_price(&state.rpc_url).await {
+        record_warn(
+            "follow-daemon",
+            "Failed to warm SOL/USD price for market-cap follow job.",
+            Some(json!({
+                "traceId": job.traceId,
+                "jobId": job.jobId,
+                "launchpad": job.launchpad,
+                "quoteAsset": job.quoteAsset,
+                "error": error,
+            })),
+        );
+    }
+}
+
 async fn cached_action_precheck_result(
     state: &Arc<AppState>,
     quote_asset: &str,
@@ -1216,11 +1471,9 @@ fn spawn_wallet_precheck_monitor(state: Arc<AppState>) {
 }
 
 async fn validate_watch_endpoint(endpoint: &str) -> Result<(), String> {
-    timeout(Duration::from_secs(3), connect_async(endpoint))
+    timeout(Duration::from_secs(5), prewarm_watch_websocket_endpoint(endpoint))
         .await
-        .map_err(|_| format!("Timed out connecting to websocket endpoint: {endpoint}"))?
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|_| format!("Timed out warming websocket endpoint: {endpoint}"))?
 }
 
 async fn ensure_follow_request_prerequisites(
@@ -1439,6 +1692,7 @@ async fn reserve_job(
         .reserve_job(payload)
         .await
         .map_err(internal_error)?;
+    warm_market_cap_reference_data(&state, &job).await;
     record_info(
         "follow-daemon",
         "Reserved follow job.",
@@ -1479,6 +1733,7 @@ async fn arm_job(
         timings.armMs = Some(arm_started.elapsed().as_millis());
     })
     .await;
+    warm_market_cap_reference_data(&state, &job).await;
     spawn_job_if_needed(state.clone(), trace_id.clone()).await;
     let arm_task_state = state.clone();
     let arm_task_trace_id = trace_id.clone();
@@ -1839,6 +2094,7 @@ async fn restore_jobs(state: Arc<AppState>) {
     let _ = state.store.recover_jobs_for_restart().await;
     for job in state.store.list_jobs().await {
         if matches!(job.state, FollowJobState::Armed | FollowJobState::Running) {
+            warm_market_cap_reference_data(&state, &job).await;
             prepare_follow_job_buy_caches(state.clone(), &job).await;
             spawn_job_if_needed(state.clone(), job.traceId.clone()).await;
         }
@@ -2015,6 +2271,7 @@ async fn execute_action_with_retry(
         if matches!(
             action.state,
             FollowActionState::Confirmed
+                | FollowActionState::Stopped
                 | FollowActionState::Cancelled
                 | FollowActionState::Failed
                 | FollowActionState::Expired
@@ -2040,6 +2297,10 @@ async fn execute_action_with_retry(
                 sync_follow_job_report(&state, &trace_id).await;
                 sleep(Duration::from_millis(retry_delay_ms)).await;
                 continue;
+            }
+            if is_stopped_action_error(&error) {
+                record_action_stopped(&state, &current_job, &action, None).await;
+                return Ok(());
             }
             if is_expired_action_error(&error) {
                 record_action_expired(&state, &current_job, &action, &error).await;
@@ -2250,6 +2511,22 @@ async fn record_action_expired(
     sync_follow_job_report(state, &job.traceId).await;
 }
 
+async fn record_action_stopped(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    action: &FollowActionRecord,
+    reason: Option<&str>,
+) {
+    let _ = state
+        .store
+        .update_action(&job.traceId, &action.actionId, |record| {
+            record.state = FollowActionState::Stopped;
+            record.lastError = reason.map(str::to_string);
+        })
+        .await;
+    sync_follow_job_report(state, &job.traceId).await;
+}
+
 fn is_pump_creator_vault_retry_error(error: &str) -> bool {
     is_creator_vault_seed_mismatch(error) || is_pump_custom_2006_seed_mismatch(error)
 }
@@ -2264,6 +2541,7 @@ fn should_retry_action(job: &FollowJobRecord, action: &FollowActionRecord, error
     if matches!(
         action.state,
         FollowActionState::Sent
+            | FollowActionState::Stopped
             | FollowActionState::Confirmed
             | FollowActionState::Cancelled
             | FollowActionState::Expired
@@ -2383,6 +2661,16 @@ fn market_cap_scan_expired_error(action_id: &str, scan_timeout_seconds: u64) -> 
     format!(
         "__expired__ market-cap scan window elapsed for {action_id} after {scan_timeout_seconds} second(s)."
     )
+}
+
+fn market_cap_scan_stopped_notice(action_id: &str, scan_timeout_seconds: u64) -> String {
+    format!(
+        "__stopped__ market-cap scan stopped for {action_id} after {scan_timeout_seconds} second(s)."
+    )
+}
+
+fn is_stopped_action_error(error: &str) -> bool {
+    error.trim().starts_with("__stopped__")
 }
 
 fn is_expired_action_error(error: &str) -> bool {
@@ -2525,11 +2813,15 @@ async fn execute_action(
         .as_deref()
         .ok_or_else(|| "Follow job missing launch creator.".to_string())?;
     let compile_started = Instant::now();
-    let prefer_post_setup_creator_vault_for_buy =
-        should_use_post_setup_creator_vault_for_buy(job.preferPostSetupCreatorVaultForSell, action);
+    let prefer_post_setup_creator_vault_for_buy = should_use_post_setup_creator_vault_for_buy(
+        job.preferPostSetupCreatorVaultForSell,
+        action,
+        &job.execution.buyMevMode,
+    );
     let prefer_post_setup_creator_vault_for_sell = should_use_post_setup_creator_vault_for_sell(
         job.preferPostSetupCreatorVaultForSell,
         action,
+        &job.execution.sellMevMode,
     );
     let sell_percent = match action.kind {
         FollowActionKind::DevAutoSell | FollowActionKind::SniperSell => Some(
@@ -3501,17 +3793,6 @@ async fn ensure_market_watcher(
     hub.market_tx.subscribe()
 }
 
-fn configured_enable_helius_transaction_subscribe() -> bool {
-    matches!(
-        env::var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 async fn capture_action_watcher_metadata(
     state: &Arc<AppState>,
     job: &FollowJobRecord,
@@ -3681,20 +3962,49 @@ async fn recompute_market_cap_for_job(
 ) -> Result<u64, String> {
     if job.launchpad == "bonk" {
         let snapshot = fetch_bonk_market_snapshot(&state.rpc_url, mint, &job.quoteAsset).await?;
-        return snapshot
+        let quote_units = snapshot
             .marketCapLamports
             .parse::<u64>()
-            .map_err(|error| format!("Invalid Bonk market cap payload: {error}"));
+            .map_err(|error| format!("Invalid Bonk market cap payload: {error}"))?;
+        return quote_units_to_usd_micros(
+            &state.rpc_url,
+            quote_units,
+            if snapshot.quoteAsset.trim().is_empty() {
+                &job.quoteAsset
+            } else {
+                &snapshot.quoteAsset
+            },
+        )
+        .await;
     }
     if job.launchpad == "bagsapp" {
         let snapshot = fetch_bags_market_snapshot(&state.rpc_url, mint).await?;
-        return snapshot
+        let quote_units = snapshot
             .marketCapLamports
             .parse::<u64>()
-            .map_err(|error| format!("Invalid Bags market cap payload: {error}"));
+            .map_err(|error| format!("Invalid Bags market cap payload: {error}"))?;
+        return quote_units_to_usd_micros(
+            &state.rpc_url,
+            quote_units,
+            if snapshot.quoteAsset.trim().is_empty() {
+                &job.quoteAsset
+            } else {
+                &snapshot.quoteAsset
+            },
+        )
+        .await;
     }
     let snapshot = fetch_pump_market_snapshot(&state.rpc_url, mint).await?;
-    Ok(snapshot.marketCapLamports)
+    quote_units_to_usd_micros(
+        &state.rpc_url,
+        snapshot.marketCapLamports,
+        if snapshot.quoteAsset.trim().is_empty() {
+            "sol"
+        } else {
+            snapshot.quoteAsset.as_str()
+        },
+    )
+    .await
 }
 
 fn market_watch_account(job: &FollowJobRecord, mint: &str) -> Result<String, String> {
@@ -3825,6 +4135,30 @@ async fn run_helius_transaction_market_watcher_session(
             None,
         )
         .await;
+    }
+}
+
+async fn run_market_watcher_polling_session(
+    state: &Arc<AppState>,
+    job: &FollowJobRecord,
+    tx: &watch::Sender<Option<Result<u64, String>>>,
+    mint: &str,
+    note: Option<String>,
+) -> Result<(), String> {
+    loop {
+        ensure_job_not_cancelled(state, &job.traceId).await?;
+        let market_cap = recompute_market_cap_for_job(state, job, mint).await?;
+        let _ = tx.send(Some(Ok(market_cap)));
+        set_watcher_health(
+            state,
+            WatcherKind::Market,
+            FollowWatcherHealth::Healthy,
+            Some("rpc-polling".to_string()),
+            Some(state.rpc_url.clone()),
+            note.clone(),
+        )
+        .await;
+        sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -4128,69 +4462,111 @@ async fn run_market_watcher(
         let _ = tx.send(Some(Err("Market watcher missing mint.".to_string())));
         return;
     };
-    let Ok(endpoint) = resolve_job_watch_endpoint(&job) else {
-        let _ = tx.send(Some(Err(
-            "Missing watch endpoint for market watcher.".to_string()
-        )));
-        return;
-    };
+    let watch_endpoint = resolve_job_watch_endpoint(&job).ok();
     let mut attempt: u32 = 0;
     let prefers_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
         configured_enable_helius_transaction_subscribe(),
-        Some(&endpoint),
+        watch_endpoint.as_deref(),
     );
     loop {
-        let session = if prefers_helius_transaction_subscribe {
-            let hel_ws = resolved_helius_transaction_subscribe_ws_url(Some(&endpoint))
-                .expect("Helius transactionSubscribe enabled but HELIUS_WS_URL / Helius watch endpoint is missing");
-            set_watcher_health(
-                &state,
-                WatcherKind::Market,
-                FollowWatcherHealth::Healthy,
-                Some("helius-transaction-subscribe".to_string()),
-                Some(hel_ws.clone()),
-                None,
-            )
-            .await;
-            match run_helius_transaction_market_watcher_session(&state, &job, &tx, &hel_ws, &mint)
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    let fallback_note = format!(
-                        "Helius transactionSubscribe market watcher failed: {error}. Falling back to standard websocket."
-                    );
-                    set_watcher_health(
-                        &state,
-                        WatcherKind::Market,
-                        FollowWatcherHealth::Healthy,
-                        Some("standard-ws".to_string()),
-                        Some(endpoint.clone()),
-                        Some(fallback_note.clone()),
-                    )
-                    .await;
-                    run_standard_market_watcher_session(
-                        &state,
-                        &job,
-                        &tx,
-                        &endpoint,
-                        &mint,
-                        Some(fallback_note),
-                    )
+        let session = if let Some(endpoint) = watch_endpoint.as_deref() {
+            if prefers_helius_transaction_subscribe {
+                let hel_ws = resolved_helius_transaction_subscribe_ws_url(Some(endpoint))
+                    .expect("Helius transactionSubscribe enabled but HELIUS_WS_URL / Helius watch endpoint is missing");
+                set_watcher_health(
+                    &state,
+                    WatcherKind::Market,
+                    FollowWatcherHealth::Healthy,
+                    Some("helius-transaction-subscribe".to_string()),
+                    Some(hel_ws.clone()),
+                    None,
+                )
+                .await;
+                match run_helius_transaction_market_watcher_session(&state, &job, &tx, &hel_ws, &mint)
                     .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let fallback_note = format!(
+                            "Helius transactionSubscribe market watcher failed: {error}. Falling back to standard websocket."
+                        );
+                        set_watcher_health(
+                            &state,
+                            WatcherKind::Market,
+                            FollowWatcherHealth::Healthy,
+                            Some("standard-ws".to_string()),
+                            Some(endpoint.to_string()),
+                            Some(fallback_note.clone()),
+                        )
+                        .await;
+                        match run_standard_market_watcher_session(
+                            &state,
+                            &job,
+                            &tx,
+                            endpoint,
+                            &mint,
+                            Some(fallback_note.clone()),
+                        )
+                        .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                let fallback_note = format!(
+                                    "{fallback_note} Standard websocket market watcher failed: {error}. Falling back to RPC polling."
+                                );
+                                run_market_watcher_polling_session(
+                                    &state,
+                                    &job,
+                                    &tx,
+                                    &mint,
+                                    Some(fallback_note),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                }
+            } else {
+                set_watcher_health(
+                    &state,
+                    WatcherKind::Market,
+                    FollowWatcherHealth::Healthy,
+                    Some("standard-ws".to_string()),
+                    Some(endpoint.to_string()),
+                    None,
+                )
+                .await;
+                match run_standard_market_watcher_session(&state, &job, &tx, endpoint, &mint, None)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let fallback_note = format!(
+                            "Standard websocket market watcher failed: {error}. Falling back to RPC polling."
+                        );
+                        run_market_watcher_polling_session(
+                            &state,
+                            &job,
+                            &tx,
+                            &mint,
+                            Some(fallback_note),
+                        )
+                        .await
+                    }
                 }
             }
         } else {
-            set_watcher_health(
+            run_market_watcher_polling_session(
                 &state,
-                WatcherKind::Market,
-                FollowWatcherHealth::Healthy,
-                Some("standard-ws".to_string()),
-                Some(endpoint.clone()),
-                None,
+                &job,
+                &tx,
+                &mint,
+                Some(
+                    "No websocket watch endpoint configured for market watcher. Falling back to RPC polling."
+                        .to_string(),
+                ),
             )
-            .await;
-            run_standard_market_watcher_session(&state, &job, &tx, &endpoint, &mint, None).await
+            .await
         };
         match session {
             Ok(()) => return,
@@ -4201,7 +4577,7 @@ async fn run_market_watcher(
                     &state,
                     &job.traceId,
                     WatcherKind::Market,
-                    &endpoint,
+                    watch_endpoint.as_deref().unwrap_or(&state.rpc_url),
                     attempt,
                     error,
                 )
@@ -4317,6 +4693,14 @@ async fn wait_for_market_cap_trigger(
             trigger.threshold
         )
     })?;
+    let mint = job
+        .mint
+        .as_deref()
+        .ok_or_else(|| "Market watcher missing mint.".to_string())?;
+    let current_market_cap = recompute_market_cap_for_job(&state, job, mint).await?;
+    if current_market_cap >= threshold {
+        return Ok(());
+    }
     let timeout_deadline =
         tokio::time::Instant::now() + Duration::from_secs(trigger.scanTimeoutSeconds);
     let mut rx = ensure_market_watcher(state.clone(), job).await;
@@ -4328,7 +4712,7 @@ async fn wait_for_market_cap_trigger(
                 return Ok(());
             }
             capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market).await;
-            return Err(market_cap_scan_expired_error(
+            return Err(market_cap_scan_stopped_notice(
                 action_id,
                 trigger.scanTimeoutSeconds,
             ));
@@ -4337,11 +4721,7 @@ async fn wait_for_market_cap_trigger(
         if let Some(result) = current_market_cap {
             match result {
                 Ok(market_cap) => {
-                    let matches = match trigger.direction.as_str() {
-                        "lte" => market_cap <= threshold,
-                        _ => market_cap >= threshold,
-                    };
-                    if matches {
+                    if market_cap >= threshold {
                         let current_health = state.store.health().await;
                         set_watcher_health(
                             &state,
@@ -4381,7 +4761,7 @@ async fn wait_for_market_cap_trigger(
                     return Ok(());
                 }
                 capture_action_watcher_metadata(&state, job, action_id, WatcherKind::Market).await;
-                return Err(market_cap_scan_expired_error(
+                return Err(market_cap_scan_stopped_notice(
                     action_id,
                     trigger.scanTimeoutSeconds,
                 ));
@@ -4627,6 +5007,34 @@ mod tests {
             "sellMaxTipSol": ""
         }))
         .expect("sample execution should deserialize")
+    }
+
+    #[test]
+    fn market_cap_threshold_scaling_uses_usd_micro_units() {
+        assert_eq!(
+            scale_value_between_decimals(100_000_000_000, 6, 6).expect("same scale"),
+            100_000_000_000
+        );
+        assert_eq!(
+            sol_quote_units_to_usd_micros(1_000_000_000, 150_000_000).expect("1 SOL in micros"),
+            150_000_000
+        );
+    }
+
+    #[test]
+    fn pyth_price_scaling_matches_micro_usd_target() {
+        assert_eq!(
+            scale_pyth_price_to_decimals(14_512_345_678, -8, 6).expect("scaled price"),
+            145_123_456
+        );
+    }
+
+    #[test]
+    fn http_price_scaling_matches_micro_usd_target() {
+        assert_eq!(
+            decimal_price_to_micro_usd(79.36).expect("scaled http price"),
+            79_360_000
+        );
     }
 
     fn sample_job() -> FollowJobRecord {
@@ -5096,7 +5504,9 @@ mod tests {
             poolId: None,
             timings: FollowActionTimings::default(),
         };
-        assert!(!should_use_post_setup_creator_vault_for_sell(true, &action));
+        assert!(!should_use_post_setup_creator_vault_for_sell(
+            true, &action, "reduced"
+        ));
     }
 
     #[test]

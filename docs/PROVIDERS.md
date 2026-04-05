@@ -1,8 +1,12 @@
 # Providers
 
-This page explains the current execution providers exposed in LaunchDeck, what they are good for, and the rules the engine enforces when you select them.
+This page explains the execution providers exposed in LaunchDeck, how routing works, and which endpoint groups are currently used.
 
-## Supported Provider IDs
+For the recommended overall setup, start with `docs/CONFIG.md`. This page is the routing and provider reference.
+
+## Current provider IDs
+
+LaunchDeck currently exposes:
 
 - `helius-sender`
 - `hellomoon`
@@ -12,15 +16,20 @@ This page explains the current execution providers exposed in LaunchDeck, what t
 User-facing labels:
 
 - `Helius Sender`
-- `Hello Moon QUIC`
+- `Hello Moon`
 - `Standard RPC`
 - `Jito Bundle`
 
-All four providers are active in the runtime registry, but `Helius Sender` remains the current default recommendation for most operators.
+Current recommendation:
 
-## How Provider Resolution Works
+- start with `Helius Sender`
+- use `Hello Moon` when you want a strong alternate low-latency path
+- use `Standard RPC` when you want plain RPC behavior
+- use `Jito Bundle` when you explicitly want bundle semantics
 
-LaunchDeck lets you choose provider settings separately for:
+## Provider resolution
+
+LaunchDeck lets you choose send settings separately for:
 
 - creation
 - buy
@@ -29,71 +38,228 @@ LaunchDeck lets you choose provider settings separately for:
 From those selections, the engine resolves:
 
 - the provider actually used
-- the execution class: `single`, `sequential`, or `bundle`
 - the transport type
-- endpoint or endpoint profile
-- send requirements such as tip, preflight behavior, and ordering
+- the endpoint profile
+- whether the send is single, sequential, or bundle-based
+- provider-specific requirements such as tip, priority fee, and preflight rules
 
-The UI stores your intent. The engine decides final wire behavior.
+The UI stores your intent. The engine owns the final wire behavior.
 
-## Provider Profiles
+## Send path vs watcher path
 
-Only these providers support endpoint profiles:
+These are not the same thing.
+
+- `execution.provider`, `execution.buyProvider`, and `execution.sellProvider` decide how transactions are sent
+- `SOLANA_WS_URL` decides which websocket watcher path the follow daemon uses
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` only affects the watcher websocket path
+
+That means:
+
+- a launch can send with `jito-bundle` and still use Helius watchers
+- a launch can send with `hellomoon` and still use Helius watchers
+- watcher warm is based on the active watcher websocket, not on provider-region fanout
+
+## Endpoint profiles
+
+Providers with endpoint-profile support:
 
 - `Helius Sender`
-- `Hello Moon QUIC`
+- `Hello Moon`
 - `Jito Bundle`
 
-Supported profile values:
+Supported profile tokens:
 
 - `global`
 - `us`
 - `eu`
 - `asia`
-- Metro codes (Helius regional senders; Jito uses the same tokens to filter block-engine bases; Hello Moon maps them onto its nearest published regions): `slc`, `ewr`, `lon`, `fra`, `ams`, `sg`, `tyo`
-- Optional comma-separated metro lists (e.g. `fra,ams`)
-- `ny` accepted as an alias for Newark (`ewr` for Helius Sender; Jito `ny.` hosts)
+- `slc`
+- `ewr`
+- `lon`
+- `fra`
+- `ams`
+- `sg`
+- `tyo`
+- comma-separated lists such as `fra,ams`
 
-The former `west` aggregate is removed—use `us`, `eu`, or explicit metros.
+`ny` is still accepted as an alias for Newark / New York style mappings where applicable.
 
-When a profile is selected, LaunchDeck fans out across the endpoints in that selected group or metro set. It does not simply pick one endpoint.
+Resolution order:
 
-For most operators, this is the recommended setup. Using `USER_REGION` or a provider-specific region override is usually faster and more reliable than pinning a single endpoint because the runtime can fan out across the selected endpoint set instead of depending on one host.
-
-Region resolution order:
-
-1. provider-specific override such as `USER_REGION_HELIUS_SENDER` or `USER_REGION_HELLOMOON`
+1. provider-specific region override such as `USER_REGION_HELIUS_SENDER`
 2. shared `USER_REGION`
-3. provider default or global fallback
+3. provider fallback
 
-If you set explicit endpoint overrides, profile-based routing is bypassed. Use explicit endpoints only when you have a specific reason to force one host or one private integration.
+If you set explicit endpoint overrides, profile routing is bypassed.
 
-### Helius Sender regional endpoints
+## Routing behavior by provider
 
-When `HELIUS_SENDER_ENDPOINT` / `HELIUS_SENDER_BASE_URL` are unset, profile fanout uses Helius regional Sender HTTP hosts (each submit path ends in `/fast`). The mapping is:
+### Helius Sender
 
-| Profile | Sender hosts used |
-| --- | --- |
-| `global` | default `sender.helius-rpc.com` |
-| `us` | `slc-sender`, `ewr-sender` |
-| `eu` | `fra-sender`, `ams-sender` |
-| `asia` | `sg-sender`, `tyo-sender` |
-| Single metro (e.g. `fra`, `lon`) | that region’s `*-sender` host only |
-| Comma metros (e.g. `fra,lon`) | the union of those regional hosts |
+Helius Sender supports exact metro routing where those metros exist.
 
-London (`lon-sender`) is available only when you set `lon`, `eu` (which is fra+ams only), or an explicit list that includes `lon`. Override envs still bypass this table.
+Grouped profiles:
 
-## Full endpoint catalog (reference)
+- `global`: global Sender front door
+- `us`: Salt Lake City + Newark
+- `eu`: Frankfurt + Amsterdam
+- `asia`: Singapore + Tokyo
 
-This section lists **concrete URLs** operators may plug into env vars or provider-specific overrides. It matches what the LaunchDeck engine uses by default where applicable, and vendor-published endpoints elsewhere—hostnames can change, so verify with each provider’s documentation if something stops resolving.
+Exact metros:
 
-### Helius Sender (execution)
+- `slc`
+- `ewr`
+- `lon`
+- `fra`
+- `ams`
+- `sg`
+- `tyo`
 
-Used when `execution.provider` is `helius-sender`. Send path is always `…/fast`; LaunchDeck’s Sender **warm** path uses **`…/ping`** on the same host (not JSON-RPC).
+### Hello Moon
+
+Hello Moon supports region-aware routing, but it does not expose every metro that Helius Sender does.
+
+Current mapping:
+
+- `global` -> global Hello Moon endpoint
+- `eu` -> Frankfurt + Amsterdam
+- `fra` -> Frankfurt
+- `ams` -> Amsterdam
+- `us` -> New York + Ashburn
+- `slc` -> New York + Ashburn
+- `ewr` -> New York + Ashburn
+- `asia` -> Tokyo
+- `sg` -> Tokyo
+- `tyo` -> Tokyo
+- `lon` -> Frankfurt + Amsterdam
+
+That means Helius Sender exact-metro routing is more precise than Hello Moon exact-metro routing in US, London, and Singapore cases.
+
+### Jito Bundle
+
+Jito Bundle uses the same profile tokens for regional filtering of its block-engine hosts.
+
+In practice:
+
+- `us` filters to the US Jito hosts
+- `eu` filters to the EU Jito hosts
+- `asia` filters to the Asia Jito hosts
+- exact metro tokens narrow that list further where hostnames match
+
+### Standard RPC
+
+`standard-rpc` does not use endpoint profiles.
+
+It uses:
+
+- `SOLANA_RPC_URL` as the primary read/confirm RPC
+- optional extra submit-only endpoints from `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS`
+
+## Recommended stack
+
+For most operators, the current recommended stack is:
+
+- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
+- `SOLANA_WS_URL`: Helius standard websocket
+- `LAUNCHDECK_WARM_RPC_URL`: Shyft
+- send provider: `helius-sender` or `hellomoon`
+
+If you are watcher-heavy or running multiple snipes, Helius dev tier is strongly recommended.
+
+## Provider details
+
+## Helius Sender
+
+`Helius Sender` is the easiest production default in LaunchDeck right now.
+
+Use it when you want:
+
+- the main supported low-latency path
+- exact metro routing
+- predictable Sender-specific transport behavior
+
+Requirements enforced by the engine:
+
+- `skipPreflight=true`
+- positive compute-unit price
+- tip of at least `200000` lamports
+
+Warm behavior:
+
+- LaunchDeck warms Sender via `GET /ping` on the same host as the `/fast` send path
+
+## Hello Moon
+
+`Hello Moon` is the alternate low-latency provider path in LaunchDeck.
+
+It requires:
+
+- `HELLOMOON_API_KEY`
+- positive compute-unit price
+- tip that satisfies the active Hello Moon path
+- `skipPreflight=true`
+
+Hello Moon modes in practice:
+
+- `off`: standard QUIC path without the stronger Hello Moon protection route
+- `reduced`: QUIC path with the reduced-protection behavior used by the app
+- `secure`: bundle-oriented Hello Moon path with bundle constraints and the stronger protection-focused route
+
+Current runtime behavior:
+
+- non-secure Hello Moon sends use the QUIC path
+- secure Hello Moon sends use the Hello Moon bundle path
+- warm logic follows the active mode, so secure and non-secure Hello Moon legs warm different endpoints when needed
+
+Bundle-path note:
+
+- Hello Moon bundle mode requires at least one valid Hello Moon tip in the bundle
+- LaunchDeck validates that locally before submission
+
+## Standard RPC
+
+`Standard RPC` is the plain RPC send path.
+
+Use it when you want:
+
+- explicit RPC semantics
+- no Sender or bundle-specific provider requirements
+- the optimized LaunchDeck standard-RPC fanout transport
+
+Current behavior:
+
+- `skipPreflight=true`
+- `maxRetries=0`
+- no provider tip handling
+- optional submit fanout through `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS`
+
+## Jito Bundle
+
+`Jito Bundle` is the bundle-oriented provider path.
+
+Use it when you want:
+
+- bundle semantics
+- ordered grouped execution
+- Jito block-engine routing
+
+Current behavior:
+
+- bundle submission with status polling
+- regional bundle endpoint filtering
+- provider-specific bundle/tip rules enforced by the engine
+
+## Full endpoint catalog
+
+This section is the concrete endpoint reference.
+
+### Helius Sender
+
+Send path uses `/fast`. Warm path uses `/ping`.
 
 | Key | Location | Send URL | Warm URL |
 | --- | --- | --- | --- |
-| `global` | Global front door | `https://sender.helius-rpc.com/fast` | `https://sender.helius-rpc.com/ping` |
+| `global` | Global | `https://sender.helius-rpc.com/fast` | `https://sender.helius-rpc.com/ping` |
 | `slc` | Salt Lake City | `http://slc-sender.helius-rpc.com/fast` | `http://slc-sender.helius-rpc.com/ping` |
 | `ewr` | Newark | `http://ewr-sender.helius-rpc.com/fast` | `http://ewr-sender.helius-rpc.com/ping` |
 | `lon` | London | `http://lon-sender.helius-rpc.com/fast` | `http://lon-sender.helius-rpc.com/ping` |
@@ -102,274 +268,88 @@ Used when `execution.provider` is `helius-sender`. Send path is always `…/fast
 | `sg` | Singapore | `http://sg-sender.helius-rpc.com/fast` | `http://sg-sender.helius-rpc.com/ping` |
 | `tyo` | Tokyo | `http://tyo-sender.helius-rpc.com/fast` | `http://tyo-sender.helius-rpc.com/ping` |
 
-`HELIUS_SENDER_ENDPOINT` / `HELIUS_SENDER_BASE_URL` override the above and bypass profile fanout.
+### Helius Solana RPC and websocket
 
-### Helius Solana RPC and WebSocket (reads / confirm / watchers)
+Recommended LaunchDeck values:
 
-These are **normal Solana JSON-RPC and websocket** endpoints, not Sender. Recommended LaunchDeck split:
-
-- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- use Helius standard websocket for `SOLANA_WS_URL`
-- if your Helius plan supports it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` so LaunchDeck can upgrade watchers onto Helius `transactionSubscribe`
-
-Example patterns:
-
-| Usage | Example pattern |
+| Usage | Example |
 | --- | --- |
-| HTTPS RPC (`SOLANA_RPC_URL`) | `https://beta.helius-rpc.com/?api-key=YOUR_API_KEY` |
-| Websocket (`SOLANA_WS_URL`) | `wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
-| Optional Helius watcher override (`HELIUS_WS_URL`) | `wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
+| `SOLANA_RPC_URL` | `https://beta.helius-rpc.com/?api-key=YOUR_API_KEY` |
+| `SOLANA_WS_URL` | `wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
+| optional `HELIUS_RPC_URL` | `https://beta.helius-rpc.com/?api-key=YOUR_API_KEY` |
+| optional `HELIUS_WS_URL` | `wss://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY` |
 
 Put your Helius key immediately after `api-key=`.
 
-Exact paths and query parameter names follow [Helius](https://www.helius.dev/) documentation for your plan.
+### Hello Moon QUIC endpoints
 
-### Jito Block Engine (execution)
+Used for non-secure Hello Moon execution.
 
-Used when `execution.provider` is `jito-bundle`. LaunchDeck derives bundle **send** from each regional **base**: `{base}/api/v1/bundles` and **status**: `{base}/api/v1/getBundleStatuses` (unless `JITO_SEND_BUNDLE_ENDPOINT` / `JITO_BUNDLE_STATUS_ENDPOINT` or `JITO_BUNDLE_BASE_URLS` override defaults).
-
-| Region key | Location | Base URL |
+| Key | Location | QUIC endpoint |
 | --- | --- | --- |
-| `mainnet` | Global mainnet | `https://mainnet.block-engine.jito.wtf` |
-| `new-york` / `ny` | New York | `https://ny.mainnet.block-engine.jito.wtf` |
-| `salt-lake-city` / `slc` | Salt Lake City | `https://slc.mainnet.block-engine.jito.wtf` |
-| `frankfurt` | Frankfurt | `https://frankfurt.mainnet.block-engine.jito.wtf` |
-| `amsterdam` | Amsterdam | `https://amsterdam.mainnet.block-engine.jito.wtf` |
-| `london` | London | `https://london.mainnet.block-engine.jito.wtf` |
-| `dublin` | Dublin | `https://dublin.mainnet.block-engine.jito.wtf` |
-| `singapore` | Singapore | `https://singapore.mainnet.block-engine.jito.wtf` |
-| `tokyo` | Tokyo | `https://tokyo.mainnet.block-engine.jito.wtf` |
+| `global` | Global | `lunar-lander.hellomoon.io:16888` |
+| `fra` | Frankfurt | `fra.lunar-lander.hellomoon.io:16888` |
+| `ams` | Amsterdam | `ams.lunar-lander.hellomoon.io:16888` |
+| `nyc` | New York | `nyc.lunar-lander.hellomoon.io:16888` |
+| `ash` | Ashburn | `ash.lunar-lander.hellomoon.io:16888` |
+| `tyo` | Tokyo | `tyo.lunar-lander.hellomoon.io:16888` |
 
-LaunchDeck **endpoint profile** metro tokens (`slc`, `ewr`, `fra`, etc.) filter this list by matching these hostnames (for example `ewr` / `ny` match the New York base).
+### Hello Moon HTTP endpoints
 
-### Hello Moon — Lunar Lander QUIC (execution)
+Used for Hello Moon HTTP send and bundle paths.
 
-Used when `execution.provider` is `hellomoon`. LaunchDeck uses Hello Moon's QUIC path for execution because it is the closest behavioral match to Helius Sender in this engine: low-latency fire-and-forget submission, local signature derivation, and standard RPC / websocket confirmation on our side.
-
-| Key | Location | QUIC endpoint | Notes |
-| --- | --- | --- | --- |
-| `global` | Geolocated / global path | `lunar-lander.hellomoon.io:16888` | Default fallback |
-| `fra` | Frankfurt | `fra.lunar-lander.hellomoon.io:16888` | Direct regional QUIC |
-| `ams` | Amsterdam | `ams.lunar-lander.hellomoon.io:16888` | Direct regional QUIC |
-| `nyc` | New York | `nyc.lunar-lander.hellomoon.io:16888` | Used for `ewr` / `ny` |
-| `ash` | Ashburn, Virginia | `ash.lunar-lander.hellomoon.io:16888` | Used for `slc` and as extra US fanout |
-| `tyo` | Tokyo | `tyo.lunar-lander.hellomoon.io:16888` | Used for `tyo`; `sg` maps to the `asia` group |
-
-Published HTTP endpoints still exist for `/send`, `/sendBatch`, and `/sendBundle`, but LaunchDeck does not currently use those for the live `hellomoon` provider path. API references: [Batch Send](https://docs.hellomoon.io/reference/batch-send-api), [Send Bundle](https://docs.hellomoon.io/reference/send-bundle-api), [QUIC submission](https://docs.hellomoon.io/reference/quic-submission).
-
-### Shyft — regional Solana RPC (standard-RPC style)
-
-[Shyft](https://shyft.to/) regional HTTPS RPC hosts are commonly used for `LAUNCHDECK_WARM_RPC_URL` and sometimes for `LAUNCHDECK_STANDARD_RPC_SEND_URLS`. Replace `YOUR_API_KEY` with your key.
-
-| Key | Location | Endpoint |
+| Location | `/send` | `/sendBundle` |
 | --- | --- | --- |
-| `fra` | Frankfurt | `https://rpc.fra.shyft.to?api_key=YOUR_API_KEY` |
-| `ams` | Amsterdam | `https://rpc.ams.shyft.to?api_key=YOUR_API_KEY` |
-| `sgp` | Singapore | `https://rpc.sgp.shyft.to?api_key=YOUR_API_KEY` |
-| `va` | Virginia | `https://rpc.va.shyft.to?api_key=YOUR_API_KEY` |
-| `ny` | New York | `https://rpc.ny.shyft.to?api_key=YOUR_API_KEY` |
+| Frankfurt | `http://fra.lunar-lander.hellomoon.io/send` | `http://fra.lunar-lander.hellomoon.io/sendBundle` |
+| Amsterdam | `http://ams.lunar-lander.hellomoon.io/send` | `http://ams.lunar-lander.hellomoon.io/sendBundle` |
+| New York | `http://nyc.lunar-lander.hellomoon.io/send` | `http://nyc.lunar-lander.hellomoon.io/sendBundle` |
+| Ashburn | `http://ash.lunar-lander.hellomoon.io/send` | `http://ash.lunar-lander.hellomoon.io/sendBundle` |
+| Tokyo | `http://tyo.lunar-lander.hellomoon.io/send` | `http://tyo.lunar-lander.hellomoon.io/sendBundle` |
+| Global | `http://lunar-lander.hellomoon.io/send` | `http://lunar-lander.hellomoon.io/sendBundle` |
+
+### Jito block engine
+
+| Region key | Base URL |
+| --- | --- |
+| `mainnet` | `https://mainnet.block-engine.jito.wtf` |
+| `ny` / `new-york` | `https://ny.mainnet.block-engine.jito.wtf` |
+| `slc` / `salt-lake-city` | `https://slc.mainnet.block-engine.jito.wtf` |
+| `frankfurt` | `https://frankfurt.mainnet.block-engine.jito.wtf` |
+| `amsterdam` | `https://amsterdam.mainnet.block-engine.jito.wtf` |
+| `london` | `https://london.mainnet.block-engine.jito.wtf` |
+| `dublin` | `https://dublin.mainnet.block-engine.jito.wtf` |
+| `singapore` | `https://singapore.mainnet.block-engine.jito.wtf` |
+| `tokyo` | `https://tokyo.mainnet.block-engine.jito.wtf` |
+
+### Shyft RPC
+
+Common Shyft regional RPC patterns:
+
+| Key | Example |
+| --- | --- |
+| `fra` | `https://rpc.fra.shyft.to?api_key=YOUR_API_KEY` |
+| `ams` | `https://rpc.ams.shyft.to?api_key=YOUR_API_KEY` |
+| `sgp` | `https://rpc.sgp.shyft.to?api_key=YOUR_API_KEY` |
+| `va` | `https://rpc.va.shyft.to?api_key=YOUR_API_KEY` |
+| `ny` | `https://rpc.ny.shyft.to?api_key=YOUR_API_KEY` |
+
+## Override variables
+
+These bypass normal profile-based routing:
+
+- `HELIUS_SENDER_ENDPOINT`
+- `HELIUS_SENDER_BASE_URL`
+- `HELLOMOON_QUIC_ENDPOINT`
+- `JITO_BUNDLE_BASE_URLS`
+- `JITO_SEND_BUNDLE_ENDPOINT`
+- `JITO_BUNDLE_STATUS_ENDPOINT`
+
+Use them only when you intentionally want to force one endpoint or one private integration.
+
+## Related docs
+
+- `docs/CONFIG.md`
+- `docs/ENV_REFERENCE.md`
+- `docs/FOLLOW_DAEMON.md`
+- `docs/EXECUTION_DOS_AND_DONTS.md`
 
-Shyft may publish additional regions; treat this table as a common regional set, not an exhaustive vendor list.
-
-## Helius Sender
-
-`Helius Sender` is the default and easiest starting point in the current runtime for most operators.
-
-Recommended operator stack:
-
-- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- use Helius standard websocket for `SOLANA_WS_URL`
-- use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- use `helius-sender` or `hellomoon` for creation, buy, and sell provider routing
-- if you have Helius dev tier and websocket support for it, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
-
-Use it when you want:
-
-- the main supported low-latency path
-- endpoint-profile support
-- predictable Sender-specific transport behavior
-- instant execution in typical low-latency setups
-
-How it works:
-
-- supports `single` execution
-- supports `sequential` execution
-- does not support bundle execution
-- supports endpoint profiles
-
-Required behavior:
-
-- inline tip is required
-- inline compute-unit price is required
-- `skipPreflight=true` is required
-- incompatible requests are rejected rather than silently downgraded
-
-Code-enforced requirements:
-
-- `execution.skipPreflight` must be `true`
-- `tx.computeUnitPriceMicroLamports` must be greater than `0`
-- `tx.jitoTipLamports` must be at least `200000`
-
-Practical note:
-
-- if `SOLANA_RPC_URL` is not configured, LaunchDeck can still use the default Sender endpoint, but you should set a dedicated confirmation RPC for real operation
-- in normal average-latency setups this is the provider we recommend first
-- pairing Helius Sender with Helius Gatekeeper HTTP + Helius standard websocket is currently the strongest overall default setup in LaunchDeck
-- Helius dev tier is strongly recommended if you care about the best watcher quality and execution performance, especially when running multiple snipes or watcher-heavy follow automation
-
-### Helius Enhanced Realtime Watchers
-
-When all of these are true:
-
-- `SOLANA_WS_URL` points at a Helius websocket endpoint
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
-- your Helius tier actually supports `transactionSubscribe`
-
-the follow daemon upgrades slot, signature, and market watchers to use Helius `transactionSubscribe` instead of standard websocket subscriptions.
-
-If any of those conditions are not met, LaunchDeck falls back to the standard websocket watcher path automatically.
-
-Watcher routing note:
-
-- send provider and watch endpoint are not the same thing
-- provider selection decides how launch and trade transactions are sent
-- `SOLANA_WS_URL` decides which websocket watch path the daemon uses
-- that means a launch can send with `standard-rpc` or `jito-bundle` and still use Helius enhanced realtime watchers if the websocket watch endpoint is Helius
-
-## Standard RPC
-
-`Standard RPC` is the plain Solana RPC path.
-
-Use it when you want:
-
-- the most conventional transport behavior
-- standard confirmation semantics
-- no Sender or bundle-specific requirements
-
-How it works:
-
-- supports `single` execution
-- supports `sequential` execution
-- does not support `bundle`
-- does not support endpoint profiles
-- does not use tip
-
-Practical note:
-
-- this is the most predictable fallback if you want explicit RPC semantics, but it does not have Sender-specific low-latency behavior
-
-## Hello Moon QUIC
-
-`Hello Moon QUIC` is the new low-latency Lunar Lander execution path.
-
-Access note:
-
-- Hello Moon requires a Lunar Lander API key before this provider can be used
-- request access through the [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) or the [Hello Moon Discord](https://discord.com/invite/HelloMoon)
-
-Use it when you want:
-
-- a fast non-Helius send path with endpoint-profile support
-- QUIC submission instead of HTTP sender semantics
-- optional connection-level MEV protection
-- a setup that pairs cleanly with Shyft for confirmation, warm, and block-height reads
-
-How it works:
-
-- supports `single` execution
-- supports `sequential` execution
-- does not support `bundle`
-- supports endpoint profiles
-- confirms through your normal RPC / websocket path after QUIC submission
-
-Current UI note:
-
-- Hello Moon `Secure` mode is currently shown but disabled in the UI while that path is being worked on
-- treat Hello Moon as a QUIC provider in normal operator flows for now
-
-Required behavior:
-
-- inline tip is required
-- inline compute-unit price is required
-- `skipPreflight=true` is required
-- `HELLOMOON_API_KEY` is required
-
-Code-enforced requirements:
-
-- `execution.skipPreflight` must be `true`
-- `tx.computeUnitPriceMicroLamports` must be greater than `0`
-- `tx.jitoTipLamports` must be at least `1000000`
-
-Endpoint-profile notes:
-
-- `us` fans out to `nyc` and `ash`
-- `eu` fans out to `fra` and `ams`
-- `asia` currently uses `tyo`
-- existing shared metro tokens are still accepted; LaunchDeck maps `ewr` -> `nyc`, `slc` -> `ash`, `lon` -> `eu`, and `sg` -> `asia`
-
-MEV protection:
-
-- set `HELLOMOON_MEV_PROTECT=true` to enable Hello Moon's connection-level QUIC MEV filtering
-- leave it unset or false to use the standard QUIC path
-
-Practical note:
-
-- this is the best current Hello Moon integration point for LaunchDeck because QUIC preserves local signature knowledge while still avoiding HTTP request overhead
-- pairing it with Shyft for `SOLANA_RPC_URL` and/or `LAUNCHDECK_WARM_RPC_URL` is a strong low-friction setup when you do not want to use Helius for confirmations
-
-## Jito Bundle
-
-`Jito Bundle` is the bundle-oriented path.
-
-Use it when you want:
-
-- bundle submission semantics
-- bundle-specific tip behavior
-- regional Jito endpoint fanout
-
-How it works:
-
-- supports `single` execution
-- does not support `sequential`
-- supports `bundle`
-- supports endpoint profiles
-
-Practical note:
-
-- bundle members are treated as an ordered grouped send
-- bundle submission is fanned out across the selected profile group when profiles are used
-
-## Engine-Owned Overrides
-
-The provider selection is not a raw pass-through. The engine owns final shaping.
-
-Examples:
-
-- `standard-rpc` ignores tip even if an old preset still contains a tip value
-- `helius-sender` rejects incompatible requests instead of silently falling back
-- `hellomoon` rejects incompatible requests instead of silently downgrading to HTTP batch/bundle behavior
-- `jito-bundle` may accept both tip and priority in the UI, but the engine can intentionally drop creation priority in some multi-transaction creation flows
-
-This is by design. Operators should treat the provider as a routing intent, not a guarantee that every individual fee field will be applied exactly as typed.
-
-## Availability And Bootstrap
-
-Provider availability is exposed through the runtime bootstrap and status APIs so the browser can initialize from the same backend that owns execution.
-
-The important operator takeaway is simple:
-
-- the UI reads provider availability from the Rust host
-- execution still happens according to runtime validation and transport planning
-
-## Legacy Provider Mapping
-
-Older saved provider values are migrated forward when settings are loaded:
-
-- `auto` -> `helius-sender`
-- `helius` -> `helius-sender`
-- `jito` -> `jito-bundle`
-- `astralane` -> `standard-rpc`
-- `bloxroute` -> `standard-rpc`
-- `hellomoon` -> `hellomoon`
-
-These values should not be used as live provider IDs in current config.

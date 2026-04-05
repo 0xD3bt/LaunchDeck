@@ -37,7 +37,6 @@
       autoSellMarketCapSettings,
       autoSellMarketCapThresholdInput,
       autoSellMarketCapThresholdValue,
-      autoSellMarketCapDirectionInput,
       autoSellMarketCapTimeoutInput,
       autoSellMarketCapTimeoutActionInput,
     } = elements;
@@ -109,19 +108,17 @@
       return expanded;
     }
 
-    function getMarketCapDirection() {
-      return "gte";
-    }
-
     function getMarketCapTimeoutSeconds() {
       const explicitSeconds = getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds");
       if (String(explicitSeconds || "").trim()) {
         const numeric = Number(explicitSeconds);
-        if (!Number.isFinite(numeric)) return 15;
+        if (!Number.isFinite(numeric)) return 30;
         return Math.max(1, Math.min(86400, Math.round(numeric)));
       }
-      const legacyMinutes = Number(getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes") || "15");
-      if (!Number.isFinite(legacyMinutes)) return 15;
+      const legacyMinutesRaw = String(getNamedValue("automaticDevSellMarketCapScanTimeoutMinutes") || "").trim();
+      if (!legacyMinutesRaw) return 30;
+      const legacyMinutes = Number(legacyMinutesRaw);
+      if (!Number.isFinite(legacyMinutes)) return 30;
       return Math.max(1, Math.min(86400, Math.round(legacyMinutes * 60)));
     }
 
@@ -160,14 +157,18 @@
       );
       const mode = normalizeTriggerMode(formValues.automaticDevSellTriggerMode);
       const marketCapThreshold = String(formValues.automaticDevSellMarketCapThreshold || "").trim();
-      const marketCapTimeout = String(formValues.automaticDevSellMarketCapScanTimeoutSeconds || "").trim()
-        ? Math.max(1, Math.min(86400, Number(formValues.automaticDevSellMarketCapScanTimeoutSeconds || 15) || 15))
-        : Math.max(1, Math.min(86400, (Number(formValues.automaticDevSellMarketCapScanTimeoutMinutes || 15) || 15) * 60));
+      const explicitTimeoutSeconds = String(formValues.automaticDevSellMarketCapScanTimeoutSeconds || "").trim();
+      const legacyTimeoutMinutes = String(formValues.automaticDevSellMarketCapScanTimeoutMinutes || "").trim();
+      const marketCapTimeout = explicitTimeoutSeconds
+        ? Math.max(1, Math.min(86400, Number(explicitTimeoutSeconds || 30) || 30))
+        : (legacyTimeoutMinutes
+          ? Math.max(1, Math.min(86400, (Number(legacyTimeoutMinutes || 15) || 15) * 60))
+          : 30);
       const marketCapTimeoutAction = String(formValues.automaticDevSellMarketCapTimeoutAction || "").trim().toLowerCase() === "sell"
         ? "sell"
         : "stop";
       if (triggerFamily === "market-cap") {
-        const thresholdLabel = marketCapThreshold || "market cap";
+        const thresholdLabel = marketCapThreshold ? `$${marketCapThreshold}` : "USD market cap";
         return `${percent} on ${thresholdLabel} (${marketCapTimeout}s, ${marketCapTimeoutAction})`;
       }
       if (mode === "submit-delay") {
@@ -214,9 +215,6 @@
       }
       if (typeof setNamedChecked === "function") {
         setNamedChecked("automaticDevSellMarketCapEnabled", triggerFamily === "market-cap");
-      }
-      if (getNamedValue("automaticDevSellMarketCapDirection") !== "gte") {
-        setNamedValue("automaticDevSellMarketCapDirection", "gte");
       }
       if (marketCapEnabled && getNamedValue("automaticDevSellMarketCapScanTimeoutSeconds") !== marketCapTimeoutSeconds) {
         setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", marketCapTimeoutSeconds);
@@ -275,9 +273,6 @@
           ? marketCapThreshold
           : (triggerFamily === "market-cap" ? "Pending" : "Disabled");
       }
-      if (autoSellMarketCapDirectionInput) {
-        autoSellMarketCapDirectionInput.value = "gte";
-      }
       if (autoSellMarketCapTimeoutInput) {
         autoSellMarketCapTimeoutInput.value = marketCapTimeoutSeconds;
         autoSellMarketCapTimeoutInput.disabled = !enabled || triggerFamily !== "market-cap";
@@ -328,7 +323,7 @@
             normalizeTriggerFamily(button.getAttribute("data-auto-sell-trigger-family")) === "market-cap"
           );
           if (!getMarketCapTimeoutSeconds()) {
-            setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", "15");
+            setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", "30");
           }
           syncUI();
           if (typeof persistDraft === "function") persistDraft();
@@ -378,7 +373,7 @@
       }
       if (autoSellMarketCapTimeoutInput) {
         autoSellMarketCapTimeoutInput.addEventListener("input", () => {
-          setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", autoSellMarketCapTimeoutInput.value || "15");
+          setNamedValue("automaticDevSellMarketCapScanTimeoutSeconds", autoSellMarketCapTimeoutInput.value || "30");
           syncUI();
           if (typeof persistDraft === "function") persistDraft();
           syncActivePresetFromInputs();

@@ -218,8 +218,10 @@ pub fn configured_hellomoon_mev_protect() -> bool {
 }
 
 pub fn configured_standard_rpc_submit_endpoints() -> Vec<String> {
-    env::var("LAUNCHDECK_STANDARD_RPC_SEND_URLS")
-        .unwrap_or_default()
+    first_non_empty_env(&[
+        "LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS",
+        "LAUNCHDECK_STANDARD_RPC_SEND_URLS",
+    ])
         .split(',')
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
@@ -273,11 +275,16 @@ fn hellomoon_profile_tokens(endpoint_profile: &str) -> Vec<String> {
         "global" => vec!["global".to_string()],
         "us" => vec!["nyc".to_string(), "ash".to_string()],
         "eu" => vec!["fra".to_string(), "ams".to_string()],
+        // Hello Moon only exposes Tokyo in Asia, so both the Asia group and Singapore fall back
+        // to the Tokyo endpoint.
         "asia" => vec!["tyo".to_string()],
-        "ewr" => vec!["nyc".to_string()],
-        "slc" => vec!["ash".to_string()],
+        // Hello Moon does not expose exact Newark/SLC regional endpoints, so keep US metro
+        // selections on the dual-US fanout across New York and Ashburn.
+        "ewr" => vec!["nyc".to_string(), "ash".to_string()],
+        "slc" => vec!["nyc".to_string(), "ash".to_string()],
         "fra" => vec!["fra".to_string()],
         "ams" => vec!["ams".to_string()],
+        // Hello Moon does not expose a London endpoint, so use the dual-EU fanout set.
         "lon" => vec!["fra".to_string(), "ams".to_string()],
         "sg" => vec!["tyo".to_string()],
         "tyo" => vec!["tyo".to_string()],
@@ -397,6 +404,20 @@ pub fn resolved_helius_transaction_subscribe_ws_url(base_watch_endpoint: Option<
     base_watch_endpoint
         .filter(|endpoint| endpoint.trim().to_ascii_lowercase().contains("helius"))
         .map(|endpoint| endpoint.trim().to_string())
+}
+
+pub fn configured_enable_helius_transaction_subscribe() -> bool {
+    match env::var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => true,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => true,
+    }
 }
 
 /// When `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE` is true, returns whether a Helius WS URL is available.
@@ -926,6 +947,48 @@ mod tests {
     }
 
     #[test]
+    fn helius_sender_asia_profile_filters_to_singapore_and_tokyo() {
+        let mut config = sample_config("helius-sender");
+        config.execution.endpointProfile = "asia".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "asia");
+        assert!(!plan.heliusSenderEndpoints.is_empty());
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| entry.contains("sg-") || entry.contains("tyo-"))
+        );
+    }
+
+    #[test]
+    fn helius_sender_singapore_profile_stays_singapore_only() {
+        let mut config = sample_config("helius-sender");
+        config.execution.endpointProfile = "sg".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "sg");
+        assert!(!plan.heliusSenderEndpoints.is_empty());
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| entry.contains("sg-"))
+        );
+    }
+
+    #[test]
+    fn helius_sender_tokyo_profile_stays_tokyo_only() {
+        let mut config = sample_config("helius-sender");
+        config.execution.endpointProfile = "tyo".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "tyo");
+        assert!(!plan.heliusSenderEndpoints.is_empty());
+        assert!(
+            plan.heliusSenderEndpoints
+                .iter()
+                .all(|entry| entry.contains("tyo-"))
+        );
+    }
+
+    #[test]
     fn standard_rpc_ignores_endpoint_profile() {
         let mut config = sample_config("standard-rpc");
         config.execution.endpointProfile = "asia".to_string();
@@ -956,6 +1019,44 @@ mod tests {
     }
 
     #[test]
+    fn hellomoon_ewr_profile_still_maps_to_dual_us_quic_endpoints() {
+        let mut config = sample_config("hellomoon");
+        config.execution.endpointProfile = "ewr".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "ewr");
+        assert_eq!(plan.helloMoonQuicEndpoints.len(), 2);
+        assert!(
+            plan.helloMoonQuicEndpoints
+                .iter()
+                .any(|entry| entry.contains("nyc.lunar-lander"))
+        );
+        assert!(
+            plan.helloMoonQuicEndpoints
+                .iter()
+                .any(|entry| entry.contains("ash.lunar-lander"))
+        );
+    }
+
+    #[test]
+    fn hellomoon_slc_profile_still_maps_to_dual_us_quic_endpoints() {
+        let mut config = sample_config("hellomoon");
+        config.execution.endpointProfile = "slc".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "slc");
+        assert_eq!(plan.helloMoonQuicEndpoints.len(), 2);
+        assert!(
+            plan.helloMoonQuicEndpoints
+                .iter()
+                .any(|entry| entry.contains("nyc.lunar-lander"))
+        );
+        assert!(
+            plan.helloMoonQuicEndpoints
+                .iter()
+                .any(|entry| entry.contains("ash.lunar-lander"))
+        );
+    }
+
+    #[test]
     fn hellomoon_lon_profile_falls_back_to_eu_endpoints() {
         let mut config = sample_config("hellomoon");
         config.execution.endpointProfile = "lon".to_string();
@@ -967,6 +1068,33 @@ mod tests {
                 .iter()
                 .all(|entry| entry.contains("fra.") || entry.contains("ams."))
         );
+    }
+
+    #[test]
+    fn hellomoon_asia_profile_maps_to_tokyo_endpoint() {
+        let mut config = sample_config("hellomoon");
+        config.execution.endpointProfile = "asia".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "asia");
+        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
+    }
+
+    #[test]
+    fn hellomoon_singapore_profile_falls_back_to_tokyo_endpoint() {
+        let mut config = sample_config("hellomoon");
+        config.execution.endpointProfile = "sg".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "sg");
+        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
+    }
+
+    #[test]
+    fn hellomoon_tokyo_profile_stays_tokyo_only() {
+        let mut config = sample_config("hellomoon");
+        config.execution.endpointProfile = "tyo".to_string();
+        let plan = build_transport_plan(&config.execution, 2);
+        assert_eq!(plan.resolvedEndpointProfile, "tyo");
+        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
     }
 
     #[test]
@@ -1056,6 +1184,21 @@ mod tests {
             true,
             Some("wss://rpc.shyft.to/ws")
         ));
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_defaults_to_enabled() {
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
+        }
+        assert!(configured_enable_helius_transaction_subscribe());
+        unsafe {
+            env::set_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE", "false");
+        }
+        assert!(!configured_enable_helius_transaction_subscribe());
+        unsafe {
+            env::remove_var("LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE");
+        }
     }
 
     #[test]

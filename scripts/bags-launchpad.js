@@ -5,7 +5,8 @@ require("dotenv").config({ quiet: true });
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
-const bs58 = require("bs58");
+const bs58Module = require("bs58");
+const bs58 = bs58Module.default || bs58Module;
 const BN = require("bn.js");
 const {
   BagsSDK,
@@ -55,6 +56,7 @@ const BAGS_CURVE = [
 const APP_DATA_DIR = path.join(process.cwd(), ".local", "launchdeck");
 const BAGS_CREDENTIALS_PATH = path.join(APP_DATA_DIR, "bags-credentials.json");
 const BAGS_SESSION_PATH = path.join(APP_DATA_DIR, "bags-session.json");
+const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function readJsonFile(filePath) {
   try {
@@ -89,6 +91,16 @@ function requireApiKey(request) {
 function parseSecretBytes(secret) {
   const value = String(secret || "").trim();
   if (!value) throw new Error("Wallet secret was empty.");
+  if (value.startsWith("base64:")) {
+    const decoded = Buffer.from(value.slice("base64:".length), "base64");
+    if (!decoded.length) {
+      throw new Error("Wallet secret base64 payload was empty.");
+    }
+    return Uint8Array.from(decoded);
+  }
+  if (value.startsWith("base58:")) {
+    return Uint8Array.from(bs58.decode(value.slice("base58:".length)));
+  }
   if (value.startsWith("[")) {
     const parsed = JSON.parse(value);
     if (!Array.isArray(parsed)) {
@@ -98,13 +110,24 @@ function parseSecretBytes(secret) {
   }
   try {
     return Uint8Array.from(bs58.decode(value));
-  } catch (_error) {
-    return Uint8Array.from(Buffer.from(value, "base64"));
+  } catch (base58Error) {
+    if (!STRICT_BASE64_PATTERN.test(value)) {
+      throw new Error(`Wallet secret was not valid base58 or base64: ${base58Error.message}`);
+    }
+    const decoded = Buffer.from(value, "base64");
+    if (!decoded.length) {
+      throw new Error("Wallet secret base64 payload was empty.");
+    }
+    return Uint8Array.from(decoded);
   }
 }
 
 function parseKeypair(secret) {
-  return Keypair.fromSecretKey(parseSecretBytes(secret));
+  const secretBytes = parseSecretBytes(secret);
+  if (secretBytes.length !== 64) {
+    throw new Error(`Wallet secret must decode to 64 bytes, got ${secretBytes.length}.`);
+  }
+  return Keypair.fromSecretKey(secretBytes);
 }
 
 function readTransactionBlockhash(transaction) {

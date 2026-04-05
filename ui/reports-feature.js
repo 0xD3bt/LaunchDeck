@@ -334,6 +334,17 @@
           if (!value) return;
           try {
             await navigator.clipboard.writeText(value);
+            const originalText = copyTarget.textContent || "";
+            if (copyTarget.__copyFeedbackTimer) {
+              window.clearTimeout(copyTarget.__copyFeedbackTimer);
+            }
+            copyTarget.classList.add("is-copied");
+            copyTarget.textContent = "Copied";
+            copyTarget.__copyFeedbackTimer = window.setTimeout(() => {
+              copyTarget.classList.remove("is-copied");
+              copyTarget.textContent = originalText;
+              copyTarget.__copyFeedbackTimer = null;
+            }, 900);
           } catch (_error) {
             // Ignore clipboard failures here and keep the terminal subtitle stable.
           }

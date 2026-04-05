@@ -69,6 +69,12 @@ enum MetadataUploadProvider {
     Pinata,
 }
 
+#[derive(Debug, Clone)]
+pub struct MetadataUploadOutcome {
+    pub metadata_uri: String,
+    pub warning: Option<String>,
+}
+
 fn parse_metadata_upload_provider(value: &str) -> Result<MetadataUploadProvider, String> {
     match value.trim().to_lowercase().as_str() {
         "" | "pump-fun" | "pumpfun" => Ok(MetadataUploadProvider::PumpFun),
@@ -243,8 +249,6 @@ pub struct UiForm {
     pub automaticDevSellMarketCapEnabled: bool,
     #[serde(default)]
     pub automaticDevSellMarketCapThreshold: String,
-    #[serde(default)]
-    pub automaticDevSellMarketCapDirection: String,
     #[serde(default)]
     pub automaticDevSellMarketCapScanTimeoutSeconds: String,
     #[serde(default)]
@@ -874,16 +878,31 @@ async fn upload_metadata_to_pinata(config: &RawConfig) -> Result<String, String>
     ))
 }
 
-async fn upload_metadata(config: &RawConfig) -> Result<String, String> {
+async fn upload_metadata(config: &RawConfig) -> Result<MetadataUploadOutcome, String> {
     match configured_metadata_upload_provider()? {
-        MetadataUploadProvider::PumpFun => upload_metadata_to_pump_fun(config).await,
+        MetadataUploadProvider::PumpFun => Ok(MetadataUploadOutcome {
+            metadata_uri: upload_metadata_to_pump_fun(config).await?,
+            warning: None,
+        }),
         MetadataUploadProvider::Pinata => match upload_metadata_to_pinata(config).await {
-            Ok(uri) => Ok(uri),
-            Err(pinata_error) => upload_metadata_to_pump_fun(config).await.map_err(|pump_error| {
-                format!(
-                    "Pinata metadata upload failed and pump-fun fallback also failed. Pinata: {pinata_error} | pump-fun: {pump_error}"
-                )
+            Ok(uri) => Ok(MetadataUploadOutcome {
+                metadata_uri: uri,
+                warning: None,
             }),
+            Err(pinata_error) => {
+                let pump_fun_uri =
+                    upload_metadata_to_pump_fun(config).await.map_err(|pump_error| {
+                        format!(
+                            "Pinata metadata upload failed and pump-fun fallback also failed. Pinata: {pinata_error} | pump-fun: {pump_error}"
+                        )
+                    })?;
+                Ok(MetadataUploadOutcome {
+                    metadata_uri: pump_fun_uri,
+                    warning: Some(format!(
+                        "Pinata upload failed and LaunchDeck fell back to pump-fun automatically: {pinata_error}"
+                    )),
+                })
+            }
         },
     }
 }
@@ -1151,23 +1170,6 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     };
     let dev_auto_sell_market_cap_enabled = dev_auto_sell_trigger_family == "market-cap"
         && !dev_auto_sell_market_cap_threshold.trim().is_empty();
-    let dev_auto_sell_market_cap_direction = if !form
-        .followLaunch
-        .devAutoSell
-        .marketCapDirection
-        .trim()
-        .is_empty()
-    {
-        form.followLaunch
-            .devAutoSell
-            .marketCapDirection
-            .trim()
-            .to_string()
-    } else if !form.automaticDevSellMarketCapDirection.trim().is_empty() {
-        form.automaticDevSellMarketCapDirection.trim().to_string()
-    } else {
-        "gte".to_string()
-    };
     let dev_auto_sell_market_cap_scan_timeout_seconds = if !form
         .followLaunch
         .devAutoSell
@@ -1211,9 +1213,9 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
             .trim()
             .parse::<u64>()
             .map(|value| value.saturating_mul(60).to_string())
-            .unwrap_or_else(|_| "15".to_string())
+            .unwrap_or_else(|_| "30".to_string())
     } else {
-        "15".to_string()
+        "30".to_string()
     };
     let dev_auto_sell_market_cap_timeout_action = if !form
         .followLaunch
@@ -1507,7 +1509,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
                     targetBlockOffset: Some(json!(dev_auto_sell_target_block_offset)),
                     marketCap: RawFollowLaunchMarketCapTrigger {
                         enabled: Some(json!(dev_auto_sell_market_cap_enabled)),
-                        direction: dev_auto_sell_market_cap_direction,
+                        direction: "gte".to_string(),
                         threshold: dev_auto_sell_market_cap_threshold,
                         scanTimeoutSeconds: Some(json!(
                             dev_auto_sell_market_cap_scan_timeout_seconds
@@ -1543,7 +1545,7 @@ async fn build_raw_config_from_ui_form(action: &str, form: UiForm) -> Result<Raw
     })
 }
 
-pub async fn upload_metadata_from_form(form_value: Value) -> Result<String, String> {
+pub async fn upload_metadata_from_form(form_value: Value) -> Result<MetadataUploadOutcome, String> {
     let form: UiForm = serde_json::from_value(form_value)
         .map_err(|error| format!("Invalid launch form payload: {error}"))?;
     let raw = build_raw_config_from_ui_form("send", form).await?;
@@ -1553,13 +1555,16 @@ pub async fn upload_metadata_from_form(form_value: Value) -> Result<String, Stri
 pub async fn build_raw_config_from_form(
     action: &str,
     form_value: Value,
-) -> Result<(RawConfig, Option<String>), String> {
+) -> Result<(RawConfig, Option<String>, Option<String>), String> {
     let form: UiForm = serde_json::from_value(form_value)
         .map_err(|error| format!("Invalid launch form payload: {error}"))?;
     let existing_metadata_uri = provided_metadata_uri(&form);
     let mut raw = build_raw_config_from_ui_form(action, form).await?;
-    let metadata_uri = if let Some(metadata_uri) = existing_metadata_uri {
-        metadata_uri
+    let metadata_outcome = if let Some(metadata_uri) = existing_metadata_uri {
+        MetadataUploadOutcome {
+            metadata_uri,
+            warning: None,
+        }
     } else if action == "send" {
         upload_metadata(&raw).await?
     } else {
@@ -1567,8 +1572,8 @@ pub async fn build_raw_config_from_form(
             "Metadata is still uploading. Wait for the metadata pre-upload to finish before {action}."
         ));
     };
-    raw.token.uri = metadata_uri.clone();
-    Ok((raw, Some(metadata_uri)))
+    raw.token.uri = metadata_outcome.metadata_uri.clone();
+    Ok((raw, Some(metadata_outcome.metadata_uri), metadata_outcome.warning))
 }
 
 #[cfg(test)]
@@ -1777,5 +1782,29 @@ mod tests {
         assert_eq!(raw.followLaunch.snipes.len(), 1);
         assert_eq!(raw.followLaunch.snipes[0].enabled, Some(json!(false)));
         assert!(raw.followLaunch.devAutoSell.is_none());
+    }
+
+    #[tokio::test]
+    async fn dev_auto_sell_market_cap_direction_is_fixed_to_reached_only() {
+        let raw = build_raw_config_from_ui_form(
+            "send",
+            UiForm {
+                selectedWalletKey: "SOLANA_PRIVATE_KEY".to_string(),
+                automaticDevSellEnabled: true,
+                automaticDevSellPercent: "50".to_string(),
+                automaticDevSellTriggerFamily: "market-cap".to_string(),
+                automaticDevSellMarketCapThreshold: "100k".to_string(),
+                automaticDevSellMarketCapScanTimeoutSeconds: "20".to_string(),
+                ..UiForm::default()
+            },
+        )
+        .await
+        .expect("market-cap dev auto sell should build");
+
+        let dev_auto_sell = raw
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        assert_eq!(dev_auto_sell.marketCap.direction, "gte");
     }
 }

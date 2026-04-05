@@ -5,7 +5,8 @@ require("dotenv").config({ quiet: true });
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
-const bs58 = require("bs58");
+const bs58Module = require("bs58");
+const bs58 = bs58Module.default || bs58Module;
 const BN = require("bn.js");
 const {
   AddressLookupTableAccount,
@@ -64,6 +65,7 @@ const RAYDIUM_LAUNCH_CONFIGS_CACHE = new Map();
 const RAYDIUM_LAUNCH_CONFIGS_IN_FLIGHT = new Map();
 const LOOKUP_TABLE_ACCOUNT_CACHE = new Map();
 let persistentBonkCacheStore = null;
+const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function resolveQuoteAssetConfig(asset) {
   return String(asset || "").trim().toLowerCase() === "usd1"
@@ -475,6 +477,16 @@ function estimateSupplyPercent(amount, supply) {
 function parseSecretBytes(secret) {
   const value = String(secret || "").trim();
   if (!value) throw new Error("Wallet secret was empty.");
+  if (value.startsWith("base64:")) {
+    const decoded = Buffer.from(value.slice("base64:".length), "base64");
+    if (!decoded.length) {
+      throw new Error("Wallet secret base64 payload was empty.");
+    }
+    return Uint8Array.from(decoded);
+  }
+  if (value.startsWith("base58:")) {
+    return Uint8Array.from(bs58.decode(value.slice("base58:".length)));
+  }
   if (value.startsWith("[")) {
     const parsed = JSON.parse(value);
     if (!Array.isArray(parsed)) {
@@ -484,13 +496,24 @@ function parseSecretBytes(secret) {
   }
   try {
     return Uint8Array.from(bs58.decode(value));
-  } catch (_error) {
-    return Uint8Array.from(Buffer.from(value, "base64"));
+  } catch (base58Error) {
+    if (!STRICT_BASE64_PATTERN.test(value)) {
+      throw new Error(`Wallet secret was not valid base58 or base64: ${base58Error.message}`);
+    }
+    const decoded = Buffer.from(value, "base64");
+    if (!decoded.length) {
+      throw new Error("Wallet secret base64 payload was empty.");
+    }
+    return Uint8Array.from(decoded);
   }
 }
 
-function parseKeypair(secret) {
-  return Keypair.fromSecretKey(parseSecretBytes(secret));
+function parseKeypair(secret, label = "Wallet secret") {
+  const secretBytes = parseSecretBytes(secret);
+  if (secretBytes.length !== 64) {
+    throw new Error(`${label} must decode to 64 bytes, got ${secretBytes.length}.`);
+  }
+  return Keypair.fromSecretKey(secretBytes);
 }
 
 function txVersionFromFormat(format) {
@@ -2047,7 +2070,7 @@ async function prepareUsd1Topup(raydium, connection, owner, request, requiredQuo
 }
 
 async function buildUsd1Topup(request) {
-  const owner = parseKeypair(request.ownerSecret);
+  const owner = parseKeypair(request.ownerSecret, "ownerSecret");
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
   const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
@@ -2121,7 +2144,7 @@ async function buildUsd1Topup(request) {
 }
 
 async function buildLaunch(request) {
-  const owner = parseKeypair(request.ownerSecret);
+  const owner = parseKeypair(request.ownerSecret, "ownerSecret");
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
   const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
@@ -2139,7 +2162,7 @@ async function buildLaunch(request) {
   );
   await ensureQuoteTokenAccountReady(connection, owner, request, raydium, defaults.quoteMint);
   const mintKeypair = request.vanitySecret
-    ? parseKeypair(request.vanitySecret)
+    ? parseKeypair(request.vanitySecret, "vanitySecret")
     : Keypair.generate();
   const txVersion = atomicUsd1TxVersion(request);
   let buyAmount;
@@ -2357,7 +2380,7 @@ async function buildLaunch(request) {
 }
 
 async function compileFollowBuy(request, labelPrefix, atomic = false) {
-  const owner = parseKeypair(request.ownerSecret);
+  const owner = parseKeypair(request.ownerSecret, "ownerSecret");
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
   const usd1QuoteContext = createUsd1QuoteRequestContext();
   const raydium = await Raydium.load({
@@ -2500,7 +2523,7 @@ async function compileFollowBuy(request, labelPrefix, atomic = false) {
 }
 
 async function compileFollowSell(request) {
-  const owner = parseKeypair(request.ownerSecret);
+  const owner = parseKeypair(request.ownerSecret, "ownerSecret");
   const connection = new Connection(request.rpcUrl, request.commitment || "confirmed");
   const requestContext = resolveQuoteAssetConfig(request.quoteAsset).asset === "usd1"
     ? createUsd1QuoteRequestContext()
@@ -2632,6 +2655,227 @@ async function predictDevBuyTokenAmount(request) {
   };
 }
 
+function quoteAssetFromMintAddress(address) {
+  const normalized = String(address || "");
+  if (normalized === NATIVE_MINT.toBase58()) {
+    return resolveQuoteAssetConfig("sol");
+  }
+  if (normalized === USD1_MINT.toBase58()) {
+    return resolveQuoteAssetConfig("usd1");
+  }
+  return null;
+}
+
+function poolTypePriority(type) {
+  switch (String(type || "")) {
+    case "Standard":
+      return 0;
+    case "Concentrated":
+      return 1;
+    default:
+      return 2;
+  }
+}
+
+function decimalToBn(value, decimals, label) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return parseDecimalToBn(trimTrailingZeroes(numeric.toFixed(decimals)), decimals, label);
+}
+
+function marketCapFromRaydiumPoolPrice(pool, tokenSupply, tokenDecimals, quote) {
+  const price = decimalToBn(pool.price, 18, "Raydium migrated pool price");
+  const scale = new BN(10).pow(new BN(18));
+  const tokenScale = new BN(10).pow(new BN(tokenDecimals));
+  const quoteScale = new BN(10).pow(new BN(quote.decimals));
+  const mintA = pool.mintA && pool.mintA.address ? pool.mintA.address : String(pool.mintA || "");
+  const mintB = pool.mintB && pool.mintB.address ? pool.mintB.address : String(pool.mintB || "");
+  if (mintA === quote.mint.toBase58()) {
+    return tokenSupply.mul(scale).mul(quoteScale).div(price).div(tokenScale);
+  }
+  if (mintB === quote.mint.toBase58()) {
+    return tokenSupply.mul(price).mul(quoteScale).div(scale).div(tokenScale);
+  }
+  throw new Error(`Migrated Raydium pool ${pool.id} does not match requested quote asset ${quote.asset}.`);
+}
+
+async function fetchLaunchpadPoolCandidate(raydium, mint, asset) {
+  try {
+    const quote = resolveQuoteAssetConfig(asset);
+    const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote.mint).publicKey;
+    const poolInfo = await raydium.launchpad.getRpcPoolInfo({ poolId });
+    const platformId = poolInfo.platformId && poolInfo.platformId.toBase58
+      ? poolInfo.platformId.toBase58()
+      : String(poolInfo.platformId || "");
+    const configId = poolInfo.configId && poolInfo.configId.toBase58
+      ? poolInfo.configId.toBase58()
+      : String(poolInfo.configId || "");
+    return {
+      kind: "launchpad",
+      launchpad: "bonk",
+      mode: platformId === BONKERS_PLATFORM.toBase58() ? "bonkers" : "regular",
+      quoteAsset: quote.asset,
+      quoteAssetLabel: quote.label,
+      quote,
+      creator: poolInfo.creator && poolInfo.creator.toBase58
+        ? poolInfo.creator.toBase58()
+        : String(poolInfo.creator || ""),
+      platformId,
+      configId,
+      poolId: poolId.toBase58(),
+      realQuoteReserves: poolInfo.realB ? poolInfo.realB.toString() : "0",
+      complete: Number(poolInfo.status || 0) !== 0,
+      detectionSource: "raydium-launchpad",
+      poolType: "LaunchLab",
+      poolInfo,
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function fetchMigratedRaydiumCandidates(raydium, mint) {
+  const candidates = [];
+  for (const asset of ["sol", "usd1"]) {
+    const quote = resolveQuoteAssetConfig(asset);
+    let response;
+    try {
+      response = await raydium.api.fetchPoolByMints({
+        mint1: mint.toBase58(),
+        mint2: quote.mint.toBase58(),
+      });
+    } catch (_error) {
+      continue;
+    }
+    for (const pool of Array.isArray(response && response.data) ? response.data : []) {
+      const quoteMeta = quoteAssetFromMintAddress(
+        pool.mintA && pool.mintA.address ? pool.mintA.address
+          : pool.mintB && pool.mintB.address ? pool.mintB.address
+            : ""
+      );
+      if (!quoteMeta) {
+        continue;
+      }
+      candidates.push({
+        kind: "raydium-migrated",
+        launchpad: "bonk",
+        mode: "regular",
+        quoteAsset: quoteMeta.asset,
+        quoteAssetLabel: quoteMeta.label,
+        quote: quoteMeta,
+        creator: "",
+        platformId: "",
+        configId: pool.config && pool.config.id ? String(pool.config.id) : "",
+        poolId: String(pool.id || ""),
+        realQuoteReserves: String(Math.round(Number(pool.tvl || 0) * 1_000_000)),
+        complete: true,
+        detectionSource: `raydium-${String(pool.type || "").toLowerCase() || "migrated"}`,
+        launchMigratePool: !!pool.launchMigratePool,
+        tvl: Number(pool.tvl || 0),
+        poolType: String(pool.type || ""),
+        pool,
+      });
+    }
+  }
+  return candidates;
+}
+
+async function detectBonkMarketCandidates(raydium, connection, mint) {
+  const launchpadCandidates = (
+    await Promise.all(["sol", "usd1"].map((asset) => fetchLaunchpadPoolCandidate(raydium, mint, asset)))
+  ).filter(Boolean);
+  if (!launchpadCandidates.some((candidate) => candidate.complete)) {
+    return launchpadCandidates;
+  }
+  const migratedCandidates = await fetchMigratedRaydiumCandidates(raydium, mint);
+  return migratedCandidates.length ? migratedCandidates : launchpadCandidates;
+}
+
+function selectPreferredBonkMarketCandidate(candidates, preferredQuoteAsset = "") {
+  if (!candidates.length) {
+    return null;
+  }
+  const normalizedPreferred = String(preferredQuoteAsset || "").trim().toLowerCase();
+  const sorted = [...candidates].sort((left, right) => {
+    const leftCanonical = left.launchMigratePool ? 1 : 0;
+    const rightCanonical = right.launchMigratePool ? 1 : 0;
+    if (leftCanonical !== rightCanonical) {
+      return rightCanonical - leftCanonical;
+    }
+    const leftLiquidity = Number(left.tvl || left.realQuoteReserves || 0);
+    const rightLiquidity = Number(right.tvl || right.realQuoteReserves || 0);
+    if (leftLiquidity !== rightLiquidity) {
+      return rightLiquidity - leftLiquidity;
+    }
+    const leftRequested = normalizedPreferred && left.quoteAsset === normalizedPreferred ? 1 : 0;
+    const rightRequested = normalizedPreferred && right.quoteAsset === normalizedPreferred ? 1 : 0;
+    if (leftRequested !== rightRequested) {
+      return rightRequested - leftRequested;
+    }
+    const leftType = poolTypePriority(left.poolType);
+    const rightType = poolTypePriority(right.poolType);
+    if (leftType !== rightType) {
+      return leftType - rightType;
+    }
+    return left.quoteAsset === "sol" ? -1 : 1;
+  });
+  return sorted[0];
+}
+
+function buildLaunchpadMarketSnapshot(candidate) {
+  const supply = new BN(candidate.poolInfo.supply.toString());
+  const virtualA = new BN(candidate.poolInfo.virtualA.toString());
+  const virtualB = new BN(candidate.poolInfo.virtualB.toString());
+  const realA = new BN(candidate.poolInfo.realA.toString());
+  const realB = new BN(candidate.poolInfo.realB.toString());
+  const totalSellA = new BN(candidate.poolInfo.totalSellA.toString());
+  const marketCapLamports = virtualA.isZero() ? new BN(0) : supply.mul(virtualB).div(virtualA);
+  return {
+    mint: candidate.poolInfo.mintA && candidate.poolInfo.mintA.toBase58
+      ? candidate.poolInfo.mintA.toBase58()
+      : "",
+    quoteAsset: candidate.quoteAsset,
+    quoteAssetLabel: candidate.quoteAssetLabel,
+    creator: candidate.creator,
+    virtualTokenReserves: virtualA.toString(10),
+    virtualSolReserves: virtualB.toString(10),
+    realTokenReserves: totalSellA.sub(realA).toString(10),
+    realSolReserves: realB.toString(10),
+    tokenTotalSupply: supply.toString(10),
+    complete: candidate.complete,
+    marketCapLamports: marketCapLamports.toString(10),
+    marketCapSol: formatBn(marketCapLamports, candidate.quote.decimals, 6),
+  };
+}
+
+async function buildMigratedRaydiumMarketSnapshot(connection, mint, candidate) {
+  const supplyInfo = await connection.getTokenSupply(mint, "processed");
+  const tokenSupply = new BN(String(supplyInfo.value.amount || "0"), 10);
+  const tokenDecimals = Number(supplyInfo.value.decimals || TOKEN_DECIMALS);
+  const marketCapLamports = marketCapFromRaydiumPoolPrice(
+    candidate.pool,
+    tokenSupply,
+    tokenDecimals,
+    candidate.quote,
+  );
+  return {
+    mint: mint.toBase58(),
+    quoteAsset: candidate.quoteAsset,
+    quoteAssetLabel: candidate.quoteAssetLabel,
+    creator: candidate.creator,
+    virtualTokenReserves: "0",
+    virtualSolReserves: "0",
+    realTokenReserves: "0",
+    realSolReserves: "0",
+    tokenTotalSupply: tokenSupply.toString(10),
+    complete: true,
+    marketCapLamports: marketCapLamports.toString(10),
+    marketCapSol: formatBn(marketCapLamports, candidate.quote.decimals, 6),
+  };
+}
+
 async function fetchMarketSnapshot(request) {
   const connection = new Connection(request.rpcUrl, request.commitment || "processed");
   const raydium = await Raydium.load({
@@ -2641,30 +2885,15 @@ async function fetchMarketSnapshot(request) {
     disableFeatureCheck: true,
   });
   const mint = new PublicKey(request.mint);
-  const quote = resolveQuoteAssetConfig(request.quoteAsset);
-  const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote.mint).publicKey;
-  const poolInfo = await raydium.launchpad.getRpcPoolInfo({ poolId });
-  const supply = new BN(poolInfo.supply.toString());
-  const virtualA = new BN(poolInfo.virtualA.toString());
-  const virtualB = new BN(poolInfo.virtualB.toString());
-  const realA = new BN(poolInfo.realA.toString());
-  const realB = new BN(poolInfo.realB.toString());
-  const totalSellA = new BN(poolInfo.totalSellA.toString());
-  const marketCapLamports = virtualA.isZero() ? new BN(0) : supply.mul(virtualB).div(virtualA);
-  return {
-    mint: mint.toBase58(),
-    quoteAsset: quote.asset,
-    quoteAssetLabel: quote.label,
-    creator: poolInfo.creator.toBase58 ? poolInfo.creator.toBase58() : String(poolInfo.creator),
-    virtualTokenReserves: virtualA.toString(10),
-    virtualSolReserves: virtualB.toString(10),
-    realTokenReserves: totalSellA.sub(realA).toString(10),
-    realSolReserves: realB.toString(10),
-    tokenTotalSupply: supply.toString(10),
-    complete: Number(poolInfo.status || 0) !== 0,
-    marketCapLamports: marketCapLamports.toString(10),
-    marketCapSol: formatBn(marketCapLamports, quote.decimals, 6),
-  };
+  const candidates = await detectBonkMarketCandidates(raydium, connection, mint);
+  const preferred = selectPreferredBonkMarketCandidate(candidates, request.quoteAsset);
+  if (!preferred) {
+    throw new Error(`No Bonk market candidate found for ${request.mint}.`);
+  }
+  if (preferred.kind === "raydium-migrated") {
+    return buildMigratedRaydiumMarketSnapshot(connection, mint, preferred);
+  }
+  return buildLaunchpadMarketSnapshot(preferred);
 }
 
 async function detectImportContext(request) {
@@ -2676,48 +2905,11 @@ async function detectImportContext(request) {
     disableFeatureCheck: true,
   });
   const mint = new PublicKey(request.mint);
-  const candidates = [];
-  for (const asset of ["sol", "usd1"]) {
-    try {
-      const quote = resolveQuoteAssetConfig(asset);
-      const poolId = getPdaLaunchpadPoolId(LAUNCHPAD_PROGRAM, mint, quote.mint).publicKey;
-      const poolInfo = await raydium.launchpad.getRpcPoolInfo({ poolId });
-      const platformId = poolInfo.platformId && poolInfo.platformId.toBase58
-        ? poolInfo.platformId.toBase58()
-        : String(poolInfo.platformId || "");
-      const configId = poolInfo.configId && poolInfo.configId.toBase58
-        ? poolInfo.configId.toBase58()
-        : String(poolInfo.configId || "");
-      candidates.push({
-        launchpad: "bonk",
-        mode: platformId === BONKERS_PLATFORM.toBase58() ? "bonkers" : "regular",
-        quoteAsset: quote.asset,
-        creator: poolInfo.creator && poolInfo.creator.toBase58
-          ? poolInfo.creator.toBase58()
-          : String(poolInfo.creator || ""),
-        platformId,
-        configId,
-        poolId: poolId.toBase58(),
-        realQuoteReserves: poolInfo.realB ? poolInfo.realB.toString() : "0",
-        complete: Number(poolInfo.status || 0) !== 0,
-        detectionSource: "raydium-launchpad",
-      });
-    } catch (_error) {
-      // Ignore missing pool shapes and keep probing the other quote asset.
-    }
-  }
+  const candidates = await detectBonkMarketCandidates(raydium, connection, mint);
   if (!candidates.length) {
     return null;
   }
-  candidates.sort((left, right) => {
-    const leftLiquidity = BigInt(left.realQuoteReserves || "0");
-    const rightLiquidity = BigInt(right.realQuoteReserves || "0");
-    if (leftLiquidity === rightLiquidity) {
-      return left.quoteAsset === "sol" ? -1 : 1;
-    }
-    return rightLiquidity > leftLiquidity ? 1 : -1;
-  });
-  return candidates[0];
+  return selectPreferredBonkMarketCandidate(candidates, request.quoteAsset);
 }
 
 async function warmState(request) {

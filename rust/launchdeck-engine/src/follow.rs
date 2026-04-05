@@ -62,6 +62,7 @@ pub enum FollowActionState {
     Running,
     Sent,
     Confirmed,
+    Stopped,
     Failed,
     Cancelled,
     Expired,
@@ -215,18 +216,30 @@ pub struct FollowJobRecord {
     pub timings: FollowJobTimings,
 }
 
+fn should_use_post_setup_creator_vault(
+    job_prefers_post_setup_creator_vault: bool,
+    action: &FollowActionRecord,
+    mev_mode: &str,
+) -> bool {
+    job_prefers_post_setup_creator_vault
+        && (action.targetBlockOffset.unwrap_or_default() > 0
+            || mev_mode.trim().eq_ignore_ascii_case("secure"))
+}
+
 pub fn should_use_post_setup_creator_vault_for_sell(
     job_prefers_post_setup_creator_vault: bool,
     action: &FollowActionRecord,
+    mev_mode: &str,
 ) -> bool {
-    job_prefers_post_setup_creator_vault && action.targetBlockOffset.unwrap_or_default() > 0
+    should_use_post_setup_creator_vault(job_prefers_post_setup_creator_vault, action, mev_mode)
 }
 
 pub fn should_use_post_setup_creator_vault_for_buy(
     job_prefers_post_setup_creator_vault: bool,
     action: &FollowActionRecord,
+    mev_mode: &str,
 ) -> bool {
-    job_prefers_post_setup_creator_vault && action.targetBlockOffset.unwrap_or_default() > 0
+    should_use_post_setup_creator_vault(job_prefers_post_setup_creator_vault, action, mev_mode)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -931,6 +944,7 @@ impl FollowDaemonStore {
                 if !matches!(
                     action.state,
                     FollowActionState::Confirmed
+                        | FollowActionState::Stopped
                         | FollowActionState::Failed
                         | FollowActionState::Cancelled
                 ) {
@@ -978,6 +992,7 @@ impl FollowDaemonStore {
                 if !matches!(
                     action.state,
                     FollowActionState::Confirmed
+                        | FollowActionState::Stopped
                         | FollowActionState::Failed
                         | FollowActionState::Cancelled
                 ) {
@@ -1505,7 +1520,7 @@ mod tests {
             poolId: None,
             timings: FollowActionTimings::default(),
         };
-        assert!(!should_use_post_setup_creator_vault_for_sell(true, &action));
+        assert!(!should_use_post_setup_creator_vault_for_sell(true, &action, "reduced"));
     }
 
     #[test]
@@ -1550,6 +1565,147 @@ mod tests {
             poolId: None,
             timings: FollowActionTimings::default(),
         };
-        assert!(should_use_post_setup_creator_vault_for_sell(true, &action));
+        assert!(should_use_post_setup_creator_vault_for_sell(true, &action, "reduced"));
+    }
+
+    #[test]
+    fn creator_vault_rule_uses_post_setup_path_immediately_for_secure_buy() {
+        let action = FollowActionRecord {
+            actionId: "buy-a".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: Some("0.001".to_string()),
+            sellPercent: None,
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(should_use_post_setup_creator_vault_for_buy(
+            true, &action, "secure"
+        ));
+    }
+
+    #[test]
+    fn creator_vault_rule_uses_post_setup_path_immediately_for_secure_sell() {
+        let action = FollowActionRecord {
+            actionId: "sell-secure".to_string(),
+            kind: FollowActionKind::DevAutoSell,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(should_use_post_setup_creator_vault_for_sell(
+            true, &action, "secure"
+        ));
+    }
+
+    #[test]
+    fn creator_vault_rule_keeps_non_secure_buy_on_deployer_path_at_zero_offset() {
+        let action = FollowActionRecord {
+            actionId: "buy-b".to_string(),
+            kind: FollowActionKind::SniperBuy,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: FollowActionState::Queued,
+            buyAmountSol: Some("0.001".to_string()),
+            sellPercent: None,
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedBlockHeight: None,
+            confirmedObservedBlockHeight: None,
+            blocksToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: None,
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(!should_use_post_setup_creator_vault_for_buy(
+            true, &action, "reduced"
+        ));
     }
 }

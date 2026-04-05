@@ -10,7 +10,6 @@
     "engine": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "engine:check": "cargo check --manifest-path ./rust/launchdeck-engine/Cargo.toml",
     "engine:test": "cargo test --manifest-path ./rust/launchdeck-engine/Cargo.toml",
-    "engine:bench": "node ./scripts/engine-benchmark.js",
     "browser-matrix": "node ./scripts/browser-matrix/run.js",
     "browser-matrix:fast": "node ./scripts/browser-matrix/run-fast.js",
     "ui": "cargo run --manifest-path ./rust/launchdeck-engine/Cargo.toml",

@@ -108,64 +108,95 @@ stop_old_launchdeck_runtime() {
 wait_for_health_endpoint() {
   local url="$1"
   local name="$2"
-  local max_attempts="${3:-20}"
-  local delay_seconds="${4:-0.5}"
-  local attempt body
+  local pid="${3:-}"
+  local log_path="${4:-}"
+  local max_attempts="${5:-20}"
+  local delay_seconds="${6:-0.5}"
+  local slow_notice_attempt="${7:-10}"
+  local attempt body slow_notice_shown=0
 
-  for ((attempt = 0; attempt < max_attempts; attempt++)); do
-    sleep "$delay_seconds"
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     body="$(curl -fsS --max-time 2 "$url" 2>/dev/null || true)"
     if [[ "$body" == *'"ok":true'* || "$body" == *'"running":true'* ]]; then
       return 0
     fi
+
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "Error: $name process exited before reporting healthy startup at $url." >&2
+      if [[ -n "$log_path" ]]; then
+        echo "Error: Check $log_path for details." >&2
+      fi
+      return 1
+    fi
+
+    if (( slow_notice_shown == 0 && attempt >= slow_notice_attempt )); then
+      echo "$name is still compiling or starting..." >&2
+      slow_notice_shown=1
+    fi
+
+    sleep "$delay_seconds"
   done
 
-  echo "Warning: $name did not report healthy startup at $url." >&2
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "$name is still compiling or starting in the background at $url." >&2
+    if [[ -n "$log_path" ]]; then
+      echo "Info: Check $log_path only if it does not become healthy soon." >&2
+    fi
+    return 2
+  fi
+
+  echo "Error: $name did not become healthy at $url." >&2
+  if [[ -n "$log_path" ]]; then
+    echo "Error: Check $log_path for details." >&2
+  fi
   return 1
 }
 
 start_launchdeck_processes() {
   local ports engine_port follow_daemon_port daemon_stdout_path daemon_stderr_path stdout_path stderr_path
-  local daemon_wait_pid engine_wait_pid
+  local daemon_pid engine_pid daemon_wait_pid engine_wait_pid
   mapfile -t ports < <(stop_old_launchdeck_runtime)
   engine_port="${ports[0]}"
   follow_daemon_port="${ports[1]}"
 
   mkdir -p "$launchdeck_log_dir"
+  cd "$project_root"
 
   daemon_stdout_path="$launchdeck_log_dir/follow-daemon.log"
   daemon_stderr_path="$launchdeck_log_dir/follow-daemon-error.log"
-  (
-    cd "$project_root"
-    nohup cargo run --manifest-path "rust/launchdeck-engine/Cargo.toml" --bin launchdeck-follow-daemon \
-      >"$daemon_stdout_path" 2>"$daemon_stderr_path" </dev/null &
-  )
+  nohup cargo run --manifest-path "rust/launchdeck-engine/Cargo.toml" --bin launchdeck-follow-daemon \
+    >"$daemon_stdout_path" 2>"$daemon_stderr_path" </dev/null &
+  daemon_pid=$!
+
   stdout_path="$launchdeck_log_dir/engine.log"
   stderr_path="$launchdeck_log_dir/engine-error.log"
-  (
-    cd "$project_root"
-    nohup cargo run --manifest-path "rust/launchdeck-engine/Cargo.toml" --bin launchdeck-engine \
-      >"$stdout_path" 2>"$stderr_path" </dev/null &
-  )
+  nohup cargo run --manifest-path "rust/launchdeck-engine/Cargo.toml" --bin launchdeck-engine \
+    >"$stdout_path" 2>"$stderr_path" </dev/null &
+  engine_pid=$!
 
   (
-    if wait_for_health_endpoint "http://127.0.0.1:$follow_daemon_port/health" "LaunchDeck follow daemon" 40 0.5; then
+    if wait_for_health_endpoint "http://127.0.0.1:$follow_daemon_port/health" "LaunchDeck follow daemon" "$daemon_pid" "$daemon_stderr_path" 40 0.5; then
       echo "LaunchDeck follow daemon ready on port $follow_daemon_port."
     else
-      echo "Warning: Check .local/launchdeck/follow-daemon-error.log if the follow daemon failed to start." >&2
+      case $? in
+        2) echo "LaunchDeck follow daemon is still starting in the background on port $follow_daemon_port." >&2 ;;
+        *) return 1 ;;
+      esac
     fi
   ) &
   daemon_wait_pid=$!
 
   (
-    if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" 60 0.5; then
+    if wait_for_health_endpoint "http://127.0.0.1:$engine_port/health" "LaunchDeck Rust host" "$engine_pid" "$stderr_path" 60 0.5; then
       echo "LaunchDeck Rust host ready on port $engine_port."
       if command -v xdg-open >/dev/null 2>&1; then
         xdg-open "http://127.0.0.1:$engine_port" >/dev/null 2>&1 || true
       fi
     else
-      echo "Warning: LaunchDeck Rust host did not report healthy startup before timeout at http://127.0.0.1:$engine_port/health. It may still be compiling." >&2
-      echo "Warning: Check .local/launchdeck/engine-error.log if the Rust host actually failed to start." >&2
+      case $? in
+        2) echo "LaunchDeck Rust host is still starting in the background on port $engine_port." >&2 ;;
+        *) return 1 ;;
+      esac
     fi
   ) &
   engine_wait_pid=$!

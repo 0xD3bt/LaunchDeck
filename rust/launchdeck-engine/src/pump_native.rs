@@ -37,7 +37,7 @@ use crate::{
     report::{LaunchReport, build_report, render_report},
     rpc::{
         CompiledTransaction, fetch_account_data, fetch_account_exists,
-        fetch_latest_blockhash_cached, fetch_multiple_account_exists,
+        fetch_latest_blockhash_cached, fetch_multiple_account_data, fetch_multiple_account_exists,
     },
     transport::TransportPlan,
     wallet::read_keypair_bytes,
@@ -56,6 +56,9 @@ const PRIORITY_FEE_PRICE_BASE_COMPUTE_UNIT_LIMIT: u64 = 1_000_000;
 const TOKEN_DECIMALS: u32 = 6;
 const GLOBAL_ACCOUNT_DISCRIMINATOR_BYTES: usize = 8;
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const USD1_MINT: &str = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB";
 const PLATFORM_GITHUB: u8 = 2;
 const DEFAULT_LOOKUP_TABLES: [&str; 2] = [
     "AXVvmhWaaPtV52jqYuTNqp1xRrkbxhfJfeHQKxq5cbvZ",
@@ -124,6 +127,10 @@ pub struct PumpMarketSnapshot {
     pub complete: bool,
     pub marketCapLamports: u64,
     pub marketCapSol: String,
+    #[serde(default)]
+    pub quoteAsset: String,
+    #[serde(default)]
+    pub quoteAssetLabel: String,
 }
 
 pub fn supports_native_pump_compile(config: &NormalizedConfig) -> bool {
@@ -178,6 +185,7 @@ pub async fn try_compile_native_pump(
     let agent_authority = resolve_agent_authority(config, &creator)?;
     let mint_keypair = resolve_mint_keypair(config)?;
     let mint = mint_keypair.pubkey();
+    ensure_vanity_mint_unused(rpc_url, config, &mint).await?;
     let separate_tip_transaction =
         transport_plan.separateTipTransaction && config.tx.jitoTipLamports > 0;
     let has_follow_up_transaction = has_launch_follow_up(config);
@@ -614,6 +622,19 @@ struct PumpBondingCurveState {
 }
 
 #[derive(Debug, Clone)]
+struct PumpAmmPoolState {
+    pubkey: String,
+    creator: Pubkey,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
+    pool_base_token_account: Pubkey,
+    pool_quote_token_account: Pubkey,
+}
+
+const PUMP_AMM_POOL_DISCRIMINATOR_BYTES: usize = 8;
+const PUMP_AMM_POOL_ACCOUNT_SIZE: usize = PUMP_AMM_POOL_DISCRIMINATOR_BYTES + 237;
+
+#[derive(Debug, Clone)]
 pub struct PreparedFollowBuyStatic {
     user: Pubkey,
     mint: Pubkey,
@@ -658,6 +679,26 @@ fn resolve_mint_keypair(config: &NormalizedConfig) -> Result<Keypair, String> {
         .map_err(|error| format!("Invalid vanity private key: {error}"))?;
     keypair_from_secret_bytes(&bytes)
         .map_err(|error| format!("Invalid vanity private key: {error}"))
+}
+
+async fn ensure_vanity_mint_unused(
+    rpc_url: &str,
+    config: &NormalizedConfig,
+    mint: &Pubkey,
+) -> Result<(), String> {
+    if config.vanityPrivateKey.trim().is_empty() {
+        return Ok(());
+    }
+    match fetch_account_data(rpc_url, &mint.to_string(), "confirmed").await {
+        Ok(_) => Err(format!(
+            "This vanity address has already been used on-chain. Generate a fresh one. ({})",
+            mint
+        )),
+        Err(error) if error.contains("was not found.") => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to verify vanity private key availability: {error}"
+        )),
+    }
 }
 
 fn parse_pubkey(value: &str, label: &str) -> Result<Pubkey, String> {
@@ -782,12 +823,9 @@ fn select_follow_creator_vault_authority(
     prefer_post_setup_creator_vault: bool,
     sharing_config_exists: bool,
 ) -> Pubkey {
-    if sharing_config_exists {
+    if prefer_post_setup_creator_vault || sharing_config_exists {
         return *sharing_config;
     }
-    let _ = prefer_post_setup_creator_vault;
-    // Same-window sells can execute before deferred fee-sharing setup, so the live account state
-    // decides which creator-vault seed path is valid.
     *launch_creator
 }
 
@@ -954,6 +992,212 @@ fn parse_bonding_curve_state(data: &[u8]) -> Result<PumpBondingCurveState, Strin
         complete,
         creator,
         cashback_enabled,
+    })
+}
+
+fn parse_pump_amm_pool_state(account_pubkey: &str, data: &[u8]) -> Result<PumpAmmPoolState, String> {
+    if data.len() < PUMP_AMM_POOL_ACCOUNT_SIZE {
+        return Err("Pump AMM pool account data was too short.".to_string());
+    }
+    let mut offset = PUMP_AMM_POOL_DISCRIMINATOR_BYTES;
+    let _pool_bump = data
+        .get(offset)
+        .copied()
+        .ok_or_else(|| "Pump AMM pool account was too short while reading pool bump.".to_string())?;
+    offset += 1;
+    offset += 2; // index
+    let creator = read_pubkey(data, &mut offset)?;
+    let base_mint = read_pubkey(data, &mut offset)?;
+    let quote_mint = read_pubkey(data, &mut offset)?;
+    let _lp_mint = read_pubkey(data, &mut offset)?;
+    let pool_base_token_account = read_pubkey(data, &mut offset)?;
+    let pool_quote_token_account = read_pubkey(data, &mut offset)?;
+    Ok(PumpAmmPoolState {
+        pubkey: account_pubkey.to_string(),
+        creator,
+        base_mint,
+        quote_mint,
+        pool_base_token_account,
+        pool_quote_token_account,
+    })
+}
+
+fn decode_spl_token_account_amount(data: &[u8], label: &str) -> Result<u64, String> {
+    let bytes: [u8; 8] = data
+        .get(64..72)
+        .ok_or_else(|| format!("{label} token account data was too short."))?
+        .try_into()
+        .map_err(|_| format!("Failed to read token amount bytes from {label} account."))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn decode_spl_mint_supply(data: &[u8], label: &str) -> Result<u64, String> {
+    let bytes: [u8; 8] = data
+        .get(36..44)
+        .ok_or_else(|| format!("{label} mint account data was too short."))?
+        .try_into()
+        .map_err(|_| format!("Failed to read mint supply bytes from {label} mint account."))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn current_market_cap_quote_units(total_supply: u64, quote_reserve: u64, base_reserve: u64) -> u64 {
+    if base_reserve == 0 {
+        return 0;
+    }
+    ((u128::from(total_supply) * u128::from(quote_reserve)) / u128::from(base_reserve))
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn quote_asset_meta_for_mint(quote_mint: &Pubkey) -> Option<(&'static str, &'static str, u32)> {
+    match quote_mint.to_string().as_str() {
+        WSOL_MINT => Some(("sol", "SOL", 9)),
+        USDC_MINT => Some(("usdc", "USDC", 6)),
+        USDT_MINT => Some(("usdt", "USDT", 6)),
+        USD1_MINT => Some(("usd1", "USD1", 6)),
+        _ => None,
+    }
+}
+
+fn pump_amm_quote_priority(quote_mint: &Pubkey) -> u8 {
+    match quote_mint.to_string().as_str() {
+        WSOL_MINT => 0,
+        USDC_MINT => 1,
+        USDT_MINT => 2,
+        USD1_MINT => 3,
+        _ => 255,
+    }
+}
+
+fn pump_pool_authority_pda(base_mint: &Pubkey) -> Result<Pubkey, String> {
+    Ok(Pubkey::find_program_address(
+        &[b"pool-authority", base_mint.as_ref()],
+        &pump_program_id()?,
+    )
+    .0)
+}
+
+fn derive_pump_amm_pool_address(
+    creator: &Pubkey,
+    mint: &Pubkey,
+    quote_mint: &Pubkey,
+    index: u16,
+) -> Result<Pubkey, String> {
+    let program_id = parse_pubkey(PUMP_AMM_PROGRAM_ID, "pump amm program")?;
+    let index_bytes = index.to_le_bytes();
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[b"pool", &index_bytes, creator.as_ref(), mint.as_ref(), quote_mint.as_ref()],
+        &program_id,
+    );
+    Ok(pubkey)
+}
+
+async fn find_pump_amm_pool_state(
+    rpc_url: &str,
+    mint: &Pubkey,
+    creator: &Pubkey,
+) -> Result<Option<PumpAmmPoolState>, String> {
+    let quote_candidates = [WSOL_MINT, USDC_MINT, USDT_MINT, USD1_MINT];
+    let mut requests = Vec::new();
+    let canonical_creator = pump_pool_authority_pda(mint)?;
+
+    let mut push_candidate = |pool_pubkey: Pubkey| {
+        let value = pool_pubkey.to_string();
+        if !requests.iter().any(|existing| existing == &value) {
+            requests.push(value);
+        }
+    };
+
+    for quote_mint in quote_candidates {
+        let quote_pubkey = parse_pubkey(quote_mint, "pump amm quote mint")?;
+        push_candidate(derive_pump_amm_pool_address(
+            &canonical_creator,
+            mint,
+            &quote_pubkey,
+            0,
+        )?);
+        for index in 0u16..=3 {
+            push_candidate(derive_pump_amm_pool_address(
+                creator,
+                mint,
+                &quote_pubkey,
+                index,
+            )?);
+        }
+    }
+    let accounts = fetch_multiple_account_data(rpc_url, &requests, "confirmed").await?;
+    let mut pools = requests
+        .into_iter()
+        .zip(accounts.into_iter())
+        .filter_map(|(pubkey, data)| {
+            data.and_then(|bytes| parse_pump_amm_pool_state(&pubkey, &bytes).ok())
+        })
+        .filter(|pool| pool.base_mint == *mint && quote_asset_meta_for_mint(&pool.quote_mint).is_some())
+        .collect::<Vec<_>>();
+    pools.sort_by_key(|pool| pump_amm_quote_priority(&pool.quote_mint));
+    Ok(pools.into_iter().next())
+}
+
+async fn fetch_pump_amm_market_snapshot_for_mint(
+    rpc_url: &str,
+    mint: &Pubkey,
+    creator: &Pubkey,
+) -> Result<PumpMarketSnapshot, String> {
+    let Some(pool) = find_pump_amm_pool_state(rpc_url, mint, creator).await? else {
+        return Err(format!(
+            "No Pump AMM pool found for mint {} and creator {} with a supported quote asset.",
+            mint, creator
+        ));
+    };
+    let Some((quote_asset, quote_asset_label, quote_decimals)) =
+        quote_asset_meta_for_mint(&pool.quote_mint)
+    else {
+        return Err(format!(
+            "Pump AMM pool {} uses unsupported quote mint {}.",
+            pool.pubkey, pool.quote_mint
+        ));
+    };
+    let account_keys = vec![
+        pool.pool_base_token_account.to_string(),
+        pool.pool_quote_token_account.to_string(),
+        mint.to_string(),
+    ];
+    let accounts = fetch_multiple_account_data(rpc_url, &account_keys, "confirmed").await?;
+    let base_vault = accounts
+        .first()
+        .and_then(|entry| entry.as_ref())
+        .ok_or_else(|| format!("Pump AMM base vault {} was not found.", pool.pool_base_token_account))?;
+    let quote_vault = accounts
+        .get(1)
+        .and_then(|entry| entry.as_ref())
+        .ok_or_else(|| format!("Pump AMM quote vault {} was not found.", pool.pool_quote_token_account))?;
+    let mint_account = accounts
+        .get(2)
+        .and_then(|entry| entry.as_ref())
+        .ok_or_else(|| format!("Mint account {} was not found.", mint))?;
+    let base_reserve = decode_spl_token_account_amount(base_vault, "Pump AMM base vault")?;
+    let quote_reserve = decode_spl_token_account_amount(quote_vault, "Pump AMM quote vault")?;
+    let total_supply = decode_spl_mint_supply(mint_account, "Pump token")?;
+    let market_cap_quote_units =
+        current_market_cap_quote_units(total_supply, quote_reserve, base_reserve);
+    Ok(PumpMarketSnapshot {
+        mint: mint.to_string(),
+        creator: pool.creator.to_string(),
+        virtualTokenReserves: base_reserve,
+        virtualSolReserves: quote_reserve,
+        realTokenReserves: base_reserve,
+        realSolReserves: quote_reserve,
+        tokenTotalSupply: total_supply,
+        complete: true,
+        marketCapLamports: market_cap_quote_units,
+        marketCapSol: format_decimal_u128(
+            u128::from(market_cap_quote_units),
+            quote_decimals,
+            6,
+        ),
+        quoteAsset: quote_asset.to_string(),
+        quoteAssetLabel: quote_asset_label.to_string(),
     })
 }
 
@@ -1253,20 +1497,34 @@ pub async fn fetch_pump_market_snapshot(
     mint: &str,
 ) -> Result<PumpMarketSnapshot, String> {
     let mint = parse_pubkey(mint, "mint")?;
-    let curve = fetch_bonding_curve_state(rpc_url, &mint).await?;
-    let market_cap_lamports = current_market_cap_lamports(&curve);
-    Ok(PumpMarketSnapshot {
-        mint: mint.to_string(),
-        creator: curve.creator.to_string(),
-        virtualTokenReserves: curve.virtual_token_reserves,
-        virtualSolReserves: curve.virtual_sol_reserves,
-        realTokenReserves: curve.real_token_reserves,
-        realSolReserves: curve.real_sol_reserves,
-        tokenTotalSupply: curve.token_total_supply,
-        complete: curve.complete,
-        marketCapLamports: market_cap_lamports,
-        marketCapSol: format_decimal_u128(u128::from(market_cap_lamports), 9, 6),
-    })
+    match fetch_bonding_curve_state(rpc_url, &mint).await {
+        Ok(curve) => {
+            let market_cap_lamports = current_market_cap_lamports(&curve);
+            let curve_snapshot = PumpMarketSnapshot {
+                mint: mint.to_string(),
+                creator: curve.creator.to_string(),
+                virtualTokenReserves: curve.virtual_token_reserves,
+                virtualSolReserves: curve.virtual_sol_reserves,
+                realTokenReserves: curve.real_token_reserves,
+                realSolReserves: curve.real_sol_reserves,
+                tokenTotalSupply: curve.token_total_supply,
+                complete: curve.complete,
+                marketCapLamports: market_cap_lamports,
+                marketCapSol: format_decimal_u128(u128::from(market_cap_lamports), 9, 6),
+                quoteAsset: "sol".to_string(),
+                quoteAssetLabel: "SOL".to_string(),
+            };
+            if !curve.complete && curve.virtual_token_reserves > 0 && curve.virtual_sol_reserves > 0 {
+                return Ok(curve_snapshot);
+            }
+            fetch_pump_amm_market_snapshot_for_mint(rpc_url, &mint, &curve.creator)
+                .await
+                .or(Ok(curve_snapshot))
+        }
+        Err(curve_error) => Err(format!(
+            "Failed to fetch Pump bonding-curve snapshot ({curve_error}). Pump AMM fallback requires the bonding-curve creator."
+        )),
+    }
 }
 
 fn priority_fee_sol_to_micro_lamports(priority_fee_sol: &str) -> Result<u64, String> {
@@ -3668,14 +3926,14 @@ mod tests {
     }
 
     #[test]
-    fn follow_sell_uses_launch_creator_until_sharing_config_exists() {
+    fn follow_sell_uses_sharing_config_when_post_setup_is_preferred() {
         let launch_creator = Pubkey::new_unique();
         let sharing_config = Pubkey::new_unique();
 
         let authority =
             select_follow_creator_vault_authority(&launch_creator, &sharing_config, true, false);
 
-        assert_eq!(authority, launch_creator);
+        assert_eq!(authority, sharing_config);
     }
 
     #[test]
@@ -3687,6 +3945,17 @@ mod tests {
             select_follow_creator_vault_authority(&launch_creator, &sharing_config, true, true);
 
         assert_eq!(authority, sharing_config);
+    }
+
+    #[test]
+    fn follow_sell_uses_launch_creator_when_post_setup_is_not_preferred() {
+        let launch_creator = Pubkey::new_unique();
+        let sharing_config = Pubkey::new_unique();
+
+        let authority =
+            select_follow_creator_vault_authority(&launch_creator, &sharing_config, false, false);
+
+        assert_eq!(authority, launch_creator);
     }
 
     #[test]
@@ -3919,6 +4188,55 @@ mod tests {
                 .last()
                 .map(|account| account.is_signer)
                 .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn parse_pump_amm_pool_state_reads_core_fields() {
+        let creator = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let lp_mint = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        let coin_creator = Pubkey::new_unique();
+        let mut data = vec![0u8; 301];
+        let mut offset = PUMP_AMM_POOL_DISCRIMINATOR_BYTES;
+        data[offset] = 254;
+        offset += 1;
+        data[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes());
+        offset += 2;
+        data[offset..offset + 32].copy_from_slice(creator.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(base_mint.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(quote_mint.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(lp_mint.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(base_vault.as_ref());
+        offset += 32;
+        data[offset..offset + 32].copy_from_slice(quote_vault.as_ref());
+        offset += 32;
+        data[offset..offset + 8].copy_from_slice(&123u64.to_le_bytes());
+        offset += 8;
+        data[offset..offset + 32].copy_from_slice(coin_creator.as_ref());
+
+        let parsed =
+            parse_pump_amm_pool_state("pool", &data).expect("pump amm pool should parse");
+        assert_eq!(parsed.pubkey, "pool");
+        assert_eq!(parsed.creator, creator);
+        assert_eq!(parsed.base_mint, base_mint);
+        assert_eq!(parsed.quote_mint, quote_mint);
+        assert_eq!(parsed.pool_base_token_account, base_vault);
+        assert_eq!(parsed.pool_quote_token_account, quote_vault);
+    }
+
+    #[test]
+    fn current_market_cap_quote_units_scales_from_reserves() {
+        assert_eq!(
+            current_market_cap_quote_units(1_000_000_000_000, 500_000_000, 250_000_000_000),
+            2_000_000_000
         );
     }
 }

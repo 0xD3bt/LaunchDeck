@@ -162,9 +162,7 @@
             <div class="section-head">
               <h2>Platform <span class="section-tag required">required</span></h2>
               <div id="platform-runtime-indicators" class="runtime-indicator-row" aria-label="Runtime status indicators">
-                <span class="runtime-indicator-dot is-yellow" title="State warm: starting." aria-label="State warm: starting."></span>
-                <span class="runtime-indicator-dot is-yellow" title="Endpoint prewarm: starting." aria-label="Endpoint prewarm: starting."></span>
-                <span class="runtime-indicator-dot is-yellow" title="Watch path: starting." aria-label="Watch path: starting."></span>
+                <span class="runtime-indicator-dot is-yellow" title="Warm: starting." aria-label="Warm: starting."></span>
               </div>
             </div>
             <div class="launchpad-grid">
@@ -301,65 +299,65 @@
             <label class="mode-option">
               <input type="radio" name="mode" value="regular" checked>
               <span class="mode-title">regular</span>
-              <span class="tooltip-dot" title="Standard Pump launch. Creator rewards go to the deployer unless you apply a separate fee split.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Standard Pump launch. Creator rewards stay on the deployer unless you later apply a fee split.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Standard Pump launch. Creator rewards stay on the deployer unless you later apply a fee split.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="bonkers">
               <span class="mode-title">bonkers</span>
-              <span class="tooltip-dot" title="Bonk-only launch mode that routes through the Bonkers platform on Raydium LaunchLab.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Bonk-only launch mode that uses the Bonkers flow on Raydium LaunchLab.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Bonk-only launch mode that uses the Bonkers flow on Raydium LaunchLab.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="bags-2-2">
               <span class="mode-title">2% / 2%</span>
-              <span class="tooltip-dot" title="Bags-only fee mode with 2% fees before and after migration.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Bags-only fee mode with 2% fees before and after migration.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Bags-only fee mode with 2% fees before and after migration.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="bags-025-1">
               <span class="mode-title">0.25% / 1%</span>
-              <span class="tooltip-dot" title="Bags-only fee mode with 0.25% fees before migration and 1% after migration.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Bags-only fee mode with 0.25% fees before migration and 1% after migration.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Bags-only fee mode with 0.25% fees before migration and 1% after migration.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="bags-1-025">
               <span class="mode-title">1% / 0.25%</span>
-              <span class="tooltip-dot" title="Bags-only fee mode with 1% fees before migration and 0.25% after migration.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Bags-only fee mode with 1% fees before migration and 0.25% after migration.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Bags-only fee mode with 1% fees before migration and 0.25% after migration.</span></span></span>
             </label>
             <button
               type="button"
               id="bonk-quote-asset-toggle"
-              class="mode-option"
+              class="mode-option tooltip-button"
               hidden
-              title="Switch Bonk quote asset between solana and USD1."
-              aria-label="Switch Bonk quote asset between solana and USD1."
+              aria-label="Switch Bonk quote asset between SOL and USD1 for Bonk quotes and launch sizing."
             >
               <span class="bonk-quote-asset-toggle-icon" aria-hidden="true">
                 <img src="/solana-mark.png" alt="" class="sol-logo inline-sol-logo" id="bonk-quote-asset-toggle-sol-icon">
                 <img src="/usd1-mark.png" alt="" class="sol-logo inline-sol-logo wallet-balance-icon-usd1" id="bonk-quote-asset-toggle-usd1-icon" hidden>
               </span>
+              <span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Switch Bonk quote asset between SOL and USD1 for Bonk quotes and launch sizing.</span></span>
             </button>
             <label class="mode-option">
               <input type="radio" name="mode" value="cashback">
               <span class="mode-title">cashback</span>
-              <span class="tooltip-dot" title="Creator rewards are redirected to traders as cashback. Trading behavior is unchanged.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Pump cashback variant. Launch behavior stays the same, but creator rewards are marked for cashback routing.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Pump cashback variant. Launch behavior stays the same, but creator rewards are marked for cashback routing.</span></span></span>
             </label>
             <label class="mode-option">
               <input name="mayhemMode" type="checkbox">
               <span class="mode-title">mayhem</span>
-              <span class="tooltip-dot" title="Enables Pump mayhem-mode behavior.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Enables the Pump mayhem variant when the selected launchpad supports it.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Enables the Pump mayhem variant when the selected launchpad supports it.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="agent-custom">
               <span class="mode-title">agent-custom</span>
-              <span class="tooltip-dot" title="Creates the token first, then bundles agent setup and your custom reward split right after launch. Pump only allows creator reward distribution to be configured once, so this becomes final immediately.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Initializes the agent during creation, then applies your custom recipient split in a follow-up agent-setup transaction.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Initializes the agent during creation, then applies your custom recipient split in a follow-up agent-setup transaction.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="agent-unlocked">
               <span class="mode-title">agent-unlocked</span>
-              <span class="tooltip-dot" title="Initializes the agent only and leaves creator reward distribution untouched. Use this if you want to preserve Pump's one allowed reward-distribution setup for later.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Initializes the agent during creation without routing creator rewards into locked escrow and without emitting a later agent-setup transaction.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Initializes the agent during creation without routing creator rewards into locked escrow and without emitting a later agent-setup transaction.</span></span></span>
             </label>
             <label class="mode-option">
               <input type="radio" name="mode" value="agent-locked">
               <span class="mode-title">agent-locked</span>
-              <span class="tooltip-dot" title="Creates the token first, then bundles agent setup that routes 100% of creator rewards to the agent. Because reward distribution is configured immediately, it is final from the start.">?</span>
+              <span class="tooltip-dot" tabindex="0" aria-label="Initializes the agent during creation and routes creator rewards through the locked agent escrow path with a follow-up agent-setup transaction.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Initializes the agent during creation and routes creator rewards through the locked agent escrow path with a follow-up agent-setup transaction.</span></span></span>
             </label>
           </div>
 
@@ -390,8 +388,9 @@
           <div class="mode-divider" aria-hidden="true"></div>
 
           <div class="mode-action-row">
-            <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button" title="Enable fee-sharing split after launch.">
+            <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button tooltip-button">
               <span class="mode-title">Fee Split</span>
+              <span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Configure creator fee sharing when the selected mode supports it.</span></span>
             </button>
             <button type="button" id="bags-identity-button" class="button subtle mode-action-button" hidden>
               <span class="mode-title" id="bags-identity-button-label">Wallet Only</span>
@@ -410,7 +409,7 @@
                 <div class="auto-sell-popover-header">
                   <div class="auto-sell-popover-title">
                     Auto-Sell
-                    <span class="tooltip-dot inline" title="Automatic selling behavior for your launch positions.">?</span>
+                    <span class="tooltip-dot inline" tabindex="0" aria-label="Configure automatic selling for your own launch position after the dev buy.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Configure automatic selling for your own launch position after the dev buy.</span></span></span>
                   </div>
                 </div>
                 <div class="auto-sell-card">
@@ -499,12 +498,8 @@
                       <div class="auto-sell-slider-block">
                         <div class="auto-sell-slider-head">
                           <span class="auto-sell-market-cap-title">
-                            <span>Market Cap Trigger</span>
-                            <span
-                              class="tooltip-dot inline auto-sell-tooltip-dot"
-                              title="Stops scanning once the token market cap crosses this threshold."
-                              aria-label="Stops scanning once the token market cap crosses this threshold."
-                            >i</span>
+                            <span>USD Market Cap Trigger</span>
+                            <span class="tooltip-dot inline auto-sell-tooltip-dot" tabindex="0" aria-label="Triggers auto-sell when the observed USD market cap reaches this threshold.">i<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Triggers auto-sell when the observed USD market cap reaches this threshold.</span></span></span>
                           </span>
                           <strong id="auto-sell-market-cap-threshold-value">Disabled</strong>
                         </div>
@@ -515,12 +510,11 @@
                           type="text"
                           inputmode="text"
                           autocomplete="off"
-                          placeholder="e.g. 100000 or 100k"
+                          placeholder="e.g. 100000 or 100k USD"
                         >
                         <div class="field-error" data-error-for="automaticDevSellMarketCapThreshold"></div>
                       </div>
                       <div class="auto-sell-market-cap-grid">
-                        <input id="auto-sell-market-cap-direction-input" name="automaticDevSellMarketCapDirection" type="hidden" value="gte">
                         <label class="auto-sell-market-cap-field">
                           <span>Scan Timeout</span>
                           <div class="auto-sell-market-cap-timeout-row">
@@ -532,7 +526,7 @@
                               min="1"
                               max="86400"
                               step="1"
-                              value="15"
+                              value="30"
                             >
                             <span class="auto-sell-market-cap-suffix">sec</span>
                           </div>
@@ -718,11 +712,11 @@
                   </label>
                   <label class="settings-mev-mode-field settings-mev-mode-field-compact">
                     <span>MEV</span>
-                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Hello Moon MEV mode help."><span aria-hidden="true">?</span><span class="tooltip-panel tooltip-panel-wide tooltip-panel-rich settings-mev-tooltip-panel" role="tooltip"><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Off</strong></span><span>Fastest Hello Moon route with no Hello Moon protection flags. This carries the highest MEV risk.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Reduced</strong><span class="tooltip-panel-badge">Recommended</span></span><span>Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. This is the default protection-focused option when you want minimal speed trade-off.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Secure</strong></span><span>Hello Moon bundle route with the strongest protection-focused path. It is slower and subject to bundle-specific constraints.</span></span><span class="tooltip-panel-foot">Only shown for Hello Moon routes. All modes still carry MEV, inclusion, and execution risk.</span></span></span>
                     <select name="creationMevMode" id="creation-mev-mode-select">
                       <option value="off" selected>Off</option>
                       <option value="reduced">Reduced</option>
-                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
+                      <option value="secure">Secure</option>
                     </select>
                   </label>
                   <label class="settings-fee-field">
@@ -742,7 +736,7 @@
                     <div class="field-error" data-error-for="creationTipSol"></div>
                   </label>
                   <input name="creationAutoFeeEnabled" id="creation-auto-fee-input" type="checkbox" hidden>
-                  <button type="button" id="creation-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, LaunchDeck fetches fresh priority and Jito tip estimates for this row based on the selected route. Manual priority and tip inputs are ignored until Auto Fee is turned off. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <button type="button" id="creation-auto-fee-button" class="preset-chip compact settings-auto-fee-button tooltip-button">Auto Fee<span class="tooltip-panel tooltip-panel-wide" role="tooltip"><span class="tooltip-panel-body">Uses live route-aware fee estimates for creation. Manual Priority Fee and Tip inputs are ignored while Auto Fee is on. Max Fee caps the total auto-resolved fee budget for this row.</span></span></button>
                   <label class="settings-auto-fee-cap settings-fee-field">
                     <span>Max Fee</span>
                     <span class="settings-fee-input-wrap">
@@ -776,11 +770,11 @@
                   </label>
                   <label class="settings-mev-mode-field settings-mev-mode-field-compact">
                     <span>MEV</span>
-                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Hello Moon MEV mode help."><span aria-hidden="true">?</span><span class="tooltip-panel tooltip-panel-wide tooltip-panel-rich settings-mev-tooltip-panel" role="tooltip"><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Off</strong></span><span>Fastest Hello Moon route with no Hello Moon protection flags. This carries the highest MEV risk.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Reduced</strong><span class="tooltip-panel-badge">Recommended</span></span><span>Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. This is the default protection-focused option when you want minimal speed trade-off.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Secure</strong></span><span>Hello Moon bundle route with the strongest protection-focused path. It is slower and subject to bundle-specific constraints.</span></span><span class="tooltip-panel-foot">Only shown for Hello Moon routes. All modes still carry MEV, inclusion, and execution risk.</span></span></span>
                     <select name="buyMevMode" id="buy-mev-mode-select">
                       <option value="off" selected>Off</option>
                       <option value="reduced">Reduced</option>
-                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
+                      <option value="secure">Secure</option>
                     </select>
                   </label>
                   <label>
@@ -805,7 +799,7 @@
                     <div class="field-error" data-error-for="buyTipSol"></div>
                   </label>
                   <input name="buyAutoFeeEnabled" id="buy-auto-fee-input" type="checkbox" hidden>
-                  <button type="button" id="buy-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, buy-side fees use fresh provider-aware estimates. For standard RPC this means auto priority fee. For Helius Sender and Jito it also resolves a tip when that path supports one. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <button type="button" id="buy-auto-fee-button" class="preset-chip compact settings-auto-fee-button tooltip-button">Auto Fee<span class="tooltip-panel tooltip-panel-wide" role="tooltip"><span class="tooltip-panel-body">Uses live route-aware fee estimates for buys. Manual Priority Fee and Tip inputs are ignored while Auto Fee is on. Max Fee caps the total auto-resolved fee budget for this row.</span></span></button>
                   <label class="settings-auto-fee-cap settings-fee-field">
                     <span>Max Fee</span>
                     <span class="settings-fee-input-wrap">
@@ -841,11 +835,11 @@
                   </label>
                   <label class="settings-mev-mode-field settings-mev-mode-field-compact">
                     <span>MEV</span>
-                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Off: fastest Hello Moon QUIC path with no Hello Moon MEV protection and the highest MEV risk. Reduced: Hello Moon QUIC with mev_protect and jitodontfront where supported, offering stronger protection with nearly no speed trade-off in normal conditions. Secure: temporarily unavailable while that path is being worked on. All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.">?<span class="settings-mev-tooltip-panel" role="tooltip"><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Off</strong></span><span>Uses the fastest Hello Moon QUIC path without Hello Moon MEV protection. This mode carries the highest MEV risk.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Reduced</strong><span class="settings-mev-tooltip-badge">Recommended</span></span><span>Uses Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. Provides stronger protection with nearly no speed trade-off in normal conditions.</span></span><span class="settings-mev-tooltip-item"><span class="settings-mev-tooltip-head"><strong>Secure</strong></span><span>Temporarily unavailable while that path is being worked on.</span></span><span class="settings-mev-tooltip-foot">All modes still carry MEV, inclusion, and execution risk, and all involve trade-offs between speed and protection.</span></span></span>
+                    <span class="tooltip-dot inline settings-mev-tooltip" tabindex="0" aria-label="Hello Moon MEV mode help."><span aria-hidden="true">?</span><span class="tooltip-panel tooltip-panel-wide tooltip-panel-rich settings-mev-tooltip-panel" role="tooltip"><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Off</strong></span><span>Fastest Hello Moon route with no Hello Moon protection flags. This carries the highest MEV risk.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Reduced</strong><span class="tooltip-panel-badge">Recommended</span></span><span>Hello Moon QUIC with <code>mev_protect</code> and <code>jitodontfront</code> where supported. This is the default protection-focused option when you want minimal speed trade-off.</span></span><span class="tooltip-panel-item"><span class="tooltip-panel-head"><strong>Secure</strong></span><span>Hello Moon bundle route with the strongest protection-focused path. It is slower and subject to bundle-specific constraints.</span></span><span class="tooltip-panel-foot">Only shown for Hello Moon routes. All modes still carry MEV, inclusion, and execution risk.</span></span></span>
                     <select name="sellMevMode" id="sell-mev-mode-select">
                       <option value="off" selected>Off</option>
                       <option value="reduced">Reduced</option>
-                      <option value="secure" disabled title="Hello Moon secure mode is temporarily unavailable.">Secure (temporarily unavailable)</option>
+                      <option value="secure">Secure</option>
                     </select>
                   </label>
                   <label>
@@ -870,7 +864,7 @@
                     <div class="field-error" data-error-for="sellTipSol"></div>
                   </label>
                   <input name="sellAutoFeeEnabled" id="sell-auto-fee-input" type="checkbox" hidden>
-                  <button type="button" id="sell-auto-fee-button" class="preset-chip compact settings-auto-fee-button" title="When enabled, sell-side fees are resolved from live fee market data for the selected route. This keeps snipe sells and dev auto-sells aligned with current conditions without editing the manual fee boxes. If Max Auto Fee is set, auto-resolved fees are capped at that SOL amount. Leave Max Auto Fee empty for no cap.">Auto Fee</button>
+                  <button type="button" id="sell-auto-fee-button" class="preset-chip compact settings-auto-fee-button tooltip-button">Auto Fee<span class="tooltip-panel tooltip-panel-wide" role="tooltip"><span class="tooltip-panel-body">Uses live route-aware fee estimates for sells. Manual Priority Fee and Tip inputs are ignored while Auto Fee is on. Max Fee caps the total auto-resolved fee budget for this row.</span></span></button>
                   <label class="settings-auto-fee-cap settings-fee-field">
                     <span>Max Fee</span>
                     <span class="settings-fee-input-wrap">
@@ -974,7 +968,7 @@
               <div class="sniper-wallets-header">
                 <div class="sniper-wallets-header-copy">
                   <strong>Wallets</strong>
-                  <span class="tooltip-dot inline" title="The selected deployer wallet is pinned first for visibility and cannot snipe the same launch.">?</span>
+                  <span class="tooltip-dot inline" tabindex="0" aria-label="The selected deployer wallet is shown first for visibility and is excluded from sniping the same launch.">?<span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">The selected deployer wallet is shown first for visibility and is excluded from sniping the same launch.</span></span></span>
                 </div>
                 <div class="sniper-wallets-summary">
                   <div id="sniper-selection-summary" class="muted small">0 wallets selected</div>

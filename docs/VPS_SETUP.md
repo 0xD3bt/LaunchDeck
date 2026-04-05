@@ -1,37 +1,49 @@
 # VPS Setup
 
-This guide walks through a simple VPS deployment flow for LaunchDeck.
+This guide walks through a straightforward VPS deployment flow for LaunchDeck.
 
-For most operators, start with a Helius-first setup and place the VPS near your provider endpoints. A good default is:
+The recommended pattern is:
 
-- US: Newark, Virginia, or New York area
+- run LaunchDeck on the VPS
+- keep the UI bound to `127.0.0.1`
+- use an SSH tunnel from your local machine to reach the UI
+
+## Recommended location
+
+Place the VPS near the provider endpoints you actually plan to use.
+
+Recommended starting regions:
+
 - EU: Frankfurt or Amsterdam
+- US: Newark or Salt Lake City if you want exact Helius metro routing, or nearby metros such as New York / Virginia when that is the more practical hosting choice
+- Asia: Singapore or Tokyo
 
-The examples below use [Vultr](https://www.vultr.com/?ref=9589308) because it has been a reliable option, but the same general process works on other VPS providers too.
+Practical note:
 
-## Why Use A VPS
+- if you use grouped routing like `us` or `asia`, those metros are far apart
+- the best practical result is usually to place the server in one of them and use the exact metro token in `USER_REGION`
 
-Running LaunchDeck on a VPS is usually the better default for:
+## Recommended stack on a VPS
 
-- lower latency to your RPC, sender, and bundle endpoints
-- better separation from your everyday browsing machine
-- easier repeatable deployments with SSH keys and startup scripts
-- the ability to keep execution on the VPS while still operating the UI from your normal desktop over SSH
+For most operators:
 
-By default, LaunchDeck binds the UI to `127.0.0.1` on the server. That means the recommended access pattern is an SSH tunnel from your local machine to the VPS.
+- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
+- `SOLANA_WS_URL`: Helius standard websocket
+- `LAUNCHDECK_WARM_RPC_URL`: Shyft
+- provider: `Helius Sender` or `Hello Moon`
 
-## Recommended Server Shape
+Helius dev tier is strongly recommended if you plan to run multiple snipes or watcher-heavy follow automation.
+
+## Recommended server shape
 
 Start simple unless you already know you need more:
 
-- Ubuntu `24.04` LTS
+- Ubuntu `24.04`
 - 2 vCPU minimum
 - 4 GB RAM minimum
-- enough SSD for Rust builds, node modules, logs, and uploads
+- enough SSD for Rust builds, `node_modules`, uploads, and local reports
 
-## 1. Create Your SSH Key
-
-If you do not already have an SSH key on your local machine, create one.
+## 1. Create an SSH key
 
 Linux or macOS:
 
@@ -45,12 +57,7 @@ Windows PowerShell with OpenSSH:
 ssh-keygen -t ed25519 -C "you@example.com"
 ```
 
-Accept the default path unless you already manage multiple keys. This usually creates:
-
-- private key: `~/.ssh/id_ed25519`
-- public key: `~/.ssh/id_ed25519.pub`
-
-Show the public key so you can copy it:
+Show the public key:
 
 ```bash
 cat ~/.ssh/id_ed25519.pub
@@ -58,81 +65,41 @@ cat ~/.ssh/id_ed25519.pub
 
 Do not share the private key.
 
-## 2. Add The SSH Key To Vultr
-
-In Vultr, add SSH keys here:
-
-- [Vultr SSH Keys](https://my.vultr.com/sshkeys/)
-
-1. Open `SSH Keys`
-2. Choose `Add SSH Key`
-3. Paste the contents of your public key
-4. Save it with a label you will recognize later
-
-## 3. Choose The VPS Region
-
-When creating the VPS:
-
-- prefer Helius-backed routing first; only switch to another provider when you have a specific reason
-- for US, pick Newark, Virginia, or New York area
-- for EU, pick Frankfurt or Amsterdam
-
-Those are the suggested starting points for better latency.
-
-## 4. Create The Server
+## 2. Create the VPS
 
 Suggested starting choices:
 
-1. Product: standard VPS / cloud compute
-2. OS: `Ubuntu 24.04`
-3. Size: at least `2 vCPU / 4 GB RAM`
-4. Region: one of the recommended regions above
-5. SSH key: attach the key you added
-6. Startup script: create or paste the script here first, then attach it during deployment:
+1. use a standard cloud VPS
+2. choose `Ubuntu 24.04`
+3. choose at least `2 vCPU / 4 GB RAM`
+4. choose the region closest to your target provider endpoints
+5. attach your SSH key
 
-- [Vultr Startup Scripts](https://my.vultr.com/startup/)
+This guide uses [Vultr](https://www.vultr.com/?ref=9589308) as the worked example, but the same shape works on other providers too.
 
-Use the contents of `scripts/vps-bootstrap.sh`.
+## 3. Bootstrap the server
 
-If your provider supports custom startup variables, these are the ones used by the script:
+If you use the repo bootstrap flow, the startup script is:
 
-- `LAUNCHDECK_REPO_URL`
-- `LAUNCHDECK_REPO_BRANCH`
-- `LAUNCHDECK_DIR`
-- `LAUNCHDECK_SERVICE_NAME`
-- `NODE_MAJOR`
+- `scripts/vps-bootstrap.sh`
 
-Defaults are already included, so you usually do not need to change them.
+Typical bootstrap result:
 
-## 5. Wait For Bootstrap To Finish
+- installs system packages
+- installs Rust
+- installs Node.js
+- clones the repo to `/opt/launchdeck`
+- runs `npm install`
+- copies `.env.example` to `.env` when needed
+- installs a `systemd` service
 
-The startup script will:
-
-- install system packages
-- install Rust
-- install Node.js `20`
-- clone the repo into `/opt/launchdeck`
-- run `npm install`
-- copy `.env.example` to `.env` if needed; use `.env.advanced` as the full variable reference
-- install and enable a `systemd` service called `launchdeck`
-- enable `ufw` and `fail2ban`
-
-If you are newer to coding or Linux, you can also do the setup through an AI coding tool instead of handling everything manually in a raw terminal.
-
-Useful options:
-
-- [Cursor](https://cursor.com/)
-- [Codex](https://openai.com/codex/)
-
-You can SSH into the VPS through those tools and let the AI help with the rest of the setup, edit files more easily, handle `.env` changes, restart services, and troubleshoot issues.
-
-Once the server is up, SSH in:
+## 4. SSH into the server
 
 ```bash
 ssh root@YOUR_SERVER_IP
 ```
 
-## 6. Edit The Env File
+## 5. Fill `.env`
 
 On the server:
 
@@ -141,36 +108,37 @@ cd /opt/launchdeck
 nano .env
 ```
 
-At minimum, most operators will want to fill in:
+Start with the same easy-setup values from `.env.example`:
 
+- `SOLANA_PRIVATE_KEY` or your `SOLANA_PRIVATE_KEY*` wallet set
 - `SOLANA_RPC_URL`
 - `SOLANA_WS_URL`
-- `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height reads off your main RPC
-- `SOLANA_PRIVATE_KEY` or your `SOLANA_PRIVATE_KEY*` set
-- `USER_REGION` for your preferred regional group or explicit metro list
+- `USER_REGION`
+- `LAUNCHDECK_WARM_RPC_URL`
+
+If you want exact copy-paste examples:
+
+```bash
+SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
+```
 
 Optional but common:
 
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier
-- `PINATA_JWT`
+- `HELLOMOON_API_KEY`
 - `BAGS_API_KEY`
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
+- `PINATA_JWT`
 
-Recommended setup:
-
-- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- use Helius standard websocket for `SOLANA_WS_URL`
-- use a [Shyft](https://shyft.to/) RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- use `Helius Sender` as your provider in LaunchDeck
-
-At the moment, that is the fastest and best-supported operator path in LaunchDeck for most users. If your Helius websocket supports `transactionSubscribe` on dev tier, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` for the upgraded slot, signature, and market watcher path. Helius dev tier is highly recommended if you want the biggest improvement in watcher quality, execution speed, and overall runtime behavior, especially if you plan to run multiple snipes.
-
-Full env reference:
+More detail:
 
 - `docs/CONFIG.md`
+- `docs/ENV_REFERENCE.md`
 
-## 7. Start Or Restart LaunchDeck
+## 6. Start or restart LaunchDeck
 
-After editing `.env`, restart the service:
+If you are using the service install:
 
 ```bash
 systemctl restart launchdeck
@@ -183,33 +151,23 @@ Useful logs:
 journalctl -u launchdeck -n 100 --no-pager
 ```
 
-The runtime helper writes logs under:
+## 7. Open the UI through SSH tunneling
 
-```bash
-/opt/launchdeck/.local/launchdeck
-```
-
-## 8. Open The UI Safely With An SSH Tunnel
-
-Because LaunchDeck binds to `127.0.0.1` on the VPS by default, open an SSH tunnel from your local machine:
+Because LaunchDeck binds locally by default, the recommended access pattern is an SSH tunnel:
 
 ```bash
 ssh -L 8789:127.0.0.1:8789 root@YOUR_SERVER_IP
 ```
 
-Then open this locally in your browser:
+Then open:
 
 ```text
 http://127.0.0.1:8789
 ```
 
-This keeps the UI private instead of exposing it directly to the public internet.
+This keeps the UI private instead of exposing it directly to the internet.
 
-After that, you can just use LaunchDeck from your normal desktop browser while the runtime stays on the VPS. The SSH tunnel only carries the local UI connection, so you can still use the app normally, including things like popout windows and the regular operator workflow.
-
-## 9. Updating The Server Later
-
-SSH into the VPS and run:
+## 8. Updating later
 
 ```bash
 cd /opt/launchdeck
@@ -218,7 +176,7 @@ npm install
 systemctl restart launchdeck
 ```
 
-## 10. Common Commands
+## Useful commands
 
 Service status:
 
@@ -232,12 +190,6 @@ Restart:
 systemctl restart launchdeck
 ```
 
-Stop:
-
-```bash
-systemctl stop launchdeck
-```
-
 Tail logs:
 
 ```bash
@@ -246,6 +198,7 @@ journalctl -u launchdeck -f
 
 ## Notes
 
-- This guide uses [Vultr](https://www.vultr.com/?ref=9589308) as the worked example, but LaunchDeck can run on any VPS provider.
-- If you want a public hostname later, add your own reverse proxy on top intentionally. Do not expose the raw local bind by accident.
-- If you change the install path or service name, update the commands accordingly.
+- do not expose the raw local bind publicly unless you intentionally add a reverse proxy and access controls
+- restart LaunchDeck after env changes
+- if you change ports or install paths, update the service and commands accordingly
+

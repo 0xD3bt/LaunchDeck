@@ -15,6 +15,7 @@ use std::{path::Path, str::FromStr};
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 const PUMP_AGENT_PAYMENTS_PROGRAM_ID: &str = "AgenTMiC2hvxGebTsgmsD4HHBa8WEcqGFf87iwRRxLo7";
+const MPL_TOKEN_METADATA_PROGRAM_ID: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 const PLATFORM_GITHUB: u8 = 2;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -123,6 +124,19 @@ fn normalize_social_url(raw_value: &str, kind: &str) -> String {
         "telegram" => format!("https://t.me/{normalized}"),
         _ => normalize_http_url(raw),
     }
+}
+
+fn metadata_program_id() -> Result<Pubkey, String> {
+    Pubkey::from_str(MPL_TOKEN_METADATA_PROGRAM_ID)
+        .map_err(|error| format!("Invalid token metadata program id: {error}"))
+}
+
+fn metadata_account_pda(mint: &Pubkey) -> Result<Pubkey, String> {
+    Ok(Pubkey::find_program_address(
+        &[b"metadata", metadata_program_id()?.as_ref(), mint.as_ref()],
+        &metadata_program_id()?,
+    )
+    .0)
 }
 
 fn is_ephemeral_launchblitz_image(url: &str) -> bool {
@@ -393,6 +407,38 @@ fn normalize_imported_metadata_payload(payload: &Value, source: &str) -> Importe
         routes: ImportedRouteData::default(),
         detection: ImportedDetectionSummary::default(),
     }
+}
+
+fn parse_metaplex_metadata_account(data: &[u8]) -> Result<ImportedTokenData, String> {
+    if data.len() < 1 + 32 + 32 {
+        return Err("Metaplex metadata account was too short.".to_string());
+    }
+    let mut offset = 1usize;
+    let _update_authority = read_pubkey(data, &mut offset)?;
+    let _mint = read_pubkey(data, &mut offset)?;
+    let name = read_string(data, &mut offset)?
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    let symbol = read_string(data, &mut offset)?
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    let metadata_uri = read_string(data, &mut offset)?
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    Ok(ImportedTokenData {
+        name,
+        symbol,
+        metadataUri: normalize_http_url(&metadata_uri),
+        source: "metaplex".to_string(),
+        detection: ImportedDetectionSummary {
+            sources: vec!["metaplex".to_string()],
+            notes: Vec::new(),
+        },
+        ..ImportedTokenData::default()
+    })
 }
 
 async fn fetch_json_or_null(client: &Client, url: &str) -> Option<Value> {
@@ -918,6 +964,48 @@ async fn enrich_from_dexscreener(
     imported
 }
 
+async fn enrich_from_metaplex_metadata(
+    client: &Client,
+    rpc_url: &str,
+    mint: &Pubkey,
+    mut imported: ImportedTokenData,
+) -> ImportedTokenData {
+    let metadata_pda = match metadata_account_pda(mint) {
+        Ok(value) => value,
+        Err(_) => return imported,
+    };
+    let account_data =
+        match fetch_account_data(rpc_url, &metadata_pda.to_string(), "confirmed").await {
+            Ok(value) => value,
+            Err(_) => return imported,
+        };
+    let onchain_metadata = match parse_metaplex_metadata_account(&account_data) {
+        Ok(value) => value,
+        Err(_) => return imported,
+    };
+    imported = merge_imported(imported, onchain_metadata);
+    if !imported.metadataUri.is_empty()
+        && let Some(metadata_payload) = fetch_json_or_null(client, &imported.metadataUri).await
+    {
+        imported = merge_imported(
+            imported,
+            normalize_imported_metadata_payload(&metadata_payload, "metadata"),
+        );
+    }
+    imported
+}
+
+fn imported_has_external_metadata_content(imported: &ImportedTokenData) -> bool {
+    !imported.name.is_empty()
+        || !imported.symbol.is_empty()
+        || !imported.description.is_empty()
+        || !imported.imageUrl.is_empty()
+        || !imported.website.is_empty()
+        || !imported.twitter.is_empty()
+        || !imported.telegram.is_empty()
+        || !imported.metadataUri.is_empty()
+}
+
 pub async fn fetch_imported_token_metadata(
     contract_address: &str,
     rpc_url: &str,
@@ -942,12 +1030,14 @@ pub async fn fetch_imported_token_metadata(
                     hint_succeeded = hinted.launchpad == "pump";
                 }
                 hinted = enrich_from_dexscreener(&client, contract_address, hinted).await;
+                hinted = enrich_from_metaplex_metadata(&client, rpc_url, &mint, hinted).await;
             }
             "bonk" => {
                 if let Some(context) = detect_bonk_import_context(rpc_url, contract_address).await?
                 {
                     hinted = apply_import_context(hinted, map_bonk_import_context(context));
                     hinted = enrich_from_dexscreener(&client, contract_address, hinted).await;
+                    hinted = enrich_from_metaplex_metadata(&client, rpc_url, &mint, hinted).await;
                     hint_succeeded = hinted.launchpad == "bonk";
                 }
             }
@@ -956,12 +1046,13 @@ pub async fn fetch_imported_token_metadata(
                 {
                     hinted = apply_import_context(hinted, map_bags_import_context(context));
                     hinted = enrich_from_dexscreener(&client, contract_address, hinted).await;
+                    hinted = enrich_from_metaplex_metadata(&client, rpc_url, &mint, hinted).await;
                     hint_succeeded = hinted.launchpad == "bagsapp";
                 }
             }
             _ => {}
         }
-        if hint_succeeded && imported_has_any_content(&hinted) {
+        if hint_succeeded && imported_has_external_metadata_content(&hinted) {
             return Ok(hinted);
         }
     }
@@ -970,6 +1061,7 @@ pub async fn fetch_imported_token_metadata(
         enrich_from_pump_frontend(&client, contract_address, imported).await;
     imported = next_imported;
     imported = enrich_from_dexscreener(&client, contract_address, imported).await;
+    imported = enrich_from_metaplex_metadata(&client, rpc_url, &mint, imported).await;
     if let Some(context) = detect_pump_import_context(rpc_url, &mint, pump_payload.as_ref()).await?
     {
         imported = apply_import_context(imported, context);

@@ -10,166 +10,90 @@ LaunchDeck is a self-hosted Solana launch and snipe tool built under the broader
 > ### Contract Address
 > `L73w5odyo5ZdJ1fPp319nfjqaFfHDdKifRmM8Kxpump`
 
-Instead of paying fees to third-party launch platforms, LaunchDeck lets you run the launcher locally, use your own wallets and provider keys, and customize how launches are built, simulated, and sent. You can get started with free infrastructure, but for serious use we strongly recommend a Helius dev-tier setup because it delivers a major improvement in realtime watcher quality, execution reliability, and overall performance.
+LaunchDeck lets you run launches locally, use your own wallets and provider keys, and control how creation, buy, sell, and follow actions are built and sent.
 
-This repo is under active development. The README reflects the features we consider usable today.
+This repo is under active development. The README reflects the setup and features we consider usable today.
 
-LaunchDeck is open-source tooling provided as-is. Running it, configuring it, modifying it, deploying it, or using it in any way is entirely the user's own responsibility. By using this software, you accept full responsibility for your environment, infrastructure, wallets, keys, dependencies, third-party packages, and any outcomes that result from its use. Trench.tools is not responsible for losses, damages, exploits, malicious code, compromised packages, misconfiguration, misuse, downtime, failed transactions, or any other direct or indirect consequences related to the software or its dependencies.
+LaunchDeck is open-source tooling provided as-is. Running it, configuring it, modifying it, deploying it, or using it in any way is entirely the user's own responsibility. By using this software, you accept full responsibility for your environment, infrastructure, wallets, keys, dependencies, third-party packages, and any outcomes that result from its use.
 
-## Current Recommendation
+## Recommended Stack
 
-For most operators today, the best-supported setup is:
+For most operators today, the best-supported production setup is:
 
-- [Helius](https://www.helius.dev/) for the full infrastructure stack
+- [Helius dev tier](https://www.helius.dev/pricing) for your main infrastructure
 - `Helius Gatekeeper HTTP` for `SOLANA_RPC_URL`
 - `Helius standard websocket` for `SOLANA_WS_URL`
-- a separate [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- `Helius Sender` or `Hello Moon QUIC` as the creation, buy, and sell provider
+- a separate [Shyft](https://shyft.to/) free-tier RPC for `LAUNCHDECK_WARM_RPC_URL`
+- `Helius Sender` or `Hello Moon` as the execution provider
 
-Why this is the current recommended stack:
+Why this is the default recommendation:
 
-- `LAUNCHDECK_WARM_RPC_URL` offloads startup warmup and block-height observation away from your main execution RPC
-- Shyft is a good fit for that warm path because you can use a free API key there
-- startup and keep-warm also hit each Helius Sender host’s HTTP `/ping` (derived from `/fast`) and report per-target status in the UI runtime indicator
-- Helius dev tier gives a very noticeable improvement in watcher performance and live execution quality versus a bare-minimum free setup, especially if you run multiple snipes or watcher-heavy follow automation
+- Helius Gatekeeper HTTP benchmarked best for the main HTTP RPC path
+- Helius standard websocket benchmarked best for the watcher websocket path
+- [Helius dev tier](https://www.helius.dev/pricing) gives a noticeable improvement in watcher quality and execution consistency, especially when you run multiple snipes or watcher-heavy follow automation
+- Shyft is a good fit for `LAUNCHDECK_WARM_RPC_URL` because its free tier offers unlimited calls at `10 RPS`, and it is well-suited to warm/cache/block-height traffic
 
-Provider note:
+### Benchmarked baseline
 
-- `Helius Sender` is still the easiest default recommendation for most operators
-- `Hello Moon QUIC` is also recommended when you want a strong alternate low-latency path
-- `Hello Moon QUIC` requires a Lunar Lander API key from Hello Moon first; request access through their [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) and [Hello Moon Discord](https://discord.com/invite/HelloMoon)
+This is the current baseline we are recommending from our own testing on a Frankfurt VPS:
 
-If you have Helius dev tier and your websocket endpoint supports it, also enable:
+- Shyft free tier
+- Helius Developer tier, about `$50/month`, via [Helius pricing](https://www.helius.dev/pricing)
+- 80 timed samples per metric
+- warmup cycles enabled
+- 100 ms request gap, about `10 RPS` per endpoint
 
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+Shareable summary:
 
-In the current runtime, that unlocks the enhanced `transactionSubscribe` watcher path whenever the follow daemon is using a Helius websocket watch endpoint, while still falling back safely to standard websocket watchers when unsupported.
+| Provider | HTTP cold avg | HTTP warm avg | WS handshake | WS slotSubscribe avg | WS accountSubscribe avg | WS transactionSubscribe avg |
+| --- | --- | --- | --- | --- | --- | --- |
+| Shyft free tier | 18.97 ms | 18.15 ms | 18.46 ms | 4.77 ms | 5.55 ms | — |
+| Helius standard | 49.24 ms | 29.29 ms | 62.33 ms | 3.74 ms | 3.23 ms | 3.58 ms |
+| Helius Gatekeeper | 6.45 ms | 2.36 ms | 9.88 ms | 43.27 ms | 43.51 ms | 43.56 ms |
 
-## What It Does
+Out of the Helius and Shyft options tested here:
 
-LaunchDeck is built for operators who want to:
+- Helius Gatekeeper benchmarked best for the HTTP RPC path
+- Helius standard websocket benchmarked best for websocket watcher subscriptions
+- Shyft free tier was still strong enough to be a very good warm RPC choice
 
-- launch locally instead of using a hosted launcher UI
-- use their own RPC, websocket, sender, and bundle infrastructure
-- control creation, buy, and sell execution settings separately
-- run same-time or delayed launch-follow actions
-- keep durable local reports for audit and reuse
+That is why the recommended split in LaunchDeck is:
 
-## Runtime Model
+- Helius Gatekeeper for `SOLANA_RPC_URL`
+- Helius standard websocket for `SOLANA_WS_URL`
+- Shyft free tier for `LAUNCHDECK_WARM_RPC_URL`
 
-LaunchDeck currently runs as two local Rust processes:
+Do not treat these numbers as universal.
 
-- the main host on `http://127.0.0.1:8789` by default
-- the follow daemon on `http://127.0.0.1:8790` by default
+- benchmark your own connections, especially warm results, from the exact VPS and region you actually run
+- dedicated nodes or more specialized infra will likely beat this
+- for what LaunchDeck is currently meant to do, this baseline is already good enough to launch and compete for `0` block in hundreds of milliseconds
 
-The main host serves:
+If you want to reproduce or compare your own setup, use:
 
-- the browser UI
-- browser-facing `/api/*` routes
-- internal `/engine/*` routes
-- uploaded assets under `/uploads/*`
+- `docs/BENCHMARKING.md`
+- `Benchmarking/README.md`
 
-The follow daemon is responsible for:
+Hello Moon note:
 
-- delayed and watcher-driven follow actions
-- realtime slot, signature, and market watchers
-- follow telemetry and timing profiles
-- persisted follow-job state outside the main request lifecycle
+- `hellomoon` is a recommended alternate low-latency execution path
+- it requires a Lunar Lander API key from Hello Moon
+- request access through the [Lunar Lander docs](https://docs.hellomoon.io/reference/lunar-lander) or the [Hello Moon Discord](https://discord.com/invite/HelloMoon)
 
-## Current Support
+## Easiest First Setup
 
-### Verified Launchpads
+For most users, the easiest setup is:
 
-#### Pump
+1. copy `.env.example` to `.env`
+2. fill only the values already listed in `.env.example`
+3. start LaunchDeck with `npm start`
+4. leave the advanced defaults alone until you actually need them
 
-Verified and Rust-native for:
+The starter template is meant to be enough for a normal first production setup. If you want every variable, use `.env.advanced` and `docs/ENV_REFERENCE.md`.
 
-- `regular`
-- `cashback`
-- `agent-custom`
-- `agent-unlocked`
-- `agent-locked`
-- immediate dev buy
-- same-time sniper buys
-- delayed sniper buys
-- snipe sells
-- automatic dev sell
+### Recommended `.env` values
 
-Pump launch assembly, transaction shaping, simulation, send orchestration, and reporting are handled in the Rust engine.
-
-#### Bonk
-
-Verified for:
-
-- `regular`
-- `bonkers`
-- quote assets `sol` and `usd1`
-- immediate dev buy
-- same-time sniper buys
-- delayed sniper buys
-- snipe sells
-- automatic dev sell
-
-Bonk validation, transport planning, reporting, simulation, and send execution are Rust-owned. Launch assembly uses the Raydium LaunchLab-backed helper bridge.
-
-Bonk `usd1` currently uses a pinned Raydium `SOL -> USD1` route pool, and same-time `usd1` sniper buys are assembled as atomic swap-and-buy transactions.
-
-The shipped engine is now `rust-native-only`. Unsupported launchpad or mode combinations hard-fail during validation instead of falling back to a generic legacy JS compile path. Bonk and Bags helper scripts remain targeted helper bridges, not a general fallback runtime.
-
-### Experimental
-
-#### Bagsapp
-
-Bagsapp is available when configured, but it is still experimental in this repo.
-
-Available behavior today includes:
-
-- fee modes `bags-2-2`, `bags-025-1`, and `bags-1-025`
-- wallet-only identity
-- linked Bags identity when the selected LaunchDeck wallet belongs to the authenticated Bags account
-- immediate dev buy
-- same-time sniper buys
-- delayed sniper buys and snipe sells
-- automatic dev sell
-
-See `docs/LAUNCHPADS.md` for the exact support matrix and restrictions.
-
-## Quick Start
-
-### 1. Install Dependencies
-
-LaunchDeck uses:
-
-- Rust for the engine and daemon
-- Node.js for runtime helpers and launchpad helper scripts
-
-Install the repo dependencies, then copy `.env.example` to `.env` and fill in the quick-start values. If you want the full variable list, use `.env.advanced` as the reference.
-
-### 2. Configure The Minimum Required Env Vars
-
-Most operators only need to set:
-
-- `SOLANA_RPC_URL`
-- `SOLANA_WS_URL`
-- `LAUNCHDECK_WARM_RPC_URL` if you want startup warm and block-height observation off your main RPC
-- `SOLANA_PRIVATE_KEY` or `SOLANA_PRIVATE_KEY*`
-- `USER_REGION` for region-aware providers; use a regional group such as `us`, `eu`, or `asia`, or explicit metros such as `fra`, `ams`, or `slc` (comma-separated metros are also supported). This is usually better than pinning one specific sender or bundle endpoint because LaunchDeck can fan out across the selected route set.
-
-Optional but common:
-
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata` ([Pinata](https://pinata.cloud/))
-- `PINATA_JWT`
-- `BAGS_API_KEY`
-- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and want the enhanced watcher path whenever LaunchDeck is watching through a Helius websocket endpoint
-
-Recommended practical setup:
-
-- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- use Helius standard websocket for `SOLANA_WS_URL`
-- use a Shyft RPC URL with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- use `Helius Sender` as the provider in LaunchDeck
-
-Example URL shapes:
+If you do not want to fetch the exact Helius URLs from the dashboard yourself, you can copy these exactly and replace only the API key:
 
 ```bash
 SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
@@ -179,136 +103,242 @@ LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
 
 Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
 
-That combination is currently the strongest default operator path in LaunchDeck. The app can run without paid infra, but Helius dev tier is highly recommended if you care about maximum speed, better watcher behavior, and better execution consistency.
+At minimum, most operators should set:
 
-Full configuration reference: `docs/CONFIG.md`
+- `SOLANA_PRIVATE_KEY` or the `SOLANA_PRIVATE_KEY*` wallet slots they want to use
+- `SOLANA_RPC_URL`
+- `SOLANA_WS_URL`
+- `USER_REGION`
+- `LAUNCHDECK_WARM_RPC_URL`
 
-### 3. Start The Runtime
+Optional but common:
+
+- `HELLOMOON_API_KEY`
+- `BAGS_API_KEY`
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
+- `PINATA_JWT`
+- `LAUNCHDECK_BENCHMARK_MODE`
+
+## What Is Already Enabled By Default
+
+You do not need to manually enable most of the runtime behavior we recommend.
+
+These already default on or to sensible production values:
+
+- startup warm
+- continuous warm
+- idle warm suspend
+- Helius `transactionSubscribe` probe/fallback behavior when your websocket is Helius
+- Bonk and Bags helper workers
+- benchmark mode `full`
+- Helius auto-fee priority level `high`
+- Jito auto-fee percentile `p99`
+- main host port `8789`
+- follow daemon port `8790`
+
+In most setups, the best move is to leave those defaults alone and start with the values in `.env.example`.
+
+## How The Runtime Works
+
+LaunchDeck runs as two local Rust processes:
+
+- the main host on `http://127.0.0.1:8789` by default
+- the follow daemon on `http://127.0.0.1:8790` by default
+
+The main host serves:
+
+- the browser UI
+- browser-facing `/api/*` routes
+- engine execution routes
+- uploaded assets
+
+The follow daemon handles:
+
+- delayed buys and sells
+- realtime slot, signature, and market watchers
+- follow timing and watcher health
+- persisted follow-job state outside the main request lifecycle
+
+### Warmup and keep-alive
+
+LaunchDeck separates three ideas:
+
+- execution transport
+- read/confirm RPC
+- watcher websocket
+
+In practice:
+
+- `Helius Sender` or `Hello Moon` handle the low-latency send path
+- `SOLANA_RPC_URL` handles reads, confirmations, and general runtime RPC behavior
+- `SOLANA_WS_URL` handles realtime watchers
+- `LAUNCHDECK_WARM_RPC_URL` handles startup warm, continuous warm probes, and block-height observation so that traffic does not have to hit your main execution RPC
+
+Current warm behavior:
+
+- startup warm runs once when the app starts
+- continuous warm keeps the active routes hot while the app is in use
+- idle warm suspend pauses that background warm traffic when the app is idle
+- watcher websocket warm probes the configured watcher path; it is not a separate provider-region fanout path
+
+When you save settings:
+
+- if the effective send routes changed, LaunchDeck immediately rewarms the new paths
+- if the effective routes did not change, LaunchDeck keeps the current warm schedule instead of needlessly restarting it
+
+### Region and metro routing
+
+`USER_REGION` is the shared default profile for region-aware providers.
+
+Supported group values:
+
+- `global`
+- `us`
+- `eu`
+- `asia`
+
+Supported metro tokens:
+
+- `slc`
+- `ewr`
+- `lon`
+- `fra`
+- `ams`
+- `sg`
+- `tyo`
+
+Important behavior:
+
+- Helius Sender supports exact metro routing where those metros exist
+- Hello Moon maps unsupported metros onto the closest Hello Moon endpoints it actually exposes
+- `eu` fans out across Amsterdam + Frankfurt
+- `asia` fans out across Singapore + Tokyo on Helius Sender, while Hello Moon `asia` / `sg` fall back to Tokyo
+- `us` fans out across Salt Lake City + Newark on Helius Sender, while Hello Moon `us` / `slc` / `ewr` fan out across New York + Ashburn
+
+## Quick Start
+
+### 1. Install dependencies
+
+LaunchDeck uses:
+
+- Rust for the engine and follow daemon
+- Node.js for runtime helpers and launchpad helper scripts
+
+From the repo root:
+
+```bash
+npm install
+```
+
+### 2. Configure `.env`
+
+Copy `.env.example` to `.env`, then fill the starter values.
+
+If you want the full list, use:
+
+- `.env.advanced`
+- `docs/ENV_REFERENCE.md`
+
+### 3. Start the runtime
 
 Primary commands:
 
 - `npm start`
 - `npm stop`
 - `npm restart`
-- `npm run ui`
 
-`npm start` uses the platform runtime helper:
+`npm start` launches both the main host and the follow daemon together, waits for health, and opens the UI when supported.
 
-- Linux: `start.sh`
-- Windows: `start.ps1`
-
-It stops old LaunchDeck processes, starts the main host and follow daemon together, waits for both health checks, and opens the UI when supported.
-
-### 4. Open The UI
+### 4. Open the UI
 
 Default local URL:
 
 - `http://127.0.0.1:8789`
 
-Typical first-run workflow:
+Basic run flow:
 
-1. import or confirm a wallet from `SOLANA_PRIVATE_KEY*`
-2. choose a launchpad and mode
-3. select an image and fill token metadata
-4. review creation, buy, and sell settings
-5. optionally configure snipers or auto-sell
-6. `Build`, `Simulate`, or `Deploy`
+- confirm your wallets are loaded from `SOLANA_PRIVATE_KEY*`
+- set your normal preset defaults in the Settings modal
+- you are ready to launch
 
-Detailed operator walkthrough: `docs/USAGE.md`
+## Provider Summary
 
-VPS deployment walkthrough: `docs/VPS_SETUP.md`
-
-## Execution Providers
-
-LaunchDeck exposes four current provider choices:
+Current provider choices:
 
 - `Helius Sender`
-- `Hello Moon QUIC`
+- `Hello Moon`
 - `Standard RPC`
 - `Jito Bundle`
 
-Important rules:
+Current recommendation:
 
-- `Helius Sender` is the current default, fastest, and most reliable starting point for most operators
-- `Helius Sender` requires `skipPreflight=true`, a positive compute-unit price, and a tip of at least `200000` lamports
-- `Hello Moon QUIC` is available as a QUIC-based low-latency provider path
-- `Standard RPC` uses the optimized `standard-rpc-fanout` transport and does not use tip
-- `Standard RPC` always submits with `skipPreflight=true` and `maxRetries=0`
-- `Standard RPC` can fan out to `SOLANA_RPC_URL` plus optional extra submit endpoints from `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
-- `Jito Bundle` uses bundle submission and status polling
-- legacy provider names such as `auto`, `helius`, `jito`, `astralane`, `bloxroute`, and `hellomoon` are migrated for compatibility when old saved configs are loaded, but they are not live provider IDs in the current runtime
-
-The UI collects intent, but the engine is the final source of truth for what gets applied to each transaction.
-
-Examples:
-
-- a stored tip value is ignored on `Standard RPC`
-- `Helius Sender` hard-fails if Sender requirements are not satisfied
-- `Hello Moon QUIC` hard-fails if its provider requirements are not satisfied
-- `Jito Bundle` may drop creation priority in launch shapes where it would only add cost without helping
-
-Provider details: `docs/PROVIDERS.md`
+- start with `Helius Sender` if you want the easiest production default
+- use `Hello Moon` when you want a strong alternate low-latency execution path
+- use `Standard RPC` when you want explicit plain-RPC transport behavior
+- use `Jito Bundle` when you explicitly want bundle semantics
 
 ## Follow Automation
 
-LaunchDeck supports launch-follow automation through the dedicated daemon.
-
-Current follow behavior includes:
+LaunchDeck supports:
 
 - same-time sniper buys
-- delayed sniper buys with `On Submit + Delay`
-- confirmed-block sniper buys with `On Confirmed Block`
-- automatic dev sell with exclusive `Time` or `Market Cap` trigger families
-- market-cap sell triggers with timeout in seconds and selectable timeout behavior (`Stop` or `Sell`)
+- delayed sniper buys
+- confirmed-block sniper buys
+- automatic dev sell
 - snipe sells
-- same-time retry for eligible sniper buys
 
-Trigger note:
+This is handled by the dedicated follow daemon so the main launch request does not have to stay open for delayed actions.
 
-- `On Confirmed Block +0` is confirmation-driven, while `On Confirmed Block +N` uses the shared offset worker after confirmation
+## Current Support
 
-Current limitation:
+High-level support today:
 
-- `followLaunch.snipes[].postBuySell` is not supported yet and is rejected by config validation
+- Pump: verified primary path
+- Bonk: verified helper-backed path
+- Bagsapp: available, but still experimental
 
-Pump agent-mode follow note:
-
-- for `agent-custom` and `agent-locked`, same-window `+0` follow buys and sells stay on the original launch-creator / deployer vault path
-- delayed Pump follow buys and sells with `targetBlockOffset > 0` prefer the post-setup fee-sharing config vault path
-- delayed Pump buys in those modes are compiled live by the daemon instead of being pre-signed too early, which helps them pick up the current on-chain creator-vault state
-- if an older pre-signed Pump follow action still hits stale creator-vault or sell-quote state, the daemon can rebuild and retry a fresh payload
-
-Follow system details: `docs/FOLLOW_DAEMON.md` and `docs/STRATEGIES.md`
-
-## Reporting And Local Data
-
-LaunchDeck writes durable local data under `.local/launchdeck` by default:
-
-- `app-config.json`
-- `image-library.json`
-- `lookup-tables.json`
-- `uploads/`
-- `send-reports/`
-- `follow-daemon-state.json`
-
-Reports capture both requested settings and actual execution outcomes, including provider, transport type, endpoint information, signatures, confirmations, and timing breakdowns.
-
-In the History UI, report detail now also surfaces the winning endpoint, attempted endpoints, and auto-fee source summaries when that data is available.
-
-History/report usage: `docs/REPORTING.md`
+See `docs/LAUNCHPADS.md` for the detailed launchpad and mode matrix.
 
 ## Documentation Map
 
-```text
-docs/
-|-- USAGE.md
-|-- CONFIG.md
-|-- LAUNCHPADS.md
-|-- PROVIDERS.md
-|-- STRATEGIES.md
-|-- FOLLOW_DAEMON.md
-|-- REPORTING.md
-|-- TROUBLESHOOTING.md
-|-- ARCHITECTURE.md
-`-- VPS_SETUP.md
-```
+Start here:
+
+- `README.md`
+  First production setup path and docs map
+- `docs/CONFIG.md`
+  Recommended setup, runtime behavior, warm/watch explanation, and operator-facing config guidance
+- `docs/ENV_REFERENCE.md`
+  Full environment variable reference, defaults, and override behavior
+
+Execution and routing:
+
+- `docs/PROVIDERS.md`
+  Provider behavior, endpoint profiles, endpoint catalogs, and routing rules
+- `docs/EXECUTION_DOS_AND_DONTS.md`
+  Lower-level execution transport reference and implementation rules
+
+Operator guides:
+
+- `docs/USAGE.md`
+  Normal UI workflow from startup through deploy and reuse
+- `docs/FOLLOW_DAEMON.md`
+  Follow daemon, triggers, watcher behavior, and follow timing
+- `docs/VPS_SETUP.md`
+  VPS deployment and SSH-tunnel workflow
+
+Reporting, troubleshooting, and benchmarking:
+
+- `docs/TROUBLESHOOTING.md`
+  Common operator problems and what to check
+- `docs/REPORTING.md`
+  Reports, history, and local state
+- `docs/BENCHMARKING.md`
+  Benchmarking concepts and how to interpret results
+- `Benchmarking/README.md`
+  Copy-paste benchmark commands
+
+Additional reference:
+
+- `docs/LAUNCHPADS.md`
+- `docs/STRATEGIES.md`
+- `docs/ARCHITECTURE.md`

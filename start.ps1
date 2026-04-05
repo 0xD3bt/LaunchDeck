@@ -88,8 +88,7 @@ function Stop-OldLaunchDeckRuntime {
     (
       $_.CommandLine.ToLowerInvariant().Contains($engineManifestPath) -or
       $_.CommandLine.ToLowerInvariant().Contains("launchdeck-engine") -or
-      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-follow-daemon") -or
-      $_.CommandLine.ToLowerInvariant().Contains("ui-server.js")
+      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-follow-daemon")
     )
   }
 
@@ -116,27 +115,61 @@ function Wait-ForHealthEndpoint {
     [string]$Url,
     [Parameter(Mandatory = $true)]
     [string]$Name,
+    [Parameter(Mandatory = $true)]
+    [int]$ProcessId,
+    [string]$LogPath = "",
     [int]$MaxAttempts = 20,
-    [int]$DelayMilliseconds = 500
+    [int]$DelayMilliseconds = 500,
+    [int]$SlowNoticeAttempt = 10
   )
 
+  $slowNoticeShown = $false
+
   for ($attempt = 0; $attempt -lt $MaxAttempts; $attempt++) {
-    Start-Sleep -Milliseconds $DelayMilliseconds
     try {
       $response = Invoke-RestMethod -UseBasicParsing $Url -TimeoutSec 2
       if (
         ($null -ne $response.ok -and $response.ok -eq $true) -or
         ($null -ne $response.running -and $response.running -eq $true)
       ) {
-        return $true
+        return @{
+          State = "healthy"
+          Url = $Url
+        }
       }
     } catch {
       # Service may still be starting.
     }
+
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+      return @{
+        State = "failed"
+        Url = $Url
+        LogPath = $LogPath
+      }
+    }
+
+    if (-not $slowNoticeShown -and ($attempt + 1) -ge $SlowNoticeAttempt) {
+      Write-Host "$Name is still compiling or starting..."
+      $slowNoticeShown = $true
+    }
+
+    Start-Sleep -Milliseconds $DelayMilliseconds
   }
 
-  Write-Warning "$Name did not report healthy startup before timeout at $Url. It may still be compiling."
-  return $false
+  if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+    return @{
+      State = "starting"
+      Url = $Url
+      LogPath = $LogPath
+    }
+  }
+
+  return @{
+    State = "failed"
+    Url = $Url
+    LogPath = $LogPath
+  }
 }
 
 function Start-LaunchDeckProcesses {
@@ -145,90 +178,78 @@ function Start-LaunchDeckProcesses {
 
   $daemonStdoutPath = Join-Path $launchDeckLogDir "follow-daemon.log"
   $daemonStderrPath = Join-Path $launchDeckLogDir "follow-daemon-error.log"
-  Start-Process `
+  $daemonProcess = Start-Process `
     -FilePath "cargo" `
     -ArgumentList @("run", "--manifest-path", "rust/launchdeck-engine/Cargo.toml", "--bin", "launchdeck-follow-daemon") `
     -WorkingDirectory $projectRoot `
     -WindowStyle Hidden `
+    -PassThru `
     -RedirectStandardOutput $daemonStdoutPath `
-    -RedirectStandardError $daemonStderrPath | Out-Null
+    -RedirectStandardError $daemonStderrPath
 
   $stdoutPath = Join-Path $launchDeckLogDir "engine.log"
   $stderrPath = Join-Path $launchDeckLogDir "engine-error.log"
 
-  Start-Process `
+  $engineProcess = Start-Process `
     -FilePath "cargo" `
     -ArgumentList @("run", "--manifest-path", "rust/launchdeck-engine/Cargo.toml", "--bin", "launchdeck-engine") `
     -WorkingDirectory $projectRoot `
     -WindowStyle Hidden `
+    -PassThru `
     -RedirectStandardOutput $stdoutPath `
-    -RedirectStandardError $stderrPath | Out-Null
+    -RedirectStandardError $stderrPath
 
-  $healthCheckScript = {
-    param(
-      [string]$Url,
-      [string]$Name,
-      [int]$MaxAttempts,
-      [int]$DelayMilliseconds
-    )
+  $daemonResult = Wait-ForHealthEndpoint `
+    -Url "http://127.0.0.1:$($ports.FollowDaemonPort)/health" `
+    -Name "LaunchDeck follow daemon" `
+    -ProcessId $daemonProcess.Id `
+    -LogPath $daemonStderrPath `
+    -MaxAttempts 40 `
+    -DelayMilliseconds 500
 
-    for ($attempt = 0; $attempt -lt $MaxAttempts; $attempt++) {
-      Start-Sleep -Milliseconds $DelayMilliseconds
-      try {
-        $response = Invoke-RestMethod -UseBasicParsing $Url -TimeoutSec 2
-        if (
-          ($null -ne $response.ok -and $response.ok -eq $true) -or
-          ($null -ne $response.running -and $response.running -eq $true)
-        ) {
-          return @{
-            Healthy = $true
-            Name = $Name
-            Url = $Url
-          }
-        }
-      } catch {
-        # Service may still be starting.
+  $engineResult = Wait-ForHealthEndpoint `
+    -Url "http://127.0.0.1:$($ports.EnginePort)/health" `
+    -Name "LaunchDeck Rust host" `
+    -ProcessId $engineProcess.Id `
+    -LogPath $stderrPath `
+    -MaxAttempts 60 `
+    -DelayMilliseconds 500
+
+  switch ($daemonResult.State) {
+    "healthy" {
+      Write-Host "LaunchDeck follow daemon ready on port $($ports.FollowDaemonPort)."
+    }
+    "starting" {
+      Write-Host "LaunchDeck follow daemon is still starting in the background on port $($ports.FollowDaemonPort)."
+      if ($daemonResult.LogPath) {
+        Write-Host "Info: Check $($daemonResult.LogPath) only if it does not become healthy soon."
       }
     }
-
-    return @{
-      Healthy = $false
-      Name = $Name
-      Url = $Url
+    default {
+      Write-Error "LaunchDeck follow daemon exited before reporting healthy startup at $($daemonResult.Url)."
+      if ($daemonResult.LogPath) {
+        Write-Error "Check $($daemonResult.LogPath) for details."
+      }
     }
   }
 
-  $daemonJob = Start-Job -ScriptBlock $healthCheckScript -ArgumentList @(
-    "http://127.0.0.1:$($ports.FollowDaemonPort)/health",
-    "LaunchDeck follow daemon",
-    40,
-    500
-  )
-  $engineJob = Start-Job -ScriptBlock $healthCheckScript -ArgumentList @(
-    "http://127.0.0.1:$($ports.EnginePort)/health",
-    "LaunchDeck Rust host",
-    60,
-    500
-  )
-
-  Wait-Job -Job @($daemonJob, $engineJob) | Out-Null
-  $daemonResult = Receive-Job -Job $daemonJob
-  $engineResult = Receive-Job -Job $engineJob
-  Remove-Job -Job @($daemonJob, $engineJob) -Force | Out-Null
-
-  if ($daemonResult.Healthy) {
-    Write-Host "LaunchDeck follow daemon ready on port $($ports.FollowDaemonPort)."
-  } else {
-    Write-Warning "LaunchDeck follow daemon did not report healthy startup before timeout at $($daemonResult.Url). It may still be compiling."
-    Write-Warning "Check .local\launchdeck\follow-daemon-error.log if the follow daemon failed to start."
-  }
-
-  if ($engineResult.Healthy) {
-    Write-Host "LaunchDeck Rust host ready on port $($ports.EnginePort)."
-    Start-Process "http://127.0.0.1:$($ports.EnginePort)" | Out-Null
-  } else {
-    Write-Warning "LaunchDeck Rust host did not report healthy startup before timeout at $($engineResult.Url). It may still be compiling."
-    Write-Warning "Check .local\launchdeck\engine-error.log if the Rust host actually failed to start."
+  switch ($engineResult.State) {
+    "healthy" {
+      Write-Host "LaunchDeck Rust host ready on port $($ports.EnginePort)."
+      Start-Process "http://127.0.0.1:$($ports.EnginePort)" | Out-Null
+    }
+    "starting" {
+      Write-Host "LaunchDeck Rust host is still starting in the background on port $($ports.EnginePort)."
+      if ($engineResult.LogPath) {
+        Write-Host "Info: Check $($engineResult.LogPath) only if it does not become healthy soon."
+      }
+    }
+    default {
+      Write-Error "LaunchDeck Rust host exited before reporting healthy startup at $($engineResult.Url)."
+      if ($engineResult.LogPath) {
+        Write-Error "Check $($engineResult.LogPath) for details."
+      }
+    }
   }
 }
 

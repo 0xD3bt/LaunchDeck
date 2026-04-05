@@ -2,9 +2,13 @@
 
 This page explains the dedicated follow daemon that LaunchDeck uses for delayed and watcher-driven post-launch actions.
 
-## What The Daemon Is For
+Default local URL:
 
-The follow daemon exists so LaunchDeck can keep working on follow actions after the main launch request has already returned.
+- `http://127.0.0.1:8790`
+
+## What the daemon does
+
+The follow daemon exists so follow actions do not have to stay on the main launch request path.
 
 Current follow action families:
 
@@ -12,284 +16,149 @@ Current follow action families:
 - `DevAutoSell`
 - `SniperSell`
 
-The daemon is meant to:
+The daemon handles:
 
-- keep running between launches
-- accept follow jobs quickly
-- watch launch progress using realtime watchers
-- compile and send follow actions without blocking the main host
-- persist follow-job state, watcher health, telemetry, and timing profiles
+- delayed follow execution
+- confirmation-driven follow execution
+- realtime slot, signature, and market watchers
+- follow timing and watcher telemetry
+- persisted follow-job state
 
-Default local URL:
+## Host vs daemon
 
-- `http://127.0.0.1:8790`
-
-## Host Vs Daemon
-
-### Main Host
+### Main host
 
 The main host is responsible for:
 
 - serving the UI
-- handling `/api/*`
-- normalizing and validating launch requests
+- accepting the launch request
+- normalizing and validating config
 - compiling and sending the launch
-- compiling and submitting same-time sniper buys
+- compiling same-time sniper buys
 - reserving and arming follow jobs
 
-### Follow Daemon
+### Follow daemon
 
-The daemon is responsible for:
+The follow daemon is responsible for:
 
-- accepting reserved jobs
-- arming jobs once launch-specific context is known
-- running slot, signature, and market watchers
-- executing delayed sniper buys
-- executing automatic dev sells
-- executing snipe sells
-- persisting independent follow-job state
+- accepting armed follow jobs
+- waiting for follow triggers
+- watching chain activity
+- compiling delayed follow actions
+- sending and confirming delayed follow actions
+- persisting follow state and outcomes
 
-## Job Lifecycle
+## Job lifecycle
 
-The current lifecycle is:
+The normal lifecycle is:
 
-1. the main host reserves a follow job before send when follow behavior is enabled
-2. the launch is sent and launch-specific context is captured
-3. the host arms the reserved job with mint, signature, send block, and related context
-4. the daemon marks actions as armed
-5. each action waits for its trigger
-6. the daemon compiles, sends, confirms, and records each action independently
+1. the main host reserves the follow job before launch send
+2. the launch is sent
+3. the main host arms the reserved job with launch context such as mint and signature
+4. the daemon waits for each trigger
+5. the daemon compiles, sends, confirms, and records each action independently
 
-This keeps delayed follow behavior off the main request path while still letting the UI work with a single launch action.
+## Trigger modes
 
-## Trigger Modes
-
-### Trigger Matrix
-
-This is the quickest way to understand which part of LaunchDeck actually decides that a follow action is ready:
-
-| UI Trigger | Primary trigger owner | What it waits on |
+| UI trigger | Primary owner | What it waits for |
 | --- | --- | --- |
 | `Same Time` | main host | launch submission path itself |
-| `On Submit + Delay` | daemon timer | observed submit time plus delay |
-| `On Confirmed Block +0` | signature watcher | launch confirmation only |
-| `On Confirmed Block +N` | signature watcher, then shared offset worker | launch confirmation, then confirmed block-height offset |
-| `Market Cap` | market watcher | market-cap threshold or timeout |
+| `On Submit + Delay` | follow daemon | observed submit time plus delay |
+| `On Confirmed Block +0` | follow daemon watcher | launch confirmation |
+| `On Confirmed Block +N` | follow daemon watcher + offset worker | launch confirmation, then extra confirmed blocks |
+| `Market Cap` | follow daemon market watcher | USD market-cap threshold or timeout |
 
-Important notes:
+Practical guidance:
 
-- `On Confirmed Block +0` does not use the shared offset worker
-- `On Confirmed Block +N` uses confirmation first, then the shared offset worker only for the extra block distance
-- `Same Time` is host-owned even though the daemon may still handle a later retry path
-
-### `Same Time`
-
-Same-time sniper buys are not primarily daemon-triggered. They are submitted alongside launch creation.
-
-Use this mainly when your latency is high enough that waiting for observed submit timing may leave you behind. In normal low-latency setups, it is usually better to use a daemon-triggered mode.
-
-How it works:
-
-- selected same-time sniper buys compile alongside the launch
-- Bonk uses launch-first submission on non-bundle transports so the buy path does not outrun creation
-- Bonk `usd1` same-time sniper buys compile as atomic swap-and-buy transactions
-- if a same-time buy lands before creation, it fails
-- a same-time fee safeguard warns when buy-side fees are higher than launch fees
-- eligible same-time sniper buys can arm a one-time daemon retry if the first landing fails
-
-Retry behavior:
-
-- retry is only available for same-time sniper buys
-- the retry is a new deferred buy, not reuse of the original same-time transaction
-- the retry is skipped if the wallet already holds the token
-
-### `On Submit + Delay`
-
-Use this for delayed sniper buys or automatic dev sell actions scheduled from observed launch submission.
-
-How it works:
-
-- `0ms` means send on observed submit
-- non-zero values wait from observed submit plus the configured delay
-- execution happens in the daemon, not inline with the launch flow
-- this mode is faster than `On Confirmed Block`, but it can still fail if the buy reaches chain execution before creation is live
-- for Pump `agent-custom` and `agent-locked`, delayed buys with `targetBlockOffset > 0` are compiled live in the daemon instead of being locked to an early pre-signed payload
-
-### `On Confirmed Block`
-
-Use this when you want the safest currently shipped buy trigger. This is the default recommendation for most users.
-
-How it works:
-
-- the daemon watches launch-relative block progress
-- the action fires when the configured confirmed-block target is observed
-- because it waits for observed launch state, it is more conservative than `Same Time`
-- the exact allowed block-offset range is enforced by the current UI and backend validation
-
-### Sell Triggers
-
-Sell-side follow actions can also wait on:
-
-- delay-based timing
-- market-cap triggers
-- confirmation requirements
-
-Current automatic dev sell behavior:
-
-- the UI exposes mutually exclusive `Time` and `Market Cap` trigger families
-- market-cap mode is exclusive and does not silently carry a hidden time delay
-- market-cap scan timeout is configured in seconds
-- timeout behavior can either `Stop` or proceed to `Sell`
+- `Same Time` is the aggressive path
+- `On Submit + Delay` is fast but still earlier than confirmation-driven modes
+- `On Confirmed Block` is the safest normal default for buys
 
 ## Watchers
 
-The daemon uses dedicated watchers for realtime trading behavior.
+The daemon currently uses:
 
-Current watcher types:
+- slot watchers
+- signature watchers
+- market watchers
 
-- slot watcher
-- signature watcher
-- market watcher
+Watcher quality depends heavily on the websocket path.
 
-Operational notes:
+Recommended setup:
 
-- watchers rely on websocket connectivity for best realtime behavior
-- watcher health is persisted
-- reconnect and backoff behavior are explicit
-- if websocket connectivity is poor, follow timing quality can degrade
+- `SOLANA_RPC_URL`: Helius Gatekeeper HTTP
+- `SOLANA_WS_URL`: Helius standard websocket
+- `LAUNCHDECK_WARM_RPC_URL`: Shyft
+- provider: `helius-sender` or `hellomoon`
 
-Current watcher modes:
+If you are watcher-heavy or running multiple snipes, Helius dev tier is strongly recommended.
 
-- slot watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
-- signature watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
-- market watcher: standard websocket by default, or Helius `transactionSubscribe` when enabled and the current watch endpoint is Helius
+## Standard websocket vs Helius transactionSubscribe
 
-### Watcher Selection Matrix
+Watcher mode is selected from the websocket path, not from the send provider.
 
-| Condition | Slot / Signature / Market watcher mode |
+Current selection logic:
+
+| Condition | Watcher mode |
 | --- | --- |
-| `SOLANA_WS_URL` is unset or no watch endpoint is available | websocket watcher cannot be used; LaunchDeck falls back to non-websocket behavior where that watcher path supports it |
-| watch endpoint is not Helius | standard websocket watcher |
-| watch endpoint is Helius, but `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=false` | standard websocket watcher |
-| watch endpoint is Helius and `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` | try Helius `transactionSubscribe` first |
-| Helius `transactionSubscribe` attempt fails | fall back to standard websocket watcher |
+| no usable websocket endpoint | websocket watchers cannot be used normally |
+| websocket is non-Helius | standard websocket watchers |
+| websocket is Helius and `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=false` | standard websocket watchers |
+| websocket is Helius and `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` | probe Helius `transactionSubscribe` first |
+| Helius probe fails | fall back to standard websocket watchers |
 
-Operational meaning:
+Important note:
 
-- watcher mode is selected from the websocket watch path, not from the send transport by itself
-- a launch can still send with `standard-rpc` or `jito-bundle` and use the enhanced Helius watcher path if `SOLANA_WS_URL` is Helius
-- watcher fallback is automatic; the env flag enables the attempt, not a hard failure mode
+- this is probe-and-fallback behavior, not a hard dependency
 
-For the best current setup:
+## Watcher warm behavior
 
-- use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
-- use Helius standard websocket for `SOLANA_WS_URL`
-- use a [Shyft](https://shyft.to/) RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-- use `helius-sender` as the provider
-- enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true` if you are on Helius dev tier and LaunchDeck is watching through a Helius websocket endpoint
+Watcher websocket warm runs on the same general warm system as the rest of the app.
 
-Helius dev tier is strongly recommended here because it gives a major improvement in realtime watcher quality and follow execution behavior compared with a bare-minimum setup, especially if you run multiple snipes or watcher-heavy follow automation.
+That means:
 
-The daemon now persists both watcher health and watcher mode so reports and follow-job state show whether a market-cap action used the enhanced Helius path or the standard websocket fallback.
+- startup warm probes the watcher path once at startup
+- continuous warm keeps the active watcher path hot while the app is in use
+- idle warm suspend pauses watcher warm traffic when the app is idle
+- if the effective watcher path changes, LaunchDeck rewarms the new path
+- if the effective path did not change, LaunchDeck does not restart that warm loop just because settings were saved again
 
-## Delayed-Buy Hot Path
+## Delayed-buy hot path
 
-Delayed buys use a hotter path than a cold rebuild-from-scratch model.
+Delayed follow actions are not rebuilt completely from scratch at trigger time.
 
-How it works:
+LaunchDeck pre-resolves and caches as much state as it can when the job is armed, then finishes the hot work at trigger time.
 
-- launch-specific follow state is pre-resolved when the job is armed
-- static buy preparation is cached per action at arm time
-- hot runtime follow state is refreshed while the job is alive
-- delayed buys use a `prepare -> finalize` split model
+In practice that means the trigger-time path focuses on:
 
-In practice, the trigger-time work focuses on:
-
-- fresh blockhash attachment
-- fresh quote or finalize work
+- fresh blockhash
+- current quote/finalization work where needed
 - signing and serialization
 
-That keeps delayed triggers lighter than a full cold compile.
+## Pump agent-mode notes
 
-## Shared Cache Behavior
+Pump `agent-custom` and `agent-locked` follow behavior has extra vault handling.
 
-The runtime uses warmed blockhash caches in both the host and daemon.
+Current behavior:
 
-How it works:
+- non-secure `+0` buys and sells stay on the original launch-creator / deployer vault path
+- secure `+0` buys and sells can switch immediately to the post-setup config-vault path
+- delayed buys and sells that need the post-setup vault path prefer the config vault path
+- if stale pre-signed state is detected, the daemon can rebuild and retry instead of blindly resubmitting the same stale payload
 
-- blockhashes are warmed for `processed`, `confirmed`, and `finalized`
-- block-height observation can be offloaded to `LAUNCHDECK_WARM_RPC_URL` instead of your main execution RPC
-- cache hits can make `compileBlockhashFetchMs` look like `0ms` in reports
-- lookup tables and follow-runtime state are also warmed where relevant
+## Same-time retry
 
-Useful tuning env vars for this path:
+Eligible same-time sniper buys can arm a one-time daemon retry if the first landing fails.
 
-- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
-- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
-- `LAUNCHDECK_FOLLOW_BLOCK_HEIGHT_REFRESH_MS` (legacy / no longer the main offset timing knob)
-- `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
-- `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
+That retry is:
 
-## Same-Time Fee Safeguard
+- a new deferred buy
+- not reuse of the exact original same-time payload
+- skipped if the wallet already holds the token
 
-The same-time safeguard exists to reduce the chance that a sniper buy lands before the creation transaction.
+## Relevant env vars
 
-How it works:
-
-- it applies only when same-time fees are strictly higher than creation fees
-- the UI shows the additional creator fee impact inline
-- the safeguard is a warning and shaping aid, not a guarantee
-
-## Agent-Mode Sell Hardening
-
-Agent launch modes receive extra handling on the follow side.
-
-How it works:
-
-- `agent-custom` and `agent-locked` use an explicit split between same-window and delayed follow actions
-- same-window `+0` buys and sells stay on the original launch-creator / deployer vault path
-- delayed buys and sells with `targetBlockOffset > 0` prefer the post-setup fee-sharing config vault path
-- creator-vault seed mismatch can trigger targeted rebuild-and-retry behavior instead of blindly resubmitting the same stale pre-signed payload
-- pre-signed Pump sell slippage failures can also be rebuilt with a fresh sell quote before retry
-- daemon-side follow actions track attempt counters in reports
-
-## Telemetry And Timing Profiles
-
-The daemon persists telemetry that later appears in reports.
-
-Current telemetry includes:
-
-- provider
-- endpoint profile
-- transport type
-- trigger type
-- delay and jitter settings
-- submit latency
-- confirm latency
-- launch-to-action latency
-- launch-to-action block distance
-- schedule slip
-- action outcome and quality labels
-
-Timing profiles include historical percentiles such as:
-
-- `P50 Submit`
-- `P75 Submit`
-- `P90 Submit`
-
-These are visibility aids. They do not automatically slow or retime current actions.
-
-## Current Limitation
-
-The daemon does not currently support per-sniper `postBuySell` chaining.
-
-This config is explicitly rejected:
-
-- `followLaunch.snipes[].postBuySell`
-
-## Relevant Configuration
-
-Key daemon env vars:
+Most operators do not need to change these, but these are the daemon-related knobs:
 
 - `LAUNCHDECK_FOLLOW_DAEMON_TRANSPORT`
 - `LAUNCHDECK_FOLLOW_DAEMON_URL`
@@ -300,11 +169,9 @@ Key daemon env vars:
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
 - `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH`
+- `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
+- `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
+- `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
+- `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
 
-Capacity behavior:
-
-- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_ACTIVE_JOBS` = uncapped active jobs
-- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` = uncapped compile concurrency
-- blank or `0` for `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` = uncapped send concurrency
-- invalid non-numeric values are treated as uncapped and produce a startup warning
-- `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` only matters when one of those caps is explicitly set
+Full env details live in `docs/ENV_REFERENCE.md`.

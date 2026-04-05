@@ -87,8 +87,7 @@ function Stop-LaunchDeckRuntime {
     (
       $_.CommandLine.ToLowerInvariant().Contains($engineManifestPath) -or
       $_.CommandLine.ToLowerInvariant().Contains("launchdeck-engine") -or
-      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-follow-daemon") -or
-      $_.CommandLine.ToLowerInvariant().Contains("ui-server.js")
+      $_.CommandLine.ToLowerInvariant().Contains("launchdeck-follow-daemon")
     )
   }
 

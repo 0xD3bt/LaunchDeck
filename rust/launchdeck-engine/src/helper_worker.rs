@@ -141,14 +141,17 @@ fn spawn_stderr_task(
 }
 
 pub fn helper_worker_enabled(env_name: &str) -> bool {
-    matches!(
-        std::env::var(env_name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    match std::env::var(env_name)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => true,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => true,
+    }
 }
 
 pub struct HelperWorkerClient {

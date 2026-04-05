@@ -942,15 +942,15 @@ fn parse_market_cap_threshold(value: &str, label: &str) -> Result<String, Config
     };
     let parsed = number_part.parse::<f64>().map_err(|_| {
         ConfigError::Message(format!(
-            "{label} must be a positive number like 100000 or 100k. Got: {value}"
+            "{label} must be a positive USD number like 100000 or 100k. Got: {value}"
         ))
     })?;
     if !parsed.is_finite() || parsed <= 0.0 {
         return Err(ConfigError::Message(format!(
-            "{label} must be a positive number like 100000 or 100k. Got: {value}"
+            "{label} must be a positive USD number like 100000 or 100k. Got: {value}"
         )));
     }
-    let expanded = (parsed * multiplier).round();
+    let expanded = (parsed * multiplier * 1_000_000_f64).round();
     if !expanded.is_finite() || expanded <= 0.0 || expanded > u64::MAX as f64 {
         return Err(ConfigError::Message(format!(
             "{label} is too large. Got: {value}"
@@ -2615,7 +2615,7 @@ mod tests {
             .marketCap
             .expect("market-cap trigger should be present");
         assert_eq!(trigger.direction, "gte");
-        assert_eq!(trigger.threshold, "250000000");
+        assert_eq!(trigger.threshold, "250000000000000");
         assert_eq!(trigger.scanTimeoutSeconds, 42);
         assert_eq!(trigger.timeoutAction, "sell");
     }
@@ -2649,9 +2649,42 @@ mod tests {
             .marketCap
             .expect("market-cap trigger should be present");
         assert_eq!(trigger.direction, "gte");
-        assert_eq!(trigger.threshold, "100000");
+        assert_eq!(trigger.threshold, "100000000000");
         assert_eq!(trigger.scanTimeoutSeconds, 15);
         assert_eq!(trigger.timeoutAction, "stop");
+    }
+
+    #[test]
+    fn normalizes_follow_sell_market_cap_direction_to_reached_only() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "devAutoSell": {
+                "enabled": true,
+                "walletEnvKey": "SOLANA_PRIVATE_KEY",
+                "percent": 100,
+                "marketCap": {
+                    "enabled": true,
+                    "direction": "lte",
+                    "threshold": "250000000",
+                    "scanTimeoutSeconds": 42,
+                    "timeoutAction": "sell"
+                }
+            }
+        }))
+        .expect("follow launch raw");
+
+        let normalized =
+            normalize_raw_config(raw).expect("market-cap follow sell should normalize");
+        let dev_auto_sell = normalized
+            .followLaunch
+            .devAutoSell
+            .expect("dev auto sell should be present");
+        let trigger = dev_auto_sell
+            .marketCap
+            .expect("market-cap trigger should be present");
+        assert_eq!(trigger.direction, "gte");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![allow(non_snake_case, dead_code)]
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -87,9 +88,14 @@ pub fn read_keypair_bytes(raw: &str) -> Result<Vec<u8>, String> {
         }
         return Ok(bytes);
     }
-    bs58::decode(trimmed)
-        .into_vec()
-        .map_err(|error| error.to_string())
+    match bs58::decode(trimmed).into_vec() {
+        Ok(bytes) => Ok(bytes),
+        Err(base58_error) => BASE64
+            .decode(trimmed)
+            .map_err(|base64_error| {
+                format!("Invalid keypair encoding. Base58: {base58_error}; Base64: {base64_error}")
+            }),
+    }
 }
 
 fn public_key_from_secret_bytes(bytes: &[u8]) -> Result<String, String> {
@@ -163,8 +169,7 @@ pub fn list_solana_env_wallets() -> Vec<WalletSummary> {
         .map(|env_key| {
             let raw_value = env::var(&env_key).unwrap_or_default();
             let (secret, custom_name) = split_wallet_secret_and_name(&raw_value);
-            match read_keypair_bytes(&secret).and_then(|bytes| public_key_from_secret_bytes(&bytes))
-            {
+            match read_keypair_bytes(&secret).and_then(|bytes| public_key_from_secret_bytes(&bytes)) {
                 Ok(public_key) => WalletSummary {
                     envKey: env_key,
                     customName: custom_name,
@@ -735,5 +740,19 @@ pub async fn enrich_wallet_statuses(
         Err(_error) => {
             enrich_wallet_statuses_individual(&client, rpc_url, usd1_mint, wallets).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_keypair_bytes;
+    use base64::Engine as _;
+
+    #[test]
+    fn read_keypair_bytes_accepts_base64_secret() {
+        let secret = vec![7u8; 64];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&secret);
+        let decoded = read_keypair_bytes(&encoded).expect("base64 secret should decode");
+        assert_eq!(decoded, secret);
     }
 }

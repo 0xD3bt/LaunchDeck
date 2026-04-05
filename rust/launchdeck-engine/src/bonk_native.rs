@@ -29,8 +29,9 @@ use crate::{
         BonkUsd1LaunchSummary, FeeSettings, InstructionSummary, TransactionSummary, build_report,
         render_report,
     },
-    rpc::CompiledTransaction,
+    rpc::{CompiledTransaction, fetch_account_data},
     transport::TransportPlan,
+    wallet::read_keypair_bytes,
 };
 
 use crate::pump_native::{LaunchQuote, NativeCompileTimings};
@@ -86,6 +87,10 @@ pub struct BonkMarketSnapshot {
     pub complete: bool,
     pub marketCapLamports: String,
     pub marketCapSol: String,
+    #[serde(default)]
+    pub quoteAsset: String,
+    #[serde(default)]
+    pub quoteAssetLabel: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -528,7 +533,40 @@ fn slippage_bps_from_percent(slippage_percent: &str) -> Result<u64, String> {
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
-    BASE64.encode(secret)
+    format!("base64:{}", BASE64.encode(secret))
+}
+
+async fn normalize_vanity_secret_for_helper(
+    rpc_url: &str,
+    raw_secret: &str,
+) -> Result<Option<String>, String> {
+    let trimmed = raw_secret.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let bytes =
+        read_keypair_bytes(trimmed).map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    let keypair = solana_sdk::signature::Keypair::try_from(bytes.as_slice())
+        .map_err(|error| format!("Invalid vanity private key: {error}"))?;
+    let public_key = bs58::encode(&keypair.to_bytes()[32..]).into_string();
+    match fetch_account_data(rpc_url, &public_key, "confirmed").await {
+        Ok(_) => {
+            return Err(format!(
+                "This vanity address has already been used on-chain. Generate a fresh one. ({})",
+                public_key
+            ));
+        }
+        Err(error) if error.contains("was not found.") => {}
+        Err(error) => {
+            return Err(format!(
+                "Failed to verify vanity private key availability: {error}"
+            ));
+        }
+    }
+    Ok(Some(format!(
+        "base58:{}",
+        bs58::encode(keypair.to_bytes()).into_string()
+    )))
 }
 
 fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {
@@ -690,6 +728,8 @@ pub async fn try_compile_native_bonk(
         return Ok(None);
     }
     validate_bonk_config(config)?;
+    let normalized_vanity_secret =
+        normalize_vanity_secret_for_helper(rpc_url, &config.vanityPrivateKey).await?;
     let tip_lamports = u64::try_from(config.tx.jitoTipLamports.max(0)).unwrap_or_default();
     let response: HelperLaunchResponse = run_helper(&json!({
         "action": "build-launch",
@@ -699,7 +739,7 @@ pub async fn try_compile_native_bonk(
         "commitment": config.execution.commitment,
         "ownerSecret": decode_secret_base64(wallet_secret),
         "allowAtaCreation": allow_ata_creation,
-        "vanitySecret": config.vanityPrivateKey,
+        "vanitySecret": normalized_vanity_secret,
         "txFormat": config.execution.txFormat,
         "slippageBps": slippage_bps_from_percent(&config.execution.buySlippagePercent)?,
         "txConfig": helper_tx_config(

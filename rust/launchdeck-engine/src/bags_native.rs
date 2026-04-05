@@ -493,7 +493,7 @@ fn follow_tip_lamports_for_provider(provider: &str, tip_sol: &str, label: &str) 
 }
 
 fn decode_secret_base64(secret: &[u8]) -> String {
-    BASE64.encode(secret)
+    format!("base64:{}", BASE64.encode(secret))
 }
 
 fn convert_compiled_transaction(source: HelperCompiledTransaction) -> CompiledTransaction {

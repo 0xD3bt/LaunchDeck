@@ -1,44 +1,37 @@
 # Troubleshooting
 
-This page covers the most common operator problems in LaunchDeck and where to look when something does not behave as expected.
+This page covers the most common LaunchDeck problems and what to check first.
 
-## First Checks
+## First checks
 
 Before debugging deeper, confirm:
 
 - `npm start` completed successfully
-- the UI host is reachable at `http://127.0.0.1:8789` or your configured port
-- the follow daemon is reachable at `http://127.0.0.1:8790` or your configured port
-- your `.env` includes `SOLANA_RPC_URL`, `SOLANA_WS_URL`, and at least one `SOLANA_PRIVATE_KEY*`
+- the main host is reachable at `http://127.0.0.1:8789`
+- the follow daemon is reachable at `http://127.0.0.1:8790`
+- `.env` includes `SOLANA_RPC_URL`, `SOLANA_WS_URL`, and at least one `SOLANA_PRIVATE_KEY*`
 
-## No Wallets In The UI
+## No wallets in the UI
 
 Common causes:
 
 - no `SOLANA_PRIVATE_KEY` values are set
-- the key format is invalid
-- the env file was changed after startup and the runtime was not restarted
+- the private key format is invalid
+- `.env` changed after startup and the runtime was not restarted
 
 What to do:
 
 1. check `.env`
-2. confirm `SOLANA_PRIVATE_KEY` or `SOLANA_PRIVATE_KEY2` exists
-3. restart with `npm restart`
+2. confirm `SOLANA_PRIVATE_KEY` or another wallet slot is present
+3. run `npm restart`
 
-## Follow Daemon Not Ready
+## Follow daemon not ready
 
 Symptoms:
 
 - delayed snipers do not arm
 - auto-sell does not trigger
 - the UI reports daemon readiness issues
-
-Common causes:
-
-- the daemon process is not running
-- the daemon URL or port is misconfigured
-- auth token mismatch between host and daemon
-- daemon capacity is exhausted
 
 What to check:
 
@@ -49,57 +42,45 @@ What to check:
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES`
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 
-If those follow capacity vars are blank or `0`, the daemon runs uncapped and capacity exhaustion is not the problem.
+Practical note:
 
-## Realtime Follow Timing Is Poor
+- blank or `0` on the capacity limits means uncapped
 
-Symptoms:
-
-- confirmed-block actions feel late
-- delayed actions are inconsistent
-- watcher-driven actions look stale
+## Realtime follow timing is poor
 
 Common causes:
 
 - missing or poor `SOLANA_WS_URL`
 - websocket instability
-- regional mismatch between your provider choice and your actual location
+- region mismatch between your VPS and your provider endpoints
+- using a weaker Helius tier for watcher-heavy operation
 
 What to do:
 
 1. set `SOLANA_WS_URL` explicitly
-2. set `USER_REGION` to your closest regional group or explicit metro list
-3. prefer region fanout over pinning one explicit sender or bundle endpoint
-4. if needed, use provider-specific region overrides
-5. if you are on Helius dev tier and LaunchDeck is watching through a Helius websocket endpoint, enable `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+2. set `USER_REGION` to your nearest region or exact metro
+3. keep `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+4. use Helius dev tier if you are running multiple snipes or watcher-heavy follow logic
 
-## Helius `transactionSubscribe` Did Not Activate
+## Helius transactionSubscribe did not activate
 
 Symptoms:
 
-- you enabled `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
-- reports or follow state still show `standard-ws`
-- follow timing does not seem to use the enhanced Helius watcher path
+- `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE` is on
+- reports or runtime still show standard websocket watcher behavior
 
 What to check:
 
-1. confirm `SOLANA_WS_URL` is actually a Helius websocket endpoint
+1. confirm the active watcher websocket is actually Helius
 2. confirm the env change was applied with `npm restart`
-3. confirm the runtime is using websocket watchers at all and did not fall back because the watch endpoint is missing
-4. inspect the persisted report or follow-daemon state for watcher mode and watcher health
-5. if Helius `transactionSubscribe` was attempted but rejected, expect LaunchDeck to fall back automatically to `standard-ws`
+3. confirm the watcher path is using websocket at all
+4. remember that LaunchDeck probes first and falls back automatically if unsupported
 
 Important:
 
-- this feature is selected from the watch endpoint, not from the send provider alone
-- the env flag allows the Helius attempt; it does not disable fallback safety
+- this is driven by the watcher websocket path, not by the send provider alone
 
-## Helius Sender Rejection
-
-Symptoms:
-
-- the launch fails before send on Sender
-- the UI settings look reasonable but the backend rejects the request
+## Helius Sender rejection
 
 Common causes:
 
@@ -110,142 +91,110 @@ Common causes:
 Current Sender requirements:
 
 - `execution.skipPreflight=true`
-- `tx.computeUnitPriceMicroLamports > 0`
-- `tx.jitoTipLamports >= 200000`
+- positive compute-unit price
+- tip of at least `200000` lamports
 
-If you do not want Sender rules, switch to `Standard RPC`.
-
-For the best current Sender path:
+Recommended Sender stack:
 
 1. use Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
 2. use Helius standard websocket for `SOLANA_WS_URL`
-3. use a Shyft RPC with a free API key for `LAUNCHDECK_WARM_RPC_URL`
-4. use Helius dev tier if you want the strongest performance and watcher behavior, especially with multiple snipes or heavy follow automation
+3. use Shyft for `LAUNCHDECK_WARM_RPC_URL`
+4. use Helius dev tier if you care about the best runtime behavior
 
-### Sender “connection warm” or startup Sender checks fail
+### Sender warm checks fail
 
-Startup and continuous warm hit each Sender URL’s **`/ping`** endpoint (from the same host as **`/fast`**). If those requests fail but normal Solana JSON-RPC works, check outbound HTTP to `*-sender.helius-rpc.com`, TLS interception, or accidental blocking of non-RPC paths—not `SOLANA_RPC_URL` health.
+LaunchDeck warms Sender hosts through `GET /ping` on the Sender host, not through `SOLANA_RPC_URL`.
 
-## Standard RPC Not Using Tip
+If Sender warm fails while normal JSON-RPC looks fine, check:
 
-This is expected.
+- outbound access to `*-sender.helius-rpc.com`
+- TLS or proxy interception
+- firewall rules blocking those Sender hosts
 
-`Standard RPC` does not use tip even if an older preset still contains a tip value. The engine ignores it for that provider.
-
-Current transport note:
-
-- `Standard RPC` currently resolves to the optimized `standard-rpc-fanout` transport
-- it sends with `skipPreflight=true` and `maxRetries=0`
-- it can fan out to `SOLANA_RPC_URL` plus extra submit endpoints from `LAUNCHDECK_STANDARD_RPC_SEND_URLS`
-- the report view is the best place to confirm the winning endpoint and full attempted endpoint list
-
-## Jito Bundle Acting Differently Than Creation Settings Suggest
-
-This can also be expected.
-
-The engine may intentionally change creation-side fee shaping on bundle paths, especially in multi-transaction launch flows where a priority value would only add cost without helping.
-
-Review the persisted report to see what was actually applied.
-
-## Bonk USD1 Route Or Buy Problems
+## Hello Moon problems
 
 Common causes:
 
-- the pinned `SOL -> USD1` Raydium route pool is unavailable or no longer matches the expected config
-- the wallet does not have enough SOL headroom for the required USD1 top-up
-- an atomic immediate dev-buy assembly overflows and falls back to split transactions
-
-What happens now:
-
-- Bonk `usd1` uses a pinned `SOL -> USD1` route pool instead of silently picking another pool
-- Bonk `usd1` same-time sniper buys use atomic swap-and-buy assembly
-- immediate dev buy on Bonk `usd1` attempts atomic launch-plus-buy assembly first
+- missing `HELLOMOON_API_KEY`
+- tip or priority-fee requirements not met
+- secure bundle path being used without a valid bundle tip
+- Hello Moon routing assumptions not matching actual metro fallback behavior
 
 What to check:
 
-- the persisted report warnings for any atomic `usd1` fallback note
-- wallet SOL balance after reserve requirements
-- the helper error text if the pinned pool or config check fails
+1. confirm `HELLOMOON_API_KEY` is set
+2. confirm the active Hello Moon mode is the one you intended
+3. remember that Hello Moon `us`, `slc`, and `ewr` route to New York + Ashburn
+4. remember that Hello Moon `asia` and `sg` route to Tokyo
 
-## Unsupported Launchpad Or Mode Combination
+## Standard RPC is not using tip
 
-Typical examples:
+This is expected.
 
-- Bonk with `cashback`
-- Bonk with Pump agent modes
-- Bagsapp with non-Bags modes
-- Bagsapp with non-`sol` quote asset
+`standard-rpc` does not use provider tip handling even if an old preset still has a tip value stored.
 
-These combinations are rejected by config normalization. Fix the launchpad or mode choice instead of retrying the same request.
+Current transport behavior:
 
-Current runtime note:
+- `skipPreflight=true`
+- `maxRetries=0`
+- optional fanout through `LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS`
 
-- LaunchDeck is now `rust-native-only`
-- unsupported combinations do not fall back to a generic JS compile path anymore
-- if a launchpad/mode pair is not in the shipped support surface, the engine should be expected to hard-fail early
+## Jito Bundle is acting differently than creation settings suggest
 
-## Fee-Sharing Validation Failure
+This can be expected.
+
+Bundle transports may apply engine-owned shaping rules that differ from plain single-send behavior.
+
+Check the saved report to see:
+
+- the actual transport used
+- the actual endpoint list
+- the actual fee/tip behavior
+
+## Unsupported launchpad or mode
+
+Examples:
+
+- Bonk with unsupported Pump-only modes
+- Bagsapp with unsupported quote asset or mode combinations
+
+These combinations are rejected by backend validation. Fix the launchpad or mode choice rather than retrying the same request.
+
+## Fee-sharing validation failure
 
 Common causes:
 
 - recipients do not total `10000` bps
-- later fee-sharing setup is enabled without recipients
-- later fee-sharing setup is used outside Pump `regular`
+- later setup is enabled without recipients
+- later setup is used outside the supported mode
 
 What to check:
 
 - recipient percentages
 - selected mode
-- creator-fee mode
+- fee-sharing settings
 
-## `postBuySell` Rejected
+## postBuySell rejected
 
-This is expected in the current shipped runtime.
+This is expected in the current runtime.
 
-`followLaunch.snipes[].postBuySell` is not a shipped operator feature yet and is explicitly rejected by validation.
+`followLaunch.snipes[].postBuySell` is not a shipped feature and is rejected by validation.
 
-Use separate snipe sell behavior that is currently supported instead.
-
-## Metadata Upload Problems
+## Metadata upload problems
 
 Common causes:
 
-- no metadata provider configured as expected
-- `PINATA_JWT` missing when [`pinata`](https://pinata.cloud/) is selected
-- upload failed and fell back to `pump-fun`
+- `PINATA_JWT` missing while provider is `pinata`
+- Pinata failed and LaunchDeck fell back to `pump-fun`
 
 What to check:
 
 - `LAUNCHDECK_METADATA_UPLOAD_PROVIDER`
 - `PINATA_JWT`
-- the final report output to see which upload path was actually used
+- the UI warning message
+- the final report output
 
-## Bags Identity Problems
-
-Symptoms:
-
-- linked mode will not stay enabled
-- verification succeeds but the app falls back to wallet-only
-
-Common causes:
-
-- selected LaunchDeck wallet does not belong to the authenticated Bags account
-- missing or invalid Bags auth material
-- identity was not fully verified
-
-What to check:
-
-- `BAGS_API_KEY`
-- selected wallet in the UI
-- linked identity status in the Bags modal
-
-## Bonk Or Bags Helper Worker Problems
-
-Symptoms:
-
-- Bonk or Bags helper-backed actions intermittently time out
-- helper-backed launches work once, then fail on later requests
-- worker-mode experiments behave worse than one-shot helper calls
+## Bonk or Bags helper worker problems
 
 What to check:
 
@@ -256,38 +205,46 @@ What to check:
 
 What to do:
 
-1. leave helper worker flags unset unless you intentionally want persistent helper processes
-2. if worker mode is enabled and behaving badly, disable it and restart
-3. increase `LAUNCHDECK_LAUNCHPAD_HELPER_TIMEOUT_MS` if helper-backed requests are legitimately taking longer than your current timeout
+1. leave helper workers on unless you have a specific reason not to
+2. if worker mode is behaving badly, temporarily set the relevant helper worker flag to `false` and restart
+3. increase helper timeout if legitimate helper work is timing out
 
-## Report And Local State Inspection
+## Report and local state inspection
 
-If the UI result is unclear, inspect local state:
+When the UI is unclear, inspect:
 
 - `.local/launchdeck/send-reports`
 - `.local/launchdeck/follow-daemon-state.json`
 - `.local/launchdeck/app-config.json`
 - `.local/launchdeck/lookup-tables.json`
 
-Use these when you need to answer:
+Use these to confirm:
 
-- what provider was actually used
-- whether the daemon armed the follow job
-- whether settings persisted correctly
-- whether a cache or warm-up path was active
+- which provider actually ran
+- which endpoints were attempted
+- whether the follow daemon armed the job
+- whether watcher or warm paths were healthy
 
-## When To Restart
+## When to restart
 
-Restart LaunchDeck if you change:
+Restart LaunchDeck after changing:
 
 - wallet env vars
-- RPC or websocket env vars
-- region or endpoint overrides
-- metadata provider env vars
-- Bags credentials
+- RPC or websocket URLs
+- region overrides
+- metadata provider credentials
+- provider integration keys
 
 Use:
 
-- `npm restart`
+```bash
+npm restart
+```
 
-That is usually enough to pick up new env values and refresh both the main host and follow daemon.
+## Related docs
+
+- `docs/CONFIG.md`
+- `docs/ENV_REFERENCE.md`
+- `docs/PROVIDERS.md`
+- `docs/FOLLOW_DAEMON.md`
+

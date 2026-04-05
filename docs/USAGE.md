@@ -1,74 +1,90 @@
 # Usage Guide
 
-This guide walks through the normal operator workflow in LaunchDeck, from first startup through deploy, follow actions, and reuse.
+This guide covers the normal operator workflow in LaunchDeck, from first startup through deploy, history, and reuse.
 
-## Before You Start
+Before using the UI, set up the basics from `.env.example` and `docs/CONFIG.md`.
+
+## Before you start
 
 Make sure you have:
 
 - configured `SOLANA_RPC_URL`
 - configured `SOLANA_WS_URL`
-- set `USER_REGION` to your nearest regional group or explicit metro list so region-aware providers can fan out across that selected endpoint set instead of relying on one pinned host
-- imported at least one wallet through `SOLANA_PRIVATE_KEY*`
-- started LaunchDeck with `npm start`
+- set `USER_REGION`
+- loaded at least one wallet through `SOLANA_PRIVATE_KEY*`
+- started the runtime with `npm start`
 
 Default UI URL:
 
 - `http://127.0.0.1:8789`
 
-## Main Workflow
+## Recommended first session
 
-The normal LaunchDeck flow is:
+For the first live session, keep it simple:
+
+1. load one wallet
+2. choose `Pump` or `Bonk`
+3. use the recommended stack: Helius Gatekeeper HTTP for `SOLANA_RPC_URL`, Helius standard websocket for `SOLANA_WS_URL`, Shyft for `LAUNCHDECK_WARM_RPC_URL`
+4. leave the provider on `Helius Sender`
+5. keep follow actions off
+6. run `Build`
+7. run `Simulate`
+8. only then run `Deploy`
+
+## Main UI flow
+
+The normal LaunchDeck workflow is:
 
 1. select a wallet
 2. choose a launchpad and mode
-3. configure token metadata
-4. review preset-backed execution settings
-5. optionally add snipers or auto-sell
-6. `Build`, `Simulate`, or `Deploy`
-7. review the output and inspect History if needed
+3. fill token metadata and image
+4. review creation, buy, and sell settings
+5. optionally add snipers or automatic dev sell
+6. run `Build`, `Simulate`, or `Deploy`
+7. review the result and the saved report
 
-## Wallet Selection
+## Wallets
 
-Wallets are loaded from `SOLANA_PRIVATE_KEY*`.
+Wallets are loaded from:
 
-In practice:
+- `SOLANA_PRIVATE_KEY`
+- `SOLANA_PRIVATE_KEY2`
+- `SOLANA_PRIVATE_KEY3`
+- and the other wallet slots up to `SOLANA_PRIVATE_KEY10`
+
+Practical notes:
 
 - the selected wallet becomes the deployer wallet
-- sniper rows can target different wallet env keys
-- Bags linked identity checks are tied to the currently selected LaunchDeck wallet
+- sniper rows can use other loaded wallet slots
+- labeled wallet syntax is supported as `<privatekey>,<label>`
 
-If your wallet list is empty, fix your env file before using the UI.
+If the wallet list is empty, fix `.env` and restart the runtime.
 
-## Choose A Launchpad And Mode
+## Launchpad and mode
 
-LaunchDeck exposes:
+Current launchpads:
 
 - `Pump`
 - `Bonk`
 - `Bagsapp`
 
-Typical choices:
+Practical guidance:
 
 - use `Pump` for the most native LaunchDeck path
-- use `Bonk` for the supported Bonk and Bonkers path
-- use `Bagsapp` only if you are comfortable using an experimental path
+- use `Bonk` for the supported helper-backed Bonk path
+- use `Bagsapp` only when you intentionally want the experimental Bags path
 
-Mode selection changes the rest of the form. For example:
+See `docs/LAUNCHPADS.md` for the exact support matrix.
 
-- Pump exposes `regular`, `cashback`, and agent modes
-- Bonk exposes `regular` and `bonkers`
-- Bagsapp exposes the Bags fee-mode variants
+## Token metadata
 
-## Fill Token Metadata
-
-Required fields:
+Required:
 
 - token name
 - token symbol
 - image
 
-The launch cannot normalize successfully without a token URI, so LaunchDeck expects metadata upload to complete before deploy.
+The launch cannot proceed without a token URI, so metadata upload needs to complete before deploy.
 
 Optional fields:
 
@@ -77,26 +93,21 @@ Optional fields:
 - twitter
 - telegram
 
-### Image Library Workflow
+## Metadata upload flow
 
-The app includes an `Image Library` so you can reuse uploaded media instead of re-uploading each time.
+Current providers:
 
-Typical image flow:
+- `pump-fun`
+- `pinata`
 
-1. open the image picker
-2. upload or select an existing image
-3. optionally tag, categorize, or favorite it
-4. confirm the selection for the current launch
+Current behavior:
 
-The image library is stored locally in `image-library.json`.
+- blank metadata provider means `pump-fun`
+- `pinata` requires `PINATA_JWT`
+- Pinata failures fall back to `pump-fun`
+- the UI surfaces that fallback as a warning
 
-### Metadata Pre-Upload
-
-When enough metadata is present, the UI can begin metadata upload before deploy.
-
-That helps reduce total launch latency because the final deploy path does not have to wait as long for metadata upload.
-
-## Presets And Settings
+## Presets and settings
 
 LaunchDeck uses three presets:
 
@@ -104,50 +115,58 @@ LaunchDeck uses three presets:
 - `Preset 2`
 - `Preset 3`
 
-Each preset stores three execution groups:
+Each preset stores:
 
 - creation settings
 - buy settings
 - sell settings
 
-The settings modal exposes:
+The settings modal is where you set your normal defaults for:
 
 - provider
+- MEV mode where applicable
 - tip
 - priority fee
-- slippage for buy and sell
 - auto-fee
 - max auto fee
+- slippage
 
-If you want to change your default execution setup, edit your presets in Settings. That is the intended place to set your usual provider, fee, slippage, and auto-fee defaults.
+Those settings persist locally in the app config.
 
-Use presets when:
+## Provider selection
 
-- you want one aggressive setup and one safer setup
-- you switch between providers regularly
-- you want quick access to different dev-buy amounts
+Current provider choices:
 
-## Dev Buy
+- `Helius Sender`
+- `Hello Moon`
+- `Standard RPC`
+- `Jito Bundle`
 
-Dev buy is the deployer wallet buy that happens as part of the launch flow.
+Recommended usage:
+
+- start with `Helius Sender`
+- use `Hello Moon` when you want the alternate low-latency path
+- use `Standard RPC` when you want plain RPC behavior
+- use `Jito Bundle` when you explicitly want bundle behavior
+
+Provider details live in `docs/PROVIDERS.md`.
+
+## Dev buy
+
+Dev buy is the deployer-wallet buy that runs as part of the launch flow.
 
 Use it when you want the deployer wallet to buy immediately on launch.
 
-This is separate from snipers:
-
-- dev buy is part of the launch
-- snipers are follow actions or same-time sniper buys from specific wallets
+This is separate from sniper rows.
 
 ## Snipers
 
-The sniper UI lets you configure sniper buys per wallet.
+Each sniper row controls:
 
-Each sniper row can control:
-
-- target wallet
+- wallet
 - buy amount
 - trigger mode
-- same-time retry behavior where supported
+- retry behavior where supported
 
 Current trigger modes:
 
@@ -155,89 +174,82 @@ Current trigger modes:
 - `On Submit + Delay`
 - `On Confirmed Block`
 
-Use `Same Time` when you want the buy sent alongside launch creation.
+Practical usage:
 
-Use `On Submit + Delay` when you want the daemon to fire after observed submit time.
+- use `Same Time` only when you intentionally want the buy sent alongside launch creation
+- use `On Submit + Delay` when you want a delay from observed submit time
+- use `On Confirmed Block` when you want the safest normal default
 
-Use `On Confirmed Block` when you want the safest default buy timing. This is the mode we suggest first for most users.
-
-## Automatic Dev Sell
+## Automatic dev sell
 
 Automatic dev sell is configured separately from sniper rows.
 
 It lets you:
 
-- enable or disable dev-wallet sell behavior
-- set the sell percent
+- enable or disable sell behavior for the deployer wallet
+- choose a percent
 - choose delay-based or confirmed-block timing
+- use market-cap triggers where supported
 
-Current trigger modes:
+This action is daemon-executed and shows separately in reports.
 
-- `On Submit + Delay`
-- `On Confirmed Block`
+## Build, Simulate, Deploy
 
-This action is daemon-executed and appears in reporting separately from the original launch.
-
-## Bags Identity Flow
-
-When using Bagsapp, the UI exposes a Bags identity flow.
-
-Identity modes:
-
-- `Wallet Only`
-- `Linked Bags Identity`
-
-Typical linked-identity flow:
-
-1. open the Bags identity modal
-2. initialize verification
-3. complete the verification step
-4. verify against the selected wallet
-
-If the selected LaunchDeck wallet does not belong to the authenticated Bags account, linked mode will not remain enabled.
-
-## Build, Simulate, And Deploy
-
-LaunchDeck exposes three core execution actions:
+LaunchDeck exposes three main actions:
 
 - `Build`
 - `Simulate`
 - `Deploy`
 
-Use `Build` when you want to inspect the planned launch shape without sending it.
+Use them like this:
 
-Use `Simulate` when you want RPC simulation before real send.
+- `Build`: inspect the planned launch without sending it
+- `Simulate`: check the launch through RPC simulation
+- `Deploy`: send it live
 
-Use `Deploy` when you want the launch sent live.
+The backend still owns final validation and transport shaping even if the UI fields looked valid.
 
-The main host normalizes the request, validates it, chooses transport behavior, and writes a report for the result.
+## History and reuse
 
-## History, Reuse, And Relaunch
-
-Open `History` to inspect previous runs.
-
-The History UI has two main views:
-
-- `Transactions`
-- `Launches`
+Open `History` when you want to inspect prior launches and transactions.
 
 From History you can:
 
-- inspect a previous run
-- review report tabs
+- inspect the report
+- review timings and endpoints
 - reuse a launch into the current form
-- relaunch from a previous saved entry
+- relaunch from saved history
 
-Detailed reporting guidance: `REPORTING.md`
+Reporting details live in `docs/REPORTING.md`.
 
-## Recommended First Session
+## Follow actions
 
-For a safe first session:
+Follow behavior is handled by the dedicated follow daemon.
 
-1. set up one wallet
-2. choose `Pump` or `Bonk`
-3. use the recommended stack first: Helius Gatekeeper HTTP for `SOLANA_RPC_URL`, Helius standard websocket for `SOLANA_WS_URL`, optional Shyft for `LAUNCHDECK_WARM_RPC_URL`, and leave the provider on `Helius Sender`
-4. keep follow actions off
-5. run `Build`
-6. run `Simulate`
-7. deploy only after the first two look correct
+That includes:
+
+- delayed buys
+- confirmed-block buys
+- automatic dev sell
+- snipe sells
+- watcher-driven follow behavior
+
+Follow details live in `docs/FOLLOW_DAEMON.md`.
+
+## When to restart
+
+Restart LaunchDeck after changing:
+
+- wallet env vars
+- RPC URLs
+- websocket URLs
+- region overrides
+- metadata provider credentials
+- provider integration keys
+
+Use:
+
+```bash
+npm restart
+```
+
