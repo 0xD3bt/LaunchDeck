@@ -16,6 +16,8 @@ This repo is under active development. The README reflects the setup and feature
 
 LaunchDeck is open-source tooling provided as-is. Running it, configuring it, modifying it, deploying it, or using it in any way is entirely the user's own responsibility. By using this software, you accept full responsibility for your environment, infrastructure, wallets, keys, dependencies, third-party packages, and any outcomes that result from its use.
 
+![LaunchDeck product screenshot](docs/images/product-dashboard.png)
+
 ## Recommended Stack
 
 For most operators today, the best-supported production setup is:
