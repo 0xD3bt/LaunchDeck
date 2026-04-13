@@ -64,15 +64,16 @@ The normal lifecycle is:
 | --- | --- | --- |
 | `Same Time` | main host | launch submission path itself |
 | `On Submit + Delay` | follow daemon | observed submit time plus delay |
-| `On Confirmed Block +0` | follow daemon watcher | launch confirmation |
-| `On Confirmed Block +N` | follow daemon watcher + offset worker | launch confirmation, then extra confirmed blocks |
+| `On Confirmed Slot +0` | follow daemon watcher | launch confirmation |
+| `On Confirmed Slot +N` | follow daemon watcher + offset worker | launch confirmation, then extra confirmed slots |
 | `Market Cap` | follow daemon market watcher | USD market-cap threshold or timeout |
 
 Practical guidance:
 
 - `Same Time` is the aggressive path
 - `On Submit + Delay` is fast but still earlier than confirmation-driven modes
-- `On Confirmed Block` is the safest normal default for buys
+- `On Confirmed Slot` is the safest normal default for buys
+- sniper autosell slot offsets are anchored from the matching buy confirmation, not from launch confirmation
 
 ## Watchers
 
@@ -92,6 +93,22 @@ Recommended setup:
 - provider: `helius-sender` or `hellomoon`
 
 If you are watcher-heavy or running multiple snipes, Helius dev tier is strongly recommended.
+
+## Market-cap triggers
+
+Market-cap follow actions are daemon-owned watcher flows.
+
+Current behavior:
+
+- the daemon watches token supply/price state and compares the observed USD market cap to the configured threshold
+- market-cap autosells can stop on timeout or force a sell on timeout, depending on the selected action
+- sniper `postBuySell` market-cap watches begin only after the matching buy confirms
+
+SOL/USD reference behavior:
+
+- LaunchDeck first tries Helius `getAsset` pricing for wrapped SOL when a Helius RPC URL is available
+- if no Helius price is available, it falls back to the configured HTTP price source
+- short-lived price caching is used so repeated follow jobs do not spam the price source
 
 ## Standard websocket vs Helius transactionSubscribe
 
@@ -145,6 +162,7 @@ Current behavior:
 - secure `+0` buys and sells can switch immediately to the post-setup config-vault path
 - delayed buys and sells that need the post-setup vault path prefer the config vault path
 - if stale pre-signed state is detected, the daemon can rebuild and retry instead of blindly resubmitting the same stale payload
+- Pump `creator_vault` / `Custom 2006` mismatches can trigger a special daemon-managed rebuild/retry path for pre-signed buys and follow sells instead of leaving the action permanently failed on the first bad authority choice
 
 ## Same-time retry
 
@@ -168,9 +186,12 @@ Most operators do not need to change these, but these are the daemon-related kno
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES`
 - `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS`
 - `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS`
+- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY`
+- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY`
 - `LAUNCHDECK_FOLLOW_DAEMON_STATE_PATH`
 - `LAUNCHDECK_FOLLOW_OFFSET_POLL_INTERVAL_MS`
 - `LAUNCHDECK_ENABLE_APPROXIMATE_FOLLOW_OFFSET_TIMER`
+- `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL`
 - `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS`
 - `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS`
 

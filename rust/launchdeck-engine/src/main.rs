@@ -9,11 +9,13 @@ mod fs_utils;
 mod helper_worker;
 mod image_library;
 mod launchpad_dispatch;
+mod launchpad_runtime;
+mod launchpad_warm;
 mod launchpads;
 mod observability;
 mod paths;
-mod providers;
 mod provider_tip;
+mod providers;
 mod pump_native;
 mod report;
 mod reports_browser;
@@ -25,31 +27,42 @@ mod ui_bridge;
 mod ui_config;
 mod vamp;
 mod wallet;
+mod warm_manager;
 
 use crate::{
     app_logs::{list_error_logs, list_live_logs, record_error, record_info, record_warn},
     bags_native::{
-        PreparedBagsSendArtifacts, compile_launch_transaction as compile_bags_launch_transaction,
-        prepare_native_bags_send, summarize_transactions as summarize_bags_transactions,
+        bags_runtime_status_payload,
+        compile_launch_transaction as compile_bags_launch_transaction,
+        summarize_transactions as summarize_bags_transactions,
     },
-    bonk_native::{
-        derive_canonical_pool_id as derive_bonk_canonical_pool_id,
-        predict_dev_buy_token_amount as predict_bonk_dev_buy_token_amount, warm_bonk_state,
+    config::{
+        NormalizedConfig, NormalizedFollowLaunch, RawConfig,
+        configured_bags_setup_confirm_timeout_secs, configured_bags_setup_gate_commitment,
+        normalize_raw_config,
     },
-    config::{NormalizedConfig, NormalizedFollowLaunch, RawConfig, normalize_raw_config},
     follow::{
         FOLLOW_RESPONSE_SCHEMA_VERSION, FollowArmRequest, FollowCancelRequest, FollowDaemonClient,
         FollowJobRecord, FollowJobResponse, FollowJobState, FollowReserveRequest,
-        FollowStopAllRequest, build_action_records,
-        should_use_post_setup_creator_vault_for_buy, should_use_post_setup_creator_vault_for_sell,
+        FollowStopAllRequest, build_action_records, should_use_post_setup_creator_vault_for_buy,
+        should_use_post_setup_creator_vault_for_sell,
     },
     fs_utils::atomic_write,
     image_library::{
         build_image_library_payload, create_category, delete_image, save_image_bytes, update_image,
     },
     launchpad_dispatch::{
-        compile_atomic_follow_buy_for_launchpad, quote_launch_for_launchpad,
-        try_compile_native_launchpad,
+        NativeLaunchArtifacts, compile_atomic_follow_buy_for_launchpad,
+        derive_canonical_pool_id_for_launchpad, launchpad_action_backend,
+        launchpad_action_rollout_state, predict_dev_buy_token_amount_for_launchpad,
+    },
+    launchpad_runtime::{
+        FeeRecipientLookupRequest, LaunchQuoteRequest, NativeLaunchCompileRequest,
+        StartupWarmLaunchpadPayloads, compile_native_launch, lookup_fee_recipient, quote_launch,
+        warm_launchpads_for_startup,
+    },
+    launchpad_warm::{
+        LaunchpadWarmBuildReport, build_launchpad_warm_context, launchpad_warm_env_snapshot,
     },
     launchpads::launchpad_registry,
     observability::{
@@ -57,11 +70,9 @@ use crate::{
         record_outbound_provider_http_request, rpc_traffic_snapshot,
         update_persisted_launch_report,
     },
-    providers::{provider_availability_registry, provider_registry},
     provider_tip::{provider_min_tip_sol_label, provider_required_tip_lamports},
-    pump_native::{
-        predict_dev_buy_token_amount, warm_default_lookup_tables, warm_pump_global_state,
-    },
+    providers::{provider_availability_registry, provider_registry},
+    pump_native::{warm_default_lookup_tables, warm_pump_global_state},
     report::{
         BenchmarkMode, ExecutionTimings, FollowJobTimings, LaunchReport,
         build_benchmark_timing_groups, build_report, configured_benchmark_mode, render_report,
@@ -69,15 +80,14 @@ use crate::{
     },
     reports_browser::{list_persisted_reports, read_persisted_report_bundle},
     rpc::{
-        CompiledTransaction, JitoWarmResult, configured_warm_rpc_url,
-        confirm_submitted_transactions_for_transport, confirm_transactions_with_websocket_fallback,
-        fetch_current_block_height, prewarm_helius_transaction_subscribe_endpoint,
+        CompiledTransaction, JitoWarmResult, SendTimingBreakdown, configured_warm_rpc_url,
+        confirm_submitted_transactions_for_transport, fetch_current_block_height,
+        derive_helius_transaction_subscribe_account_required,
+        is_blockhash_valid, prewarm_helius_transaction_subscribe_endpoint,
         prewarm_hellomoon_bundle_endpoint, prewarm_hellomoon_quic_endpoint,
-        prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint,
-        prewarm_watch_websocket_endpoint, refresh_latest_blockhash_cache,
-        send_transactions_bundle,
-        simulate_transactions, submit_independent_transactions_for_transport,
-        submit_transactions_for_transport, submit_transactions_sequential,
+        prewarm_jito_bundle_endpoint, prewarm_rpc_endpoint, prewarm_watch_websocket_endpoint,
+        refresh_latest_blockhash_cache, simulate_transactions,
+        submit_independent_transactions_for_transport, submit_transactions_for_transport,
     },
     runtime::{
         RuntimeRegistry, RuntimeRequest, RuntimeResponse, fail_worker, heartbeat_worker,
@@ -85,19 +95,17 @@ use crate::{
     },
     strategies::strategy_registry,
     transport::{
-        build_transport_plan, configured_helius_sender_endpoint,
-        configured_enable_helius_transaction_subscribe,
-        configured_helius_sender_endpoints_for_profile, configured_hellomoon_mev_protect,
-        configured_hellomoon_bundle_endpoints_for_profile,
+        TransportPlan, build_transport_plan, configured_enable_helius_transaction_subscribe,
+        configured_helius_sender_endpoint, configured_helius_sender_endpoints_for_profile,
+        configured_hellomoon_bundle_endpoints_for_profile, configured_hellomoon_mev_protect,
         configured_hellomoon_quic_endpoints_for_profile, configured_jito_bundle_endpoints,
         configured_jito_bundle_endpoints_for_profile, configured_provider_region,
-        prefers_helius_transaction_subscribe_path,
         configured_shared_region, configured_standard_rpc_submit_endpoints,
-        resolved_helius_transaction_subscribe_ws_url,
         configured_watch_endpoints_for_provider, default_endpoint_profile,
-        default_endpoint_profile_for_provider,
-        estimate_transaction_count, helius_sender_endpoint_override_active,
-        jito_bundle_endpoint_override_active, resolved_helius_priority_fee_rpc_url,
+        default_endpoint_profile_for_provider, estimate_transaction_count,
+        helius_sender_endpoint_override_active, jito_bundle_endpoint_override_active,
+        prefers_helius_transaction_subscribe_path, resolved_helius_priority_fee_rpc_url,
+        resolved_helius_transaction_subscribe_ws_url,
     },
     ui_bridge::{build_raw_config_from_form, quote_from_form, upload_metadata_from_form},
     ui_config::{
@@ -106,8 +114,12 @@ use crate::{
     vamp::{fetch_imported_token_metadata, import_remote_image_to_library},
     wallet::{
         enrich_wallet_statuses, list_solana_env_wallets, load_solana_wallet_by_env_key,
-        public_key_from_secret, selected_wallet_key_or_default,
-        selected_wallet_key_or_default_from_wallets, read_keypair_bytes,
+        public_key_from_secret, read_keypair_bytes, selected_wallet_key_or_default,
+        selected_wallet_key_or_default_from_wallets,
+    },
+    warm_manager::{
+        WarmActivityRequest, WarmControlState, WarmLifecycleMode, WarmRouteSelection,
+        WarmTargetHealth, WarmTargetStatus, WatchWarmTarget, WatchWarmTransport,
     },
 };
 use axum::{
@@ -122,8 +134,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     fs,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -135,69 +149,22 @@ struct AppState {
     warm: Arc<Mutex<WarmControlState>>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct WarmControlState {
-    last_activity_at_ms: u128,
-    last_resume_at_ms: Option<u128>,
-    last_suspend_at_ms: Option<u128>,
-    last_warm_attempt_at_ms: Option<u128>,
-    last_warm_success_at_ms: Option<u128>,
-    current_reason: String,
-    last_error: Option<String>,
-    selected_routes: Vec<WarmRouteSelection>,
-    follow_job_routes: Vec<WarmRouteSelection>,
-    browser_active: bool,
-    continuous_active: bool,
-    follow_jobs_active: bool,
-    in_flight_requests: usize,
-    warm_pass_in_flight: bool,
-    warm_targets: HashMap<String, WarmTargetStatus>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WarmRouteSelection {
-    provider: String,
-    endpoint_profile: String,
-    hellomoon_mev_mode: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum WarmTargetHealth {
-    Healthy,
-    RateLimited,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WarmTargetStatus {
-    id: String,
-    category: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
-    label: String,
-    target: String,
-    active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_attempt_at_ms: Option<u64>,
-    status: WarmTargetHealth,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_success_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_rate_limited_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_rate_limit_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_error: Option<String>,
-    consecutive_failures: u32,
-}
-
 #[derive(Debug, Clone)]
 enum WarmAttemptResult {
     Success,
     RateLimited(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WarmRecoveredTarget {
+    label: String,
+    category: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    target: String,
+    recovered_error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -210,50 +177,15 @@ struct WarmTargetAttempt {
     result: WarmAttemptResult,
 }
 
-#[derive(Debug, Clone)]
-struct WatchWarmTarget {
-    label: String,
-    target: String,
-    transport: WatchWarmTransport,
-    fallback_target: Option<String>,
+#[derive(Debug)]
+struct WarmAttemptOutcome {
+    attempt: WarmTargetAttempt,
+    success: bool,
+    error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WatchWarmTransport {
-    StandardWs,
-    HeliusTransactionSubscribe,
-}
-
-#[derive(Deserialize, Default)]
-struct WarmActivityRequest {
-    #[serde(default)]
-    #[serde(rename = "creationProvider")]
-    creation_provider: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "creationEndpointProfile")]
-    creation_endpoint_profile: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "creationMevMode")]
-    creation_mev_mode: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "buyProvider")]
-    buy_provider: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "buyEndpointProfile")]
-    buy_endpoint_profile: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "buyMevMode")]
-    buy_mev_mode: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "sellProvider")]
-    sell_provider: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "sellEndpointProfile")]
-    sell_endpoint_profile: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "sellMevMode")]
-    sell_mev_mode: Option<String>,
-}
+type WarmProbeFuture = Pin<Box<dyn Future<Output = WarmAttemptOutcome> + Send>>;
+type WarmProbeBatchFuture = Pin<Box<dyn Future<Output = Vec<WarmAttemptOutcome>> + Send>>;
 
 struct WarmInFlightGuard {
     warm: Arc<Mutex<WarmControlState>>,
@@ -294,6 +226,261 @@ fn build_warm_target_attempt(
     }
 }
 
+fn warm_attempt_outcome(attempt: WarmTargetAttempt) -> WarmAttemptOutcome {
+    let success = matches!(attempt.result, WarmAttemptResult::Success);
+    let error = match &attempt.result {
+        WarmAttemptResult::Error(message) => {
+            Some(format!("{} {}: {}", attempt.label, attempt.target, message))
+        }
+        _ => None,
+    };
+    WarmAttemptOutcome {
+        attempt,
+        success,
+        error,
+    }
+}
+
+fn boxed_warm_probe<F>(
+    category: &str,
+    provider: Option<&str>,
+    label: &str,
+    target: impl Into<String>,
+    future: F,
+) -> WarmProbeFuture
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let category = category.to_string();
+    let provider = provider.map(ToString::to_string);
+    let label = label.to_string();
+    let target = target.into();
+    let timeout_ms = configured_warm_probe_timeout_ms();
+    Box::pin(async move {
+        let result = match tokio::time::timeout(Duration::from_millis(timeout_ms), future).await {
+            Ok(Ok(())) => WarmAttemptResult::Success,
+            Ok(Err(error)) => WarmAttemptResult::Error(error),
+            Err(_) => WarmAttemptResult::Error(format!("timed out after {timeout_ms}ms")),
+        };
+        warm_attempt_outcome(build_warm_target_attempt(
+            &category,
+            provider.as_deref(),
+            &label,
+            target,
+            result,
+        ))
+    })
+}
+
+fn boxed_jito_warm_probe(endpoint: crate::transport::JitoBundleEndpoint) -> WarmProbeFuture {
+    let timeout_ms = configured_warm_probe_timeout_ms();
+    let target = endpoint.name.clone();
+    Box::pin(async move {
+        let result = match tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            prewarm_jito_bundle_endpoint(&endpoint),
+        )
+        .await
+        {
+            Ok(Ok(JitoWarmResult::Warmed)) => WarmAttemptResult::Success,
+            Ok(Ok(JitoWarmResult::RateLimited(message))) => WarmAttemptResult::RateLimited(message),
+            Ok(Err(error)) => WarmAttemptResult::Error(error),
+            Err(_) => WarmAttemptResult::Error(format!("timed out after {timeout_ms}ms")),
+        };
+        warm_attempt_outcome(build_warm_target_attempt(
+            "endpoint",
+            Some("jito-bundle"),
+            "Jito Bundle",
+            target,
+            result,
+        ))
+    })
+}
+
+fn boxed_watch_warm_probe(target: WatchWarmTarget) -> WarmProbeBatchFuture {
+    let timeout_ms = configured_warm_probe_timeout_ms();
+    Box::pin(async move {
+        let primary_result = match target.transport {
+            WatchWarmTransport::StandardWs => {
+                tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    prewarm_watch_websocket_endpoint(&target.target),
+                )
+                .await
+            }
+            WatchWarmTransport::HeliusTransactionSubscribe => {
+                tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    prewarm_helius_transaction_subscribe_endpoint(&target.target),
+                )
+                .await
+            }
+        };
+        let primary_attempt = match primary_result {
+            Ok(Ok(())) => WarmAttemptResult::Success,
+            Ok(Err(error)) => WarmAttemptResult::Error(error),
+            Err(_) => WarmAttemptResult::Error(format!("timed out after {timeout_ms}ms")),
+        };
+        let mut outcomes = vec![warm_attempt_outcome(build_warm_target_attempt(
+            "watch-endpoint",
+            None,
+            &target.label,
+            target.target.clone(),
+            primary_attempt.clone(),
+        ))];
+        if target.transport == WatchWarmTransport::HeliusTransactionSubscribe
+            && matches!(primary_attempt, WarmAttemptResult::Error(_))
+        {
+            if let Some(fallback_endpoint) = target.fallback_target.as_deref() {
+                let fallback_result = tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    prewarm_watch_websocket_endpoint(fallback_endpoint),
+                )
+                .await;
+                let fallback_attempt = match fallback_result {
+                    Ok(Ok(())) => WarmAttemptResult::Success,
+                    Ok(Err(error)) => WarmAttemptResult::Error(error),
+                    Err(_) => WarmAttemptResult::Error(format!("timed out after {timeout_ms}ms")),
+                };
+                outcomes.push(warm_attempt_outcome(build_warm_target_attempt(
+                    "watch-endpoint",
+                    None,
+                    "Watcher WS",
+                    fallback_endpoint.to_string(),
+                    fallback_attempt,
+                )));
+            }
+        }
+        outcomes
+    })
+}
+
+fn continuous_state_warm_probe_futures(
+    main_rpc_url: &str,
+    warm_rpc_url: &str,
+) -> Vec<WarmProbeFuture> {
+    let mut futures = Vec::new();
+    let warm_rpc_target = warm_rpc_url.to_string();
+    futures.push(boxed_warm_probe(
+        "state",
+        None,
+        "Warm RPC",
+        warm_rpc_target.clone(),
+        async move { prewarm_rpc_endpoint(&warm_rpc_target).await },
+    ));
+    if should_prewarm_primary_rpc_separately(main_rpc_url, warm_rpc_url) {
+        let primary_target = main_rpc_url.to_string();
+        futures.push(boxed_warm_probe(
+            "state",
+            None,
+            "Primary RPC",
+            primary_target.clone(),
+            async move { prewarm_rpc_endpoint(&primary_target).await },
+        ));
+    }
+    let fee_market_target = main_rpc_url.to_string();
+    futures.push(boxed_warm_probe(
+        "state",
+        None,
+        "Fee Market",
+        fee_market_target.clone(),
+        async move { fetch_fee_market_snapshot(&fee_market_target).await.map(|_| ()) },
+    ));
+    futures
+}
+
+fn endpoint_warm_probe_futures(
+    routes: &[WarmRouteSelection],
+    main_rpc_url: &str,
+) -> Vec<WarmProbeFuture> {
+    let mut futures = Vec::new();
+    if routes.iter().any(|route| route.provider == "standard-rpc") {
+        for endpoint in configured_standard_rpc_warm_endpoints(main_rpc_url) {
+            let endpoint_target = endpoint.clone();
+            futures.push(boxed_warm_probe(
+                "endpoint",
+                Some("standard-rpc"),
+                "Standard RPC",
+                endpoint,
+                async move { prewarm_rpc_endpoint(&endpoint_target).await },
+            ));
+        }
+    }
+    if routes.iter().any(|route| route.provider == "helius-sender") {
+        let mut seen = HashSet::new();
+        for route in routes.iter().filter(|route| route.provider == "helius-sender") {
+            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let endpoint_target = endpoint.clone();
+                futures.push(boxed_warm_probe(
+                    "endpoint",
+                    Some("helius-sender"),
+                    "Helius Sender",
+                    endpoint,
+                    async move { prewarm_helius_sender_endpoint(&endpoint_target).await },
+                ));
+            }
+        }
+    }
+    if routes.iter().any(|route| route.provider == "hellomoon") {
+        let mut seen = HashSet::new();
+        let mev_protect = configured_hellomoon_mev_protect();
+        for route in routes.iter().filter(|route| route.provider == "hellomoon") {
+            let endpoints = if route.hellomoon_mev_mode == "secure" {
+                configured_hellomoon_bundle_endpoints_for_profile(&route.endpoint_profile)
+            } else {
+                configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
+            };
+            for endpoint in endpoints {
+                if !seen.insert(endpoint.clone()) {
+                    continue;
+                }
+                let endpoint_target = endpoint.clone();
+                if route.hellomoon_mev_mode == "secure" {
+                    futures.push(boxed_warm_probe(
+                        "endpoint",
+                        Some("hellomoon"),
+                        "Hello Moon Bundle",
+                        endpoint,
+                        async move { prewarm_hellomoon_bundle_endpoint(&endpoint_target).await },
+                    ));
+                } else {
+                    futures.push(boxed_warm_probe(
+                        "endpoint",
+                        Some("hellomoon"),
+                        "Hello Moon QUIC",
+                        endpoint,
+                        async move {
+                            prewarm_hellomoon_quic_endpoint(&endpoint_target, mev_protect).await
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    if routes.iter().any(|route| route.provider == "jito-bundle") {
+        let mut seen = HashSet::new();
+        for route in routes.iter().filter(|route| route.provider == "jito-bundle") {
+            for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
+                if !seen.insert(endpoint.send.clone()) {
+                    continue;
+                }
+                futures.push(boxed_jito_warm_probe(endpoint));
+            }
+        }
+    }
+    futures
+}
+
+fn watch_warm_probe_futures(routes: &[WarmRouteSelection]) -> Vec<WarmProbeBatchFuture> {
+    configured_watch_warm_targets(routes)
+        .into_iter()
+        .map(boxed_watch_warm_probe)
+        .collect()
+}
+
 fn set_all_warm_targets_inactive(warm: &mut WarmControlState) {
     for target in warm.warm_targets.values_mut() {
         target.active = false;
@@ -304,11 +491,12 @@ fn apply_warm_target_attempts(
     warm: &mut WarmControlState,
     attempts: &[WarmTargetAttempt],
     attempt_at_ms: u64,
-) {
+) -> Vec<WarmRecoveredTarget> {
     let active_ids = attempts
         .iter()
         .map(|attempt| attempt.id.clone())
         .collect::<HashSet<_>>();
+    let mut recovered_targets = Vec::new();
     for target in warm.warm_targets.values_mut() {
         target.active = active_ids.contains(&target.id);
     }
@@ -329,6 +517,9 @@ fn apply_warm_target_attempts(
                 last_rate_limited_at_ms: None,
                 last_rate_limit_message: None,
                 last_error: None,
+                last_error_at_ms: None,
+                last_recovered_at_ms: None,
+                last_recovered_error: None,
                 consecutive_failures: 0,
             });
         let previous_status = entry.status.clone();
@@ -346,26 +537,30 @@ fn apply_warm_target_attempts(
                 entry.last_success_at_ms = Some(attempt_at_ms);
                 entry.last_rate_limited_at_ms = None;
                 entry.last_rate_limit_message = None;
+                entry.last_error_at_ms = None;
+                if previous_error
+                    .as_deref()
+                    .is_some_and(|error| !error.trim().is_empty())
+                {
+                    entry.last_recovered_at_ms = Some(attempt_at_ms);
+                    entry.last_recovered_error = previous_error.clone();
+                    recovered_targets.push(WarmRecoveredTarget {
+                        label: entry.label.clone(),
+                        category: entry.category.clone(),
+                        provider: entry.provider.clone(),
+                        target: entry.target.clone(),
+                        recovered_error: previous_error.unwrap_or_default(),
+                    });
+                }
                 entry.last_error = None;
                 entry.consecutive_failures = 0;
-                if previous_status != WarmTargetHealth::Healthy {
-                    record_info(
-                        "warm",
-                        format!("{} warm target recovered", entry.label),
-                        Some(json!({
-                            "provider": entry.provider,
-                            "target": entry.target,
-                            "category": entry.category,
-                            "status": "healthy",
-                        })),
-                    );
-                }
             }
             WarmAttemptResult::RateLimited(message) => {
                 entry.status = WarmTargetHealth::RateLimited;
                 entry.last_success_at_ms = Some(attempt_at_ms);
                 entry.last_rate_limited_at_ms = Some(attempt_at_ms);
                 entry.last_rate_limit_message = Some(message.clone());
+                entry.last_error_at_ms = None;
                 entry.last_error = None;
                 entry.consecutive_failures = 0;
                 if previous_status != WarmTargetHealth::RateLimited
@@ -389,6 +584,9 @@ fn apply_warm_target_attempts(
                 entry.last_rate_limited_at_ms = None;
                 entry.last_rate_limit_message = None;
                 entry.last_error = Some(error.clone());
+                entry.last_error_at_ms = Some(attempt_at_ms);
+                entry.last_recovered_at_ms = None;
+                entry.last_recovered_error = None;
                 entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
                 if previous_status != WarmTargetHealth::Error
                     || previous_error.as_deref() != Some(error.as_str())
@@ -410,6 +608,49 @@ fn apply_warm_target_attempts(
         }
     }
     prune_stale_warm_targets_after_attempt(warm, &active_ids, attempt_at_ms);
+    recovered_targets
+}
+
+fn record_warm_recovery_summary(scope: &str, recovered_targets: &[WarmRecoveredTarget]) {
+    if recovered_targets.is_empty() {
+        return;
+    }
+    let labels = recovered_targets
+        .iter()
+        .map(|target| target.label.clone())
+        .collect::<Vec<_>>();
+    let preview = labels
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let extra = labels.len().saturating_sub(4);
+    let summary = if extra > 0 {
+        format!("{preview} | +{extra} more")
+    } else {
+        preview
+    };
+    record_info(
+        "warm",
+        format!(
+            "{} recovered {} warm target{}",
+            scope,
+            recovered_targets.len(),
+            if recovered_targets.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        Some(json!({
+            "scope": scope,
+            "status": "healthy",
+            "count": recovered_targets.len(),
+            "summary": summary,
+            "targets": recovered_targets,
+        })),
+    );
 }
 
 fn record_startup_warm_attempts(
@@ -417,7 +658,8 @@ fn record_startup_warm_attempts(
     attempts: &[WarmTargetAttempt],
     attempt_at_ms: u64,
 ) {
-    apply_warm_target_attempts(warm, attempts, attempt_at_ms);
+    let recovered_targets = apply_warm_target_attempts(warm, attempts, attempt_at_ms);
+    record_warm_recovery_summary("startup warm", &recovered_targets);
     warm.last_warm_attempt_at_ms = Some(u128::from(attempt_at_ms));
     if attempts.iter().any(|attempt| {
         matches!(
@@ -634,6 +876,15 @@ struct BagsIdentityStatusQuery {
     wallet: Option<String>,
 }
 
+#[allow(non_snake_case)]
+#[derive(Deserialize, Default)]
+struct BagsFeeRecipientLookupQuery {
+    provider: Option<String>,
+    username: Option<String>,
+    #[serde(rename = "githubUserId")]
+    github_user_id: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct ReportsQuery {
     sort: Option<String>,
@@ -814,6 +1065,14 @@ fn configured_continuous_warm_pass_timeout_ms() -> u64 {
         .unwrap_or(120_000)
 }
 
+fn configured_warm_probe_timeout_ms() -> u64 {
+    std::env::var("LAUNCHDECK_WARM_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= 1_000)
+        .unwrap_or(5_000)
+}
+
 fn configured_idle_warm_timeout_ms() -> u64 {
     std::env::var("LAUNCHDECK_IDLE_WARM_TIMEOUT_MS")
         .ok()
@@ -876,14 +1135,11 @@ fn push_unique_warm_route(
     };
     let endpoint_profile = normalize_warm_endpoint_profile(&provider, endpoint_profile);
     let hellomoon_mev_mode = normalize_warm_hellomoon_mev_mode(&provider, mev_mode);
-    if values
-        .iter()
-        .any(|entry| {
-            entry.provider == provider
-                && entry.endpoint_profile == endpoint_profile
-                && entry.hellomoon_mev_mode == hellomoon_mev_mode
-        })
-    {
+    if values.iter().any(|entry| {
+        entry.provider == provider
+            && entry.endpoint_profile == endpoint_profile
+            && entry.hellomoon_mev_mode == hellomoon_mev_mode
+    }) {
         return;
     }
     values.push(WarmRouteSelection {
@@ -946,7 +1202,9 @@ fn merged_warm_routes(selected: &[WarmRouteSelection]) -> Vec<WarmRouteSelection
     routes
 }
 
-fn warm_routes_for_execution(execution: &crate::config::NormalizedExecution) -> Vec<WarmRouteSelection> {
+fn warm_routes_for_execution(
+    execution: &crate::config::NormalizedExecution,
+) -> Vec<WarmRouteSelection> {
     let mut routes = Vec::new();
     for (provider, endpoint_profile, mev_mode) in [
         (
@@ -1087,12 +1345,19 @@ fn configured_standard_rpc_warm_endpoints(main_rpc_url: &str) -> Vec<String> {
     endpoints
 }
 
+fn should_prewarm_primary_rpc_separately(main_rpc_url: &str, warm_rpc_url: &str) -> bool {
+    let main_trimmed = main_rpc_url.trim();
+    let warm_trimmed = warm_rpc_url.trim();
+    !main_trimmed.is_empty() && !warm_trimmed.is_empty() && main_trimmed != warm_trimmed
+}
+
 fn configured_watch_warm_targets(routes: &[WarmRouteSelection]) -> Vec<WatchWarmTarget> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
     let helius_transaction_subscribe_enabled = configured_enable_helius_transaction_subscribe();
     for route in routes {
-        for endpoint in configured_watch_endpoints_for_provider(&route.provider, &route.endpoint_profile)
+        for endpoint in
+            configured_watch_endpoints_for_provider(&route.provider, &route.endpoint_profile)
         {
             let trimmed = endpoint.trim();
             if trimmed.is_empty() {
@@ -1274,6 +1539,13 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (active, browser_active, reason) = warm_gate_state(&warm, now_ms, follow_active_jobs);
+    let mode = if active {
+        WarmLifecycleMode::Active
+    } else if browser_active || follow_active_jobs > 0 || warm.warm_pass_in_flight {
+        WarmLifecycleMode::Maintenance
+    } else {
+        WarmLifecycleMode::Idle
+    };
     let selected_routes = effective_warm_routes(&warm);
     let selected_providers = warm_route_providers(&selected_routes);
     let state_targets = payload_warm_targets(&warm, "state", active);
@@ -1286,6 +1558,7 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         "intervalMs": configured_continuous_warm_interval_ms(),
         "idleTimeoutMs": configured_idle_warm_timeout_ms(),
         "active": active,
+        "mode": mode,
         "suspended": configured_continuous_warm_enabled() && !active,
         "browserActive": browser_active,
         "reason": reason,
@@ -1296,6 +1569,7 @@ fn warm_state_payload(state: &Arc<AppState>, follow_active_jobs: u64) -> Value {
         "idleForMs": if warm.last_activity_at_ms > 0 { Some(now_ms.saturating_sub(warm.last_activity_at_ms) as u64) } else { None },
         "lastResumeAtMs": warm.last_resume_at_ms.map(|value| value as u64),
         "lastSuspendAtMs": effective_suspend_at_ms(&warm, active, &reason, now_ms),
+        "passInFlight": warm.warm_pass_in_flight,
         "lastWarmAttemptAtMs": warm.last_warm_attempt_at_ms.map(|value| value as u64),
         "lastWarmSuccessAtMs": warm.last_warm_success_at_ms.map(|value| value as u64),
         "lastError": warm.last_error.clone(),
@@ -1329,7 +1603,9 @@ fn update_follow_job_warm_state(
 async fn refresh_follow_job_warm_state_from_daemon(state: &Arc<AppState>) {
     let client = FollowDaemonClient::new(&configured_follow_daemon_base_url());
     match client.list().await {
-        Ok(response) => update_follow_job_warm_state(state, response.health.activeJobs, &response.jobs),
+        Ok(response) => {
+            update_follow_job_warm_state(state, response.health.activeJobs, &response.jobs)
+        }
         Err(_error) => update_follow_job_warm_state(state, 0, &[]),
     }
 }
@@ -1378,209 +1654,25 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
 
     let main_rpc_url = configured_rpc_url();
     let warm_rpc_url = configured_warm_rpc_url(&main_rpc_url);
-    let mut success_count = 0usize;
-    let mut errors = Vec::new();
-    let mut attempts = Vec::new();
-
-    let warm_rpc_result = prewarm_rpc_endpoint(&warm_rpc_url).await;
-    match &warm_rpc_result {
-        Ok(()) => success_count += 1,
-        Err(error) => errors.push(format!("warm-rpc: {error}")),
+    let (state_outcomes, endpoint_outcomes, watch_outcomes_nested) = tokio::join!(
+        join_all(continuous_state_warm_probe_futures(&main_rpc_url, &warm_rpc_url)),
+        join_all(endpoint_warm_probe_futures(&routes, &main_rpc_url)),
+        join_all(watch_warm_probe_futures(&routes)),
+    );
+    let mut outcomes = state_outcomes;
+    outcomes.extend(endpoint_outcomes);
+    for watch_outcomes in watch_outcomes_nested {
+        outcomes.extend(watch_outcomes);
     }
-    attempts.push(build_warm_target_attempt(
-        "state",
-        None,
-        "Warm RPC",
-        warm_rpc_url.clone(),
-        match warm_rpc_result {
-            Ok(()) => WarmAttemptResult::Success,
-            Err(error) => WarmAttemptResult::Error(error),
-        },
-    ));
-
-    let fee_market_result = fetch_fee_market_snapshot(&main_rpc_url).await.map(|_| ());
-    match &fee_market_result {
-        Ok(()) => success_count += 1,
-        Err(error) => errors.push(format!("fee-market: {error}")),
-    }
-    attempts.push(build_warm_target_attempt(
-        "state",
-        None,
-        "Fee Market",
-        main_rpc_url.clone(),
-        match fee_market_result {
-            Ok(()) => WarmAttemptResult::Success,
-            Err(error) => WarmAttemptResult::Error(error),
-        },
-    ));
-
-    if routes.iter().any(|route| route.provider == "standard-rpc") {
-        for endpoint in configured_standard_rpc_warm_endpoints(&main_rpc_url) {
-            let result = prewarm_rpc_endpoint(&endpoint).await;
-            match &result {
-                Ok(()) => success_count += 1,
-                Err(error) => errors.push(format!("standard-rpc {}: {}", endpoint, error)),
-            }
-            attempts.push(build_warm_target_attempt(
-                "endpoint",
-                Some("standard-rpc"),
-                "Standard RPC",
-                endpoint,
-                match result {
-                    Ok(()) => WarmAttemptResult::Success,
-                    Err(error) => WarmAttemptResult::Error(error),
-                },
-            ));
-        }
-    }
-    if routes.iter().any(|route| route.provider == "helius-sender") {
-        let mut seen = HashSet::new();
-        for route in routes
-            .iter()
-            .filter(|route| route.provider == "helius-sender")
-        {
-            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
-            {
-                if !seen.insert(endpoint.clone()) {
-                    continue;
-                }
-                let result = prewarm_helius_sender_endpoint(&endpoint).await;
-                match &result {
-                    Ok(()) => success_count += 1,
-                    Err(error) => errors.push(format!("helius-sender {}: {}", endpoint, error)),
-                }
-                attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("helius-sender"),
-                    "Helius Sender",
-                    endpoint,
-                    match result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    if routes.iter().any(|route| route.provider == "hellomoon") {
-        let mut seen = HashSet::new();
-        let mev_protect = configured_hellomoon_mev_protect();
-        for route in routes.iter().filter(|route| route.provider == "hellomoon") {
-            let endpoints = if route.hellomoon_mev_mode == "secure" {
-                configured_hellomoon_bundle_endpoints_for_profile(&route.endpoint_profile)
-            } else {
-                configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
-            };
-            for endpoint in endpoints {
-                if !seen.insert(endpoint.clone()) {
-                    continue;
-                }
-                let result = if route.hellomoon_mev_mode == "secure" {
-                    prewarm_hellomoon_bundle_endpoint(&endpoint).await
-                } else {
-                    prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await
-                };
-                match &result {
-                    Ok(()) => success_count += 1,
-                    Err(error) => errors.push(format!("hellomoon {}: {}", endpoint, error)),
-                }
-                attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("hellomoon"),
-                    if route.hellomoon_mev_mode == "secure" {
-                        "Hello Moon Bundle"
-                    } else {
-                        "Hello Moon QUIC"
-                    },
-                    endpoint,
-                    match result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    if routes.iter().any(|route| route.provider == "jito-bundle") {
-        let mut seen = HashSet::new();
-        for route in routes
-            .iter()
-            .filter(|route| route.provider == "jito-bundle")
-        {
-            for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
-                if !seen.insert(endpoint.send.clone()) {
-                    continue;
-                }
-                let target = endpoint.name.clone();
-                let result = prewarm_jito_bundle_endpoint(&endpoint).await;
-                match &result {
-                    Ok(JitoWarmResult::Warmed) => success_count += 1,
-                    Ok(JitoWarmResult::RateLimited(_)) => {}
-                    Err(error) => errors.push(format!("jito-bundle {}: {}", endpoint.name, error)),
-                }
-                attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("jito-bundle"),
-                    "Jito Bundle",
-                    target,
-                    match result {
-                        Ok(JitoWarmResult::Warmed) => WarmAttemptResult::Success,
-                        Ok(JitoWarmResult::RateLimited(message)) => {
-                            WarmAttemptResult::RateLimited(message)
-                        }
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    for target in configured_watch_warm_targets(&routes) {
-        let result = match target.transport {
-            WatchWarmTransport::StandardWs => prewarm_watch_websocket_endpoint(&target.target).await,
-            WatchWarmTransport::HeliusTransactionSubscribe => {
-                prewarm_helius_transaction_subscribe_endpoint(&target.target).await
-            }
-        };
-        match &result {
-            Ok(()) => success_count += 1,
-            Err(error) => errors.push(format!("watch-endpoint {}: {}", target.target, error)),
-        }
-        attempts.push(build_warm_target_attempt(
-            "watch-endpoint",
-            None,
-            &target.label,
-            target.target.clone(),
-            match result {
-                Ok(()) => WarmAttemptResult::Success,
-                Err(error) => WarmAttemptResult::Error(error),
-            },
-        ));
-        if target.transport == WatchWarmTransport::HeliusTransactionSubscribe
-            && attempts
-                .last()
-                .is_some_and(|attempt| matches!(attempt.result, WarmAttemptResult::Error(_)))
-        {
-            if let Some(fallback_endpoint) = target.fallback_target.as_deref() {
-                let fallback_result = prewarm_watch_websocket_endpoint(fallback_endpoint).await;
-                match &fallback_result {
-                    Ok(()) => success_count += 1,
-                    Err(error) => {
-                        errors.push(format!("watch-endpoint {}: {}", fallback_endpoint, error))
-                    }
-                }
-                attempts.push(build_warm_target_attempt(
-                    "watch-endpoint",
-                    None,
-                    "Watcher WS",
-                    fallback_endpoint.to_string(),
-                    match fallback_result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
+    let success_count = outcomes.iter().filter(|outcome| outcome.success).count();
+    let errors = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.error.clone())
+        .collect::<Vec<_>>();
+    let attempts = outcomes
+        .into_iter()
+        .map(|outcome| outcome.attempt)
+        .collect::<Vec<_>>();
 
     let now_ms = current_time_ms();
     let mut warm = state
@@ -1588,7 +1680,8 @@ async fn execute_continuous_warm_pass(state: &Arc<AppState>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     warm.warm_pass_in_flight = false;
-    apply_warm_target_attempts(&mut warm, &attempts, attempt_started_at_ms);
+    let recovered_targets = apply_warm_target_attempts(&mut warm, &attempts, attempt_started_at_ms);
+    record_warm_recovery_summary("continuous warm", &recovered_targets);
     if success_count > 0 {
         warm.last_warm_success_at_ms = Some(now_ms);
         warm.last_error = None;
@@ -1733,6 +1826,7 @@ fn guess_content_type(path: &std::path::Path) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
+        "avif" => "image/avif",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
@@ -1754,7 +1848,7 @@ fn cache_control_for_path(path: &std::path::Path) -> &'static str {
     }
     if matches!(
         extension.as_str(),
-        "js" | "css" | "svg" | "png" | "jpg" | "jpeg" | "webp" | "gif"
+        "js" | "css" | "svg" | "png" | "avif" | "jpg" | "jpeg" | "webp" | "gif"
     ) {
         return "no-cache";
     }
@@ -1785,6 +1879,41 @@ fn file_response(path: std::path::PathBuf) -> Result<Response<Body>, (StatusCode
                 })),
             )
         })
+}
+
+fn static_not_found() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "ok": false,
+            "error": "Not found",
+        })),
+    )
+}
+
+fn safe_ui_relative_path(requested: &str) -> Option<std::path::PathBuf> {
+    let trimmed = requested.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Some(std::path::PathBuf::from("index.html"));
+    }
+    let mut relative = std::path::PathBuf::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            std::path::Component::Normal(value) => relative.push(value),
+            _ => return None,
+        }
+    }
+    if requested.ends_with('/') {
+        relative.push("index.html");
+    }
+    Some(relative)
+}
+
+fn try_file_response(path: std::path::PathBuf) -> Option<Result<Response<Body>, (StatusCode, Json<Value>)>> {
+    if path.is_file() {
+        return Some(file_response(path));
+    }
+    None
 }
 
 fn now_timestamp_string() -> String {
@@ -1826,6 +1955,17 @@ fn render_report_value(report: &Value) -> Value {
     serde_json::from_value::<LaunchReport>(report.clone())
         .map(|parsed| Value::String(render_report(&parsed)))
         .unwrap_or_else(|_| Value::String(String::new()))
+}
+
+fn response_metadata_uri(prepared_metadata_uri: Option<String>, report: &Value) -> Option<String> {
+    prepared_metadata_uri.or_else(|| {
+        report
+            .get("metadataUri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn append_execution_warning(report: &mut Value, warning: &str) {
@@ -1926,7 +2066,12 @@ fn refresh_report_benchmark(report: &mut Value) {
         if let Some(execution) = report.get_mut("execution") {
             execution["timings"] = Value::Null;
         }
-        report["benchmark"] = Value::Null;
+        report["benchmark"] = json!({
+            "mode": mode.as_str(),
+            "timings": {},
+            "timingGroups": [],
+            "sent": [],
+        });
         return;
     }
     let timings =
@@ -1943,18 +2088,22 @@ fn refresh_report_benchmark(report: &mut Value) {
     let sent = sent_items
         .into_iter()
         .map(|item| {
-            let send_height = item.get("sendObservedBlockHeight").and_then(Value::as_u64);
-            let confirmed_height = item
-                .get("confirmedObservedBlockHeight")
+            let send_slot = item
+                .get("sendObservedSlot")
+                .or_else(|| item.get("sendObservedBlockHeight"))
+                .and_then(Value::as_u64);
+            let confirmed_slot = item
+                .get("confirmedObservedSlot")
+                .or_else(|| item.get("confirmedObservedBlockHeight"))
                 .and_then(Value::as_u64);
             json!({
                 "label": item.get("label").cloned().unwrap_or_else(|| Value::String("(unknown)".to_string())),
                 "signature": item.get("signature").cloned().unwrap_or(Value::Null),
                 "confirmationStatus": item.get("confirmationStatus").cloned().unwrap_or(Value::Null),
-                "sendBlockHeight": send_height,
-                "confirmedBlockHeight": confirmed_height,
-                "blocksToConfirm": match (send_height, confirmed_height) {
-                    (Some(send_height), Some(confirmed_height)) => Some(confirmed_height.saturating_sub(send_height)),
+                "sendSlot": send_slot,
+                "confirmedObservedSlot": confirmed_slot,
+                "slotsToConfirm": match (send_slot, confirmed_slot) {
+                    (Some(send_slot), Some(confirmed_slot)) => Some(confirmed_slot.saturating_sub(send_slot)),
                     _ => None,
                 },
                 "confirmedSlot": item.get("confirmedSlot").cloned().unwrap_or(Value::Null),
@@ -2043,6 +2192,317 @@ fn has_same_time_snipes(follow_launch: &NormalizedFollowLaunch) -> bool {
         .snipes
         .iter()
         .any(|snipe| snipe.enabled && snipe.submitWithLaunch)
+}
+
+async fn cancel_reserved_follow_job_on_launch_failure(
+    client: Option<&FollowDaemonClient>,
+    reserve_task: &mut Option<tokio::task::JoinHandle<Result<(FollowJobResponse, u128), String>>>,
+    trace_id: &str,
+    note: &str,
+) {
+    if let Some(mut task) = reserve_task.take() {
+        match tokio::time::timeout(Duration::from_millis(1500), &mut task).await {
+            Ok(_) => {}
+            Err(_) => {
+                task.abort();
+            }
+        }
+    }
+    let _ = cancel_follow_job_best_effort(client, trace_id, note).await;
+}
+
+async fn cancel_follow_job_best_effort(
+    client: Option<&FollowDaemonClient>,
+    trace_id: &str,
+    note: &str,
+) -> bool {
+    if let Some(client) = client {
+        let mut last_error = None;
+        for attempt in 0..5 {
+            match client
+                .cancel(&FollowCancelRequest {
+                    traceId: trace_id.to_string(),
+                    actionId: None,
+                    note: Some(note.to_string()),
+                })
+                .await
+            {
+                Ok(_) => {
+                    return true;
+                }
+                Err(error) => {
+                    let retry_unknown_trace = error.contains("Unknown follow job traceId");
+                    last_error = Some(error);
+                    if retry_unknown_trace && attempt < 4 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            record_warn(
+                "follow-client",
+                "Follow daemon cancellation after launch failure was not acknowledged.".to_string(),
+                Some(json!({
+                    "traceId": trace_id,
+                    "message": error,
+                    "note": note,
+                })),
+            );
+        }
+    }
+    false
+}
+
+async fn collect_bags_setup_transaction_diagnostics(
+    rpc_url: &str,
+    commitment: &str,
+    transaction: &CompiledTransaction,
+    sent: Option<&[crate::rpc::SentResult]>,
+) -> String {
+    let mut diagnostics = vec![
+        format!("label={}", transaction.label),
+        format!("format={}", transaction.format),
+        format!("blockhash={}", transaction.blockhash),
+        format!(
+            "localLastValidBlockHeight={}",
+            transaction.lastValidBlockHeight
+        ),
+        format!(
+            "computeUnitLimit={}",
+            transaction
+                .computeUnitLimit
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ),
+        format!(
+            "computeUnitPriceMicroLamports={}",
+            transaction
+                .computeUnitPriceMicroLamports
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ),
+        format!(
+            "inlineTipLamports={}",
+            transaction
+                .inlineTipLamports
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ),
+        format!(
+            "inlineTipAccount={}",
+            transaction
+                .inlineTipAccount
+                .clone()
+                .unwrap_or_else(|| "null".to_string())
+        ),
+    ];
+    if let Some(signature) = transaction.signature.as_deref() {
+        diagnostics.push(format!("signature={signature}"));
+    }
+    match fetch_current_block_height(rpc_url, commitment).await {
+        Ok(value) => diagnostics.push(format!("currentBlockHeight={value}")),
+        Err(error) => diagnostics.push(format!("currentBlockHeightError={error}")),
+    }
+    match is_blockhash_valid(rpc_url, &transaction.blockhash, commitment).await {
+        Ok(valid) => diagnostics.push(format!("actualBlockhashValid={valid}")),
+        Err(error) => diagnostics.push(format!("actualBlockhashValidError={error}")),
+    }
+    match simulate_transactions(rpc_url, std::slice::from_ref(transaction), commitment).await {
+        Ok((simulation, warnings)) => {
+            if let Some(result) = simulation.first() {
+                diagnostics.push(format!(
+                    "simulationErr={}",
+                    result
+                        .err
+                        .as_ref()
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "null".to_string())
+                ));
+                if let Some(units) = result.unitsConsumed {
+                    diagnostics.push(format!("simulationUnitsConsumed={units}"));
+                }
+                if !result.logs.is_empty() {
+                    diagnostics.push(format!(
+                        "simulationLogs={}",
+                        result
+                            .logs
+                            .iter()
+                            .take(12)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" || ")
+                    ));
+                }
+            }
+            if !warnings.is_empty() {
+                diagnostics.push(format!("simulationWarnings={}", warnings.join(" || ")));
+            }
+        }
+        Err(error) => diagnostics.push(format!("simulationRequestError={error}")),
+    }
+    if let Some(sent_results) = sent {
+        if let Some(first) = sent_results.first() {
+            diagnostics.push(format!("transportType={}", first.transportType));
+            diagnostics.push(format!(
+                "transportEndpoint={}",
+                first.endpoint.clone().unwrap_or_else(|| "null".to_string())
+            ));
+            if !first.attemptedEndpoints.is_empty() {
+                diagnostics.push(format!(
+                    "attemptedEndpoints={}",
+                    first.attemptedEndpoints.join(",")
+                ));
+            }
+            if let Some(value) = first.sendObservedSlot {
+                diagnostics.push(format!("sendObservedSlot={value}"));
+            }
+        }
+    }
+    diagnostics.join(" | ")
+}
+
+fn actual_helius_sender_endpoint(sent: &[crate::rpc::SentResult]) -> Option<String> {
+    sent.iter().find_map(|entry| {
+        if entry.transportType != "helius-sender" {
+            return None;
+        }
+        entry.endpoint
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+    })
+}
+
+fn standard_rpc_transport_plan(base: &TransportPlan, primary_rpc_url: &str) -> TransportPlan {
+    let mut plan = base.clone();
+    plan.requestedProvider = "standard-rpc".to_string();
+    plan.resolvedProvider = "standard-rpc".to_string();
+    plan.transportType = "standard-rpc-fanout".to_string();
+    plan.executionClass = "sequential".to_string();
+    plan.ordering = "sequential".to_string();
+    plan.supportsBundle = false;
+    plan.requiresInlineTip = false;
+    plan.requiresPriorityFee = false;
+    plan.separateTipTransaction = false;
+    plan.skipPreflight = base.skipPreflight
+        || primary_rpc_url
+            .trim()
+            .to_ascii_lowercase()
+            .contains("helius");
+    plan.maxRetries = 0;
+    plan.helloMoonQuicEndpoint = None;
+    plan.helloMoonQuicEndpoints = vec![];
+    plan.helloMoonBundleEndpoint = None;
+    plan.helloMoonBundleEndpoints = vec![];
+    plan.heliusSenderEndpoint = None;
+    plan.heliusSenderEndpoints = vec![];
+    plan.jitoBundleEndpoints = vec![];
+    plan
+}
+
+fn build_buy_transport_plan(
+    execution: &crate::config::NormalizedExecution,
+    transaction_count: usize,
+) -> TransportPlan {
+    let mut buy_execution = execution.clone();
+    buy_execution.provider = execution.buyProvider.clone();
+    buy_execution.endpointProfile = execution.buyEndpointProfile.clone();
+    buy_execution.mevProtect = execution.buyMevProtect;
+    buy_execution.mevMode = execution.buyMevMode.clone();
+    buy_execution.jitodontfront = execution.buyJitodontfront;
+    buy_execution.autoGas = execution.buyAutoGas;
+    buy_execution.autoMode = execution.buyAutoMode.clone();
+    buy_execution.priorityFeeSol = execution.buyPriorityFeeSol.clone();
+    buy_execution.tipSol = execution.buyTipSol.clone();
+    buy_execution.maxPriorityFeeSol = execution.buyMaxPriorityFeeSol.clone();
+    buy_execution.maxTipSol = execution.buyMaxTipSol.clone();
+    build_transport_plan(&buy_execution, transaction_count)
+}
+
+async fn send_transactions_sequential_for_transport(
+    rpc_url: &str,
+    transport_plan: &TransportPlan,
+    transactions: &[CompiledTransaction],
+    commitment: &str,
+    skip_preflight: bool,
+    track_send_block_height: bool,
+    confirm_timeout_secs: Option<u64>,
+) -> Result<
+    (
+        Vec<crate::rpc::SentResult>,
+        Vec<String>,
+        SendTimingBreakdown,
+    ),
+    String,
+> {
+    if transactions.is_empty() {
+        return Ok((vec![], vec![], SendTimingBreakdown::default()));
+    }
+    let mut sent = Vec::with_capacity(transactions.len());
+    let mut warnings = Vec::new();
+    let mut timing = SendTimingBreakdown::default();
+    for transaction in transactions {
+        let (mut submitted, mut entry_warnings, submit_ms) = submit_transactions_for_transport(
+            rpc_url,
+            transport_plan,
+            std::slice::from_ref(transaction),
+            commitment,
+            skip_preflight,
+            track_send_block_height,
+        )
+        .await?;
+        warnings.append(&mut entry_warnings);
+        timing.submit_ms = timing.submit_ms.saturating_add(submit_ms);
+
+        let confirm_future = confirm_submitted_transactions_for_transport(
+            rpc_url,
+            transport_plan,
+            &mut submitted,
+            commitment,
+            track_send_block_height,
+        );
+        let confirm_result = if let Some(timeout_secs) = confirm_timeout_secs {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), confirm_future).await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "Timed out waiting for transaction {} to reach {} ({}s sequential confirmation budget exceeded).",
+                    transaction.label, commitment, timeout_secs
+                )),
+            }
+        } else {
+            confirm_future.await
+        };
+
+        match confirm_result {
+            Ok((mut confirm_warnings, confirm_ms)) => {
+                warnings.append(&mut confirm_warnings);
+                timing.confirm_ms = timing.confirm_ms.saturating_add(confirm_ms);
+                sent.append(&mut submitted);
+            }
+            Err(error) => {
+                let actual_blockhash_valid =
+                    is_blockhash_valid(rpc_url, &transaction.blockhash, commitment)
+                        .await
+                        .ok();
+                let current_block_height =
+                    fetch_current_block_height(rpc_url, commitment).await.ok();
+                return Err(match current_block_height {
+                    Some(height) => format!(
+                        "{error} (current block height {}; actualBlockhashValid={:?})",
+                        height, actual_blockhash_valid
+                    ),
+                    None => format!(
+                        "{error} (actualBlockhashValid={:?})",
+                        actual_blockhash_valid
+                    ),
+                });
+            }
+        }
+    }
+    Ok((sent, warnings, timing))
 }
 
 fn should_reserve_follow_job(
@@ -2546,8 +3006,8 @@ fn resolve_auto_fee_components_with_total_cap(
 
             if remaining_budget > 0 {
                 if resolved_tip < target_tip_budget {
-                    let extra_priority = (priority.saturating_sub(resolved_priority))
-                        .min(remaining_budget);
+                    let extra_priority =
+                        (priority.saturating_sub(resolved_priority)).min(remaining_budget);
                     resolved_priority = resolved_priority.saturating_add(extra_priority);
                 } else if resolved_priority < target_priority_budget {
                     let extra_tip = (tip.saturating_sub(resolved_tip)).min(remaining_budget);
@@ -2662,21 +3122,21 @@ fn parse_helius_priority_estimate_result(
 ) -> Option<u64> {
     normalize_estimate_to_lamports(
         helius_priority_level_value(result, helius_priority_level)
-        .or_else(|| {
-            result
-                .get("priorityFeeLevels")
-                .and_then(|levels| levels.get("veryHigh"))
-        })
-        .or_else(|| {
-            result
-                .get("priorityFeeEstimate")
-                .or_else(|| result.get("recommended"))
-        })
-        .or_else(|| {
-            result
-                .get("priorityFeeLevels")
-                .and_then(|levels| levels.get("high"))
-        }),
+            .or_else(|| {
+                result
+                    .get("priorityFeeLevels")
+                    .and_then(|levels| levels.get("veryHigh"))
+            })
+            .or_else(|| {
+                result
+                    .get("priorityFeeEstimate")
+                    .or_else(|| result.get("recommended"))
+            })
+            .or_else(|| {
+                result
+                    .get("priorityFeeLevels")
+                    .and_then(|levels| levels.get("high"))
+            }),
     )
 }
 
@@ -2794,16 +3254,17 @@ async fn estimate_serialized_launch_priority_fee(
 ) -> Result<Option<u64>, String> {
     let probe_config = sanitized_serialized_priority_probe_config(config);
 
-    let native = try_compile_native_launchpad(
+    let native = compile_native_launch(NativeLaunchCompileRequest {
         rpc_url,
-        &probe_config,
+        config: &probe_config,
         transport_plan,
         wallet_secret,
-        now_timestamp_string(),
-        creator_public_key.to_string(),
-        Some("Rust serialized fee probe".to_string()),
-        true,
-    )
+        built_at: now_timestamp_string(),
+        creator_public_key: creator_public_key.to_string(),
+        config_path: Some("Rust serialized fee probe".to_string()),
+        allow_ata_creation: true,
+        launch_blockhash_prime: None,
+    })
     .await?
     .ok_or_else(|| {
         format!(
@@ -2868,7 +3329,9 @@ async fn prewarm_helius_sender_endpoint(rpc_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_helius_priority_snapshot_live(primary_rpc_url: &str) -> Result<FeeMarketSnapshot, String> {
+async fn fetch_helius_priority_snapshot_live(
+    primary_rpc_url: &str,
+) -> Result<FeeMarketSnapshot, String> {
     let helius_priority_level = auto_fee_helius_priority_level();
     let client = shared_fee_market_http_client();
     let hel_priority_rpc = resolved_helius_priority_fee_rpc_url(primary_rpc_url);
@@ -3246,7 +3709,8 @@ async fn resolve_auto_execution_fees(
                 creation_report.tipSource = source;
                 creation_report.tipEstimateLamports = estimated;
                 Some(estimated.ok_or_else(|| {
-                    "Creation auto fee is enabled but no Jito tip estimate was returned.".to_string()
+                    "Creation auto fee is enabled but no Jito tip estimate was returned."
+                        .to_string()
                 })?)
             } else {
                 None
@@ -3317,7 +3781,8 @@ async fn resolve_auto_execution_fees(
                 buy_report.prioritySource = source;
                 buy_report.priorityEstimateLamports = estimated;
                 Some(estimated.ok_or_else(|| {
-                    "Buy auto fee is enabled but no Helius priority estimate was returned.".to_string()
+                    "Buy auto fee is enabled but no Helius priority estimate was returned."
+                        .to_string()
                 })?)
             } else {
                 None
@@ -3389,7 +3854,8 @@ async fn resolve_auto_execution_fees(
                 sell_report.prioritySource = source;
                 sell_report.priorityEstimateLamports = estimated;
                 Some(estimated.ok_or_else(|| {
-                    "Sell auto fee is enabled but no Helius priority estimate was returned.".to_string()
+                    "Sell auto fee is enabled but no Helius priority estimate was returned."
+                        .to_string()
                 })?)
             } else {
                 None
@@ -3488,6 +3954,8 @@ fn apply_same_time_creation_fee_guard(
         let next_priority_text = format_lamports_to_sol_decimal(next_priority);
         normalized.execution.priorityFeeSol = next_priority_text.clone();
         normalized.execution.maxPriorityFeeSol = next_priority_text;
+        normalized.tx.computeUnitPriceMicroLamports =
+            Some(lamports_to_priority_fee_micro_lamports(next_priority) as i64);
         adjusted_fields.push("priority fee");
     }
     if creation_tip <= buy_tip {
@@ -3527,35 +3995,91 @@ async fn compile_same_time_snipes(
     snipes: &[crate::config::NormalizedFollowLaunchSnipe],
     allow_ata_creation: bool,
 ) -> Result<Vec<CompiledTransaction>, String> {
-    let tasks = snipes.iter().enumerate().map(|(index, snipe)| async move {
-        let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
-        let mut tx = compile_atomic_follow_buy_for_launchpad(
-            &normalized.launchpad,
-            &normalized.mode,
-            &normalized.quoteAsset,
-            rpc_url,
-            &normalized.execution,
-            normalized.token.mayhemMode,
-            &normalized.tx.jitoTipAccount,
-            &wallet_secret,
-            mint,
-            launch_creator,
-            &snipe.buyAmountSol,
-            allow_ata_creation,
-        )
-        .await?;
-        tx.label = format!(
-            "sniper-buy-{}-wallet-{}",
-            index + 1,
-            same_time_wallet_label(&snipe.walletEnvKey)
-        );
-        Ok::<Vec<CompiledTransaction>, String>(vec![tx])
+    let (predicted_dev_buy_tokens, predicted_dev_buy_quote_amount, pump_cashback_enabled) =
+        resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
+    let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
+    let tasks = snipes.iter().enumerate().map(|(index, snipe)| {
+        let buy_tip_account = buy_tip_account.clone();
+        async move {
+            let wallet_secret = load_solana_wallet_by_env_key(&snipe.walletEnvKey)?;
+            let mut tx = compile_atomic_follow_buy_for_launchpad(
+                &normalized.launchpad,
+                &normalized.mode,
+                &normalized.quoteAsset,
+                rpc_url,
+                &normalized.execution,
+                normalized.token.mayhemMode,
+                &buy_tip_account,
+                &wallet_secret,
+                mint,
+                launch_creator,
+                &snipe.buyAmountSol,
+                allow_ata_creation,
+                predicted_dev_buy_tokens,
+                predicted_dev_buy_quote_amount,
+                pump_cashback_enabled,
+            )
+            .await?;
+            tx.label = format!(
+                "sniper-buy-{}-wallet-{}",
+                index + 1,
+                same_time_wallet_label(&snipe.walletEnvKey)
+            );
+            Ok::<Vec<CompiledTransaction>, String>(vec![tx])
+        }
     });
     join_all(tasks)
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .map(|groups| groups.into_iter().flatten().collect())
+}
+
+async fn resolve_predicted_creator_dev_buy_effect(
+    rpc_url: &str,
+    normalized: &NormalizedConfig,
+) -> Result<(Option<u64>, Option<u64>, Option<bool>), String> {
+    match normalized.launchpad.as_str() {
+        "pump" => Ok((
+            predict_dev_buy_token_amount_for_launchpad(rpc_url, normalized).await?,
+            None,
+            Some(normalized.mode == "cashback"),
+        )),
+        "bonk" => {
+            let effect = crate::bonk_native::predict_dev_buy_effect(rpc_url, normalized).await?;
+            Ok((
+                effect.as_ref().map(|value| value.token_amount),
+                effect.as_ref().map(|value| value.requested_quote_amount_b),
+                None,
+            ))
+        }
+        "bagsapp" => Ok((None, None, None)),
+        other => Err(format!(
+            "Unsupported launchpad for predicted creator dev buy effect: {other}"
+        )),
+    }
+}
+
+fn launch_prefers_post_setup_creator_vault_for_follow(
+    launchpad: &str,
+    mode: &str,
+    generate_later_setup: bool,
+    has_fee_recipients: bool,
+) -> bool {
+    matches!(mode, "agent-custom" | "agent-locked")
+        || (launchpad == "pump"
+            && mode == "regular"
+            && generate_later_setup
+            && has_fee_recipients)
+}
+
+fn prefers_post_setup_creator_vault_for_follow(normalized: &NormalizedConfig) -> bool {
+    launch_prefers_post_setup_creator_vault_for_follow(
+        &normalized.launchpad,
+        &normalized.mode,
+        normalized.feeSharing.generateLaterSetup,
+        !normalized.feeSharing.recipients.is_empty(),
+    )
 }
 
 async fn compile_presigned_follow_actions(
@@ -3568,10 +4092,11 @@ async fn compile_presigned_follow_actions(
     let mut actions = build_action_records(&normalized.followLaunch);
     let buy_tip_account = pick_tip_account_for_provider(&normalized.execution.buyProvider);
     let sell_tip_account = pick_tip_account_for_provider(&normalized.execution.sellProvider);
-    let mut predicted_dev_buy_tokens: Option<Option<u64>> = None;
+    let mut predicted_dev_buy_effect: Option<(Option<u64>, Option<u64>, Option<bool>)> = None;
     let mut predicted_bonk_dev_buy_tokens: Option<Option<u64>> = None;
     let bonk_pool_id = if normalized.launchpad == "bonk" {
-        Some(derive_bonk_canonical_pool_id(&normalized.quoteAsset, mint).await?)
+        derive_canonical_pool_id_for_launchpad(&normalized.launchpad, &normalized.quoteAsset, mint)
+            .await?
     } else {
         None
     };
@@ -3587,15 +4112,28 @@ async fn compile_presigned_follow_actions(
                 let Some(buy_amount_sol) = action.buyAmountSol.as_deref() else {
                     continue;
                 };
+                if action.targetBlockOffset.unwrap_or_default() > 0 {
+                    continue;
+                }
                 if normalized.launchpad == "pump"
                     && should_use_post_setup_creator_vault_for_buy(
-                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                        prefers_post_setup_creator_vault_for_follow(normalized),
                         action,
                         &normalized.execution.buyMevMode,
                     )
                 {
                     continue;
                 }
+                let (predicted_dev_buy_tokens, predicted_dev_buy_quote_amount, pump_cashback_enabled) =
+                    match predicted_dev_buy_effect {
+                        Some(value) => value,
+                        None => {
+                            let value =
+                                resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
+                            predicted_dev_buy_effect = Some(value);
+                            value
+                        }
+                    };
                 let mut tx = compile_atomic_follow_buy_for_launchpad(
                     &normalized.launchpad,
                     &normalized.mode,
@@ -3609,6 +4147,9 @@ async fn compile_presigned_follow_actions(
                     launch_creator,
                     buy_amount_sol,
                     allow_ata_creation,
+                    predicted_dev_buy_tokens,
+                    predicted_dev_buy_quote_amount,
+                    pump_cashback_enabled,
                 )
                 .await?;
                 tx.label = action.actionId.clone();
@@ -3616,20 +4157,23 @@ async fn compile_presigned_follow_actions(
             }
             crate::follow::FollowActionKind::DevAutoSell
                 if normalized.launchpad == "pump"
-                    && action.walletEnvKey == normalized.selectedWalletKey =>
+                    && action.walletEnvKey == normalized.selectedWalletKey
+                    && follow_action_is_immediate_presign_candidate(action) =>
             {
                 let use_post_setup_creator_vault_for_sell =
                     should_use_post_setup_creator_vault_for_sell(
-                        matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked"),
+                        prefers_post_setup_creator_vault_for_follow(normalized),
                         action,
                         &normalized.execution.sellMevMode,
                     );
-                let predicted_tokens = match predicted_dev_buy_tokens {
-                    Some(value) => value,
+                let predicted_tokens = match predicted_dev_buy_effect {
+                    Some((value, _, _)) => value,
                     None => {
-                        let value = predict_dev_buy_token_amount(rpc_url, normalized).await?;
-                        predicted_dev_buy_tokens = Some(value);
-                        value
+                        let value =
+                            resolve_predicted_creator_dev_buy_effect(rpc_url, normalized).await?;
+                        let predicted_tokens = value.0;
+                        predicted_dev_buy_effect = Some(value);
+                        predicted_tokens
                     }
                 };
                 let Some(predicted_tokens) = predicted_tokens else {
@@ -3661,12 +4205,14 @@ async fn compile_presigned_follow_actions(
             }
             crate::follow::FollowActionKind::DevAutoSell
                 if normalized.launchpad == "bonk"
-                    && action.walletEnvKey == normalized.selectedWalletKey =>
+                    && action.walletEnvKey == normalized.selectedWalletKey
+                    && follow_action_is_immediate_presign_candidate(action) =>
             {
                 let predicted_tokens = match predicted_bonk_dev_buy_tokens {
                     Some(value) => value,
                     None => {
-                        let value = predict_bonk_dev_buy_token_amount(rpc_url, normalized).await?;
+                        let value =
+                            predict_dev_buy_token_amount_for_launchpad(rpc_url, normalized).await?;
                         predicted_bonk_dev_buy_tokens = Some(value);
                         value
                     }
@@ -3708,6 +4254,13 @@ async fn compile_presigned_follow_actions(
         }
     }
     Ok(actions)
+}
+
+fn follow_action_is_immediate_presign_candidate(action: &crate::follow::FollowActionRecord) -> bool {
+    action.marketCap.is_none()
+        && action.delayMs.unwrap_or_default() == 0
+        && action.submitDelayMs.unwrap_or_default() == 0
+        && action.targetBlockOffset.unwrap_or_default() == 0
 }
 
 async fn build_status_payload(
@@ -3856,6 +4409,56 @@ async fn build_wallet_status_payload(
     }))
 }
 
+fn build_launchpad_backend_status_payload() -> Value {
+    let launchpad_actions: [(&str, &[&str]); 3] = [
+        (
+            "pump",
+            &["startup-warm", "quote", "market-snapshot", "build-launch"],
+        ),
+        (
+            "bonk",
+            &[
+                "startup-warm",
+                "quote",
+                "market-snapshot",
+                "import-context",
+                "follow-buy",
+                "follow-sell",
+                "build-launch",
+            ],
+        ),
+        (
+            "bagsapp",
+            &[
+                "startup-warm",
+                "quote",
+                "market-snapshot",
+                "import-context",
+                "fee-recipient-lookup",
+                "follow-buy",
+                "follow-sell",
+                "prepare-launch",
+                "build-launch",
+            ],
+        ),
+    ];
+    let mut payload = serde_json::Map::new();
+    for (launchpad, actions) in launchpad_actions {
+        let mut action_payload = serde_json::Map::new();
+        for action in actions {
+            action_payload.insert(
+                action.to_string(),
+                json!({
+                    "backend": launchpad_action_backend(launchpad, action),
+                    "rolloutState": launchpad_action_rollout_state(launchpad, action),
+                }),
+            );
+        }
+        payload.insert(launchpad.to_string(), Value::Object(action_payload));
+    }
+    Value::Object(payload)
+}
+
 async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
     let (runtime_workers, follow_daemon) =
         tokio::join!(list_workers(&state.runtime), follow_daemon_status_payload(),);
@@ -3878,6 +4481,11 @@ async fn build_runtime_status_payload(state: &Arc<AppState>) -> Value {
         "runtime": {
             "statePath": state.runtime.storage_path,
             "workerCount": runtime_workers.len(),
+        },
+        "launchpads": launchpad_registry(),
+        "launchpadBackends": build_launchpad_backend_status_payload(),
+        "nativeFallbacks": {
+            "bagsapp": bags_runtime_status_payload(),
         },
         "warm": warm_state_payload(state, follow_active_jobs),
         "runtimeWorkers": runtime_workers,
@@ -3976,17 +4584,17 @@ async fn execute_engine_action_payload(
         } else if let Some(form_value) = payload.form.clone() {
             let (raw_config, metadata_uri, metadata_warning) =
                 build_raw_config_from_form(&action, form_value)
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
+                    .await
+                    .map_err(|error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": error,
+                                "traceId": trace.traceId,
+                            })),
+                        )
+                    })?;
             let raw_config_value = serde_json::to_value(raw_config).map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -4278,59 +4886,57 @@ async fn execute_engine_action_payload(
             "report": report_value,
             "sendLogPath": send_log_path,
             "text": render_report_value(&report_value),
-            "metadataUri": prepared_metadata_uri,
+            "metadataUri": response_metadata_uri(prepared_metadata_uri, &report_value),
             "metadataWarning": prepared_metadata_warning,
         }));
     }
     let compile_started_ms = current_time_ms();
-    let mut prepared_bags_send: Option<PreparedBagsSendArtifacts> = None;
-    let native_artifacts = if action == "send" && normalized.launchpad == "bagsapp" {
-        let prepared = prepare_native_bags_send(
-            &configured_rpc_url(),
-            &normalized,
-            &transport_plan,
-            &wallet_secret,
-            now_timestamp_string(),
-            creator_public_key.clone(),
-            Some("Rust native compile".to_string()),
-        )
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": error,
-                    "traceId": trace.traceId,
-                })),
-            )
-        })?;
-        let native = prepared.native_artifacts.clone();
-        prepared_bags_send = Some(prepared);
-        Some(native.into())
+    let (launch_blockhash_prime, warm_report) = if action == "send" || action == "simulate" {
+        match build_launchpad_warm_context(&configured_rpc_url(), &normalized.execution.commitment)
+            .await
+        {
+            Ok((ctx, report)) => {
+                let prime = if ctx.blockhash.is_empty() {
+                    None
+                } else {
+                    Some((ctx.blockhash, ctx.last_valid_block_height))
+                };
+                (prime, report)
+            }
+            Err(error) => {
+                record_warn(
+                    "launch-warm",
+                    format!("Launch warm context failed (continuing): {error}"),
+                    Some(json!({ "traceId": trace.traceId })),
+                );
+                (None, launchpad_warm_env_snapshot())
+            }
+        }
     } else {
-        try_compile_native_launchpad(
-            &configured_rpc_url(),
-            &normalized,
-            &transport_plan,
-            &wallet_secret,
-            now_timestamp_string(),
-            creator_public_key.clone(),
-            Some("Rust native compile".to_string()),
-            action == "send",
-        )
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": error,
-                    "traceId": trace.traceId,
-                })),
-            )
-        })?
+        (None, LaunchpadWarmBuildReport::default())
     };
+    let native_artifacts = compile_native_launch(NativeLaunchCompileRequest {
+        rpc_url: &configured_rpc_url(),
+        config: &normalized,
+        transport_plan: &transport_plan,
+        wallet_secret: &wallet_secret,
+        built_at: now_timestamp_string(),
+        creator_public_key: creator_public_key.clone(),
+        config_path: Some("Rust native compile".to_string()),
+        allow_ata_creation: action == "send",
+        launch_blockhash_prime,
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error,
+                "traceId": trace.traceId,
+            })),
+        )
+    })?;
     let compile_transactions_ms = current_time_ms().saturating_sub(compile_started_ms);
     let native = native_artifacts.ok_or_else(|| {
         (
@@ -4346,32 +4952,41 @@ async fn execute_engine_action_payload(
             })),
         )
     })?;
-    let (
+    let NativeLaunchArtifacts {
         mut compiled_transactions,
         creation_transactions,
         deferred_setup_transactions,
-        mut report_value,
-        text_value,
-        assembly_executor,
-        compile_breakdown,
-        compiled_mint,
-        compiled_launch_creator,
-    ) = (
-        native.compiled_transactions,
-        native.creation_transactions,
-        native.deferred_setup_transactions,
-        native.report,
-        Value::String(native.text),
-        "rust-native".to_string(),
-        native.compile_timings,
-        native.mint,
-        native.launch_creator,
-    );
+        setup_bundles,
+        setup_transactions,
+        bags_launch_follow,
+        bags_config_key,
+        bags_metadata_uri,
+        bags_prepare_launch_ms,
+        bags_metadata_upload_ms,
+        bags_fee_recipient_resolve_ms,
+        report,
+        text,
+        compile_timings: compile_breakdown,
+        mint: compiled_mint,
+        launch_creator: compiled_launch_creator,
+        bags_fee_estimate: _,
+    } = native;
+    let mut report_value = report;
+    let text_value = Value::String(text);
+    let assembly_executor = "rust-native".to_string();
     if let Some(warning) = same_time_fee_guard_warning.as_deref() {
         append_execution_warning(&mut report_value, warning);
     }
     for note in &auto_fee_resolution.notes {
         append_execution_note(&mut report_value, note);
+    }
+    if normalized.launchpad == "bagsapp"
+        && (!setup_bundles.is_empty() || !setup_transactions.is_empty())
+    {
+        append_execution_note(
+            &mut report_value,
+            "LaunchDeck-created Bags trading is pinned to the canonical local DBC/DAMM path; hosted Bags trade fallback is disabled for this launch.",
+        );
     }
     if benchmark_mode == BenchmarkMode::Full {
         set_execution_value(
@@ -4385,6 +5000,24 @@ async fn execute_engine_action_payload(
         "compileTransactionsMs",
         compile_transactions_ms,
     );
+    set_report_timing(
+        &mut report_value,
+        "launchpadWarmContextBuildMs",
+        warm_report.build_ms,
+    );
+    set_report_timing(
+        &mut report_value,
+        "launchpadWarmBlockhashPrimeMs",
+        warm_report.blockhash_fetch_ms,
+    );
+    if let Some(exec) = report_value.get_mut("execution") {
+        exec["launchpadBackend"] = json!(launchpad_action_backend(&normalized.launchpad, "build-launch"));
+        exec["launchpadRolloutState"] =
+            json!(launchpad_action_rollout_state(&normalized.launchpad, "build-launch"));
+        exec["launchpadWarmContextEnabled"] = json!(warm_report.warm_context_enabled);
+        exec["launchpadWarmParallelFetchEnabled"] = json!(warm_report.parallel_enabled);
+        exec["launchpadWarmMaxParallelFetches"] = json!(warm_report.max_parallel_warm_fetches);
+    }
     set_report_timing(
         &mut report_value,
         "compileLaunchCreatorPrepMs",
@@ -4430,12 +5063,65 @@ async fn execute_engine_action_payload(
         "compileTipSerializeMs",
         compile_breakdown.tip_serialize_ms,
     );
+    set_optional_report_timing(
+        &mut report_value,
+        "bagsPrepareLaunchMs",
+        bags_prepare_launch_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "bagsMetadataUploadMs",
+        bags_metadata_upload_ms,
+    );
+    set_optional_report_timing(
+        &mut report_value,
+        "bagsFeeRecipientResolveMs",
+        bags_fee_recipient_resolve_ms,
+    );
 
     if action == "simulate" {
+        let mut simulation_transactions = compiled_transactions.clone();
+        if normalized.launchpad == "bagsapp"
+            && (!setup_bundles.is_empty() || !setup_transactions.is_empty())
+        {
+            let launch_compiled = compile_bags_launch_transaction(
+                &configured_rpc_url(),
+                &normalized,
+                &wallet_secret,
+                &compiled_mint,
+                &bags_config_key,
+                &bags_metadata_uri,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("Bags launch transaction build failed: {error}"),
+                        "traceId": trace.traceId,
+                    })),
+                )
+            })?;
+            if let Some(transactions) = report_value
+                .get_mut("transactions")
+                .and_then(Value::as_array_mut)
+            {
+                let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
+                    std::slice::from_ref(&launch_compiled.compiled_transaction),
+                    normalized.tx.dumpBase64,
+                ))
+                .unwrap_or_else(|_| Value::Array(vec![]));
+                if let Some(items) = launch_summaries.as_array_mut() {
+                    transactions.append(items);
+                }
+            }
+            simulation_transactions.push(launch_compiled.compiled_transaction);
+        }
         let simulate_started_ms = current_time_ms();
         let (simulation, warnings) = simulate_transactions(
             &configured_rpc_url(),
-            &compiled_transactions,
+            &simulation_transactions,
             &normalized.execution.commitment,
         )
         .await
@@ -4516,10 +5202,24 @@ async fn execute_engine_action_payload(
         );
         set_report_timing(
             &mut report,
+            "launchpadWarmContextBuildMs",
+            warm_report.build_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "launchpadWarmBlockhashPrimeMs",
+            warm_report.blockhash_fetch_ms,
+        );
+        set_report_timing(
+            &mut report,
             "simulateMs",
             current_time_ms().saturating_sub(simulate_started_ms),
         );
         if let Some(execution) = report.get_mut("execution") {
+            execution["launchpadWarmContextEnabled"] = json!(warm_report.warm_context_enabled);
+            execution["launchpadWarmParallelFetchEnabled"] = json!(warm_report.parallel_enabled);
+            execution["launchpadWarmMaxParallelFetches"] =
+                json!(warm_report.max_parallel_warm_fetches);
             execution["simulation"] =
                 serde_json::to_value(simulation).unwrap_or(Value::Array(vec![]));
             let mut existing_warnings = execution
@@ -4615,7 +5315,7 @@ async fn execute_engine_action_payload(
             "report": report,
             "sendLogPath": send_log_path,
             "text": render_report_value(&report),
-            "metadataUri": prepared_metadata_uri,
+            "metadataUri": response_metadata_uri(prepared_metadata_uri, &report),
             "metadataWarning": prepared_metadata_warning,
         }));
     }
@@ -4658,6 +5358,7 @@ async fn execute_engine_action_payload(
         let mut armed_follow_job: Option<FollowJobResponse> = None;
         let mut same_time_sniper_compile_ms = 0u128;
         let mut same_time_independent_compiled: Vec<CompiledTransaction> = Vec::new();
+        let mut same_time_transport_plan: Option<TransportPlan> = None;
         let mut same_time_sent: Vec<crate::rpc::SentResult> = Vec::new();
         let mut post_send_warnings: Vec<String> = Vec::new();
         let mut send_phase_errors: Vec<String> = Vec::new();
@@ -4671,7 +5372,11 @@ async fn execute_engine_action_payload(
         let mut bags_setup_sent: Vec<crate::rpc::SentResult> = Vec::new();
         let mut bags_setup_warnings: Vec<String> = Vec::new();
         let mut bags_setup_submit_ms = 0u128;
-        let mut bags_setup_confirm_ms = 0u128;
+        let mut bags_setup_gate_ms = 0u128;
+        let mut bags_launch_build_ms = 0u128;
+        let bags_confirm_timeout_secs = configured_bags_setup_confirm_timeout_secs();
+        let bags_setup_gate_commitment = configured_bags_setup_gate_commitment();
+        let mut launch_transport_confirm_ms = 0u128;
         let mut follow_reserve_ms = 0u128;
         let mut follow_arm_ms = 0u128;
         let must_complete_follow_reserve_before_send = deferred_follow_launch
@@ -4719,7 +5424,8 @@ async fn execute_engine_action_payload(
             let sell_tip_account =
                 pick_tip_account_for_provider(&normalized.execution.sellProvider);
             let prefer_post_setup_creator_vault_for_sell =
-                matches!(normalized.mode.as_str(), "agent-custom" | "agent-locked");
+                prefers_post_setup_creator_vault_for_follow(&normalized);
+            let bags_launch = bags_launch_follow.clone();
             let prebuilt_actions = prebuilt_follow_actions.clone().unwrap_or_default();
             let deferred_setup_transactions = effective_deferred_setup_transactions.clone();
             Some(tokio::spawn(async move {
@@ -4739,6 +5445,7 @@ async fn execute_engine_action_payload(
                         sellTipAccount: sell_tip_account,
                         preferPostSetupCreatorVaultForSell:
                             prefer_post_setup_creator_vault_for_sell,
+                        bagsLaunch: bags_launch,
                         prebuiltActions: prebuilt_actions,
                         deferredSetupTransactions: deferred_setup_transactions,
                     })
@@ -4748,128 +5455,229 @@ async fn execute_engine_action_payload(
         } else {
             None
         };
-        if let Some(prepared) = prepared_bags_send.as_ref() {
-            let launch_compiled = compile_bags_launch_transaction(
+        if normalized.launchpad == "bagsapp"
+            && (!setup_bundles.is_empty() || !setup_transactions.is_empty())
+        {
+            let bags_submit_transport_plan =
+                standard_rpc_transport_plan(&transport_plan, &rpc_url);
+            for bundle in &setup_bundles {
+                let (mut bundle_sent, bundle_warnings, bundle_timing) =
+                    match send_transactions_sequential_for_transport(
+                        &rpc_url,
+                        &bags_submit_transport_plan,
+                        bundle,
+                        &bags_setup_gate_commitment,
+                        false,
+                        normalized.execution.trackSendBlockHeight,
+                        Some(bags_confirm_timeout_secs),
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let mut diagnostics = Vec::new();
+                            for bundle_transaction in bundle {
+                                diagnostics.push(format!(
+                                    "{} => {}",
+                                    bundle_transaction.label,
+                                    collect_bags_setup_transaction_diagnostics(
+                                        &rpc_url,
+                                        &bags_setup_gate_commitment,
+                                        bundle_transaction,
+                                        None,
+                                    )
+                                    .await
+                                ));
+                            }
+                            let diagnostics = diagnostics.join(" || ");
+                            cancel_reserved_follow_job_on_launch_failure(
+                                follow_daemon_client.as_ref(),
+                                &mut reserve_follow_job_task,
+                                &trace.traceId,
+                                &format!(
+                                    "Bags setup bundle execution failed: {error} | diagnostics: {diagnostics}",
+                                ),
+                            )
+                            .await;
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "error": format!(
+                                        "Bags setup bundle execution failed: {error} | diagnostics: {diagnostics}"
+                                    ),
+                                    "traceId": trace.traceId,
+                                })),
+                            ));
+                        }
+                    };
+                bags_setup_submit_ms += bundle_timing.submit_ms;
+                bags_setup_gate_ms += bundle_timing.confirm_ms;
+                bags_setup_warnings.extend(bundle_warnings);
+                bags_setup_sent.append(&mut bundle_sent);
+            }
+            if !setup_transactions.is_empty() {
+                let setup_batch = setup_transactions.clone();
+                let setup_labels = setup_batch
+                    .iter()
+                    .map(|transaction| transaction.label.clone())
+                    .collect::<Vec<_>>();
+                let setup_label_summary = setup_labels.join(", ");
+                let (mut setup_sent, setup_warnings, setup_timing) =
+                    match send_transactions_sequential_for_transport(
+                        &rpc_url,
+                        &bags_submit_transport_plan,
+                        &setup_batch,
+                        &bags_setup_gate_commitment,
+                        false,
+                        normalized.execution.trackSendBlockHeight,
+                        Some(bags_confirm_timeout_secs),
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let mut diagnostics = Vec::new();
+                            for setup_transaction in &setup_batch {
+                                diagnostics.push(format!(
+                                    "{} => {}",
+                                    setup_transaction.label,
+                                    collect_bags_setup_transaction_diagnostics(
+                                        &rpc_url,
+                                        &bags_setup_gate_commitment,
+                                        setup_transaction,
+                                        None,
+                                    )
+                                    .await
+                                ));
+                            }
+                            let diagnostics = diagnostics.join(" || ");
+                            cancel_reserved_follow_job_on_launch_failure(
+                                follow_daemon_client.as_ref(),
+                                &mut reserve_follow_job_task,
+                                &trace.traceId,
+                                &format!(
+                                    "Bags sequential setup execution failed for [{setup_label_summary}]: {error} | diagnostics: {diagnostics}",
+                                ),
+                            )
+                            .await;
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "ok": false,
+                                    "error": format!(
+                                        "Bags sequential setup execution failed for [{setup_label_summary}]: {error} | diagnostics: {diagnostics}"
+                                    ),
+                                    "traceId": trace.traceId,
+                                })),
+                            ));
+                        }
+                    };
+                for warning in &setup_warnings {
+                    if warning.contains("Websocket batch confirmation failed via") {
+                        record_warn(
+                            "bags-send",
+                            format!(
+                                "Bags setup gate fell back to RPC polling for [{}] at {}",
+                                setup_label_summary, bags_setup_gate_commitment
+                            ),
+                            Some(json!({
+                                "traceId": trace.traceId,
+                                "labels": setup_labels,
+                                "gateCommitment": bags_setup_gate_commitment,
+                                "watchEndpoint": transport_plan.watchEndpoint.as_deref().or_else(|| {
+                                    transport_plan.watchEndpoints.first().map(String::as_str)
+                                }),
+                                "warning": warning,
+                            })),
+                        );
+                    }
+                }
+                bags_setup_submit_ms += setup_timing.submit_ms;
+                bags_setup_gate_ms += setup_timing.confirm_ms;
+                bags_setup_warnings.extend(setup_warnings);
+                if setup_sent.is_empty() {
+                    let mut diagnostics = Vec::new();
+                    for setup_transaction in &setup_batch {
+                        diagnostics.push(format!(
+                            "{} => {}",
+                            setup_transaction.label,
+                            collect_bags_setup_transaction_diagnostics(
+                                &rpc_url,
+                                &bags_setup_gate_commitment,
+                                setup_transaction,
+                                None,
+                            )
+                            .await
+                        ));
+                    }
+                    let diagnostics = diagnostics.join(" || ");
+                    cancel_reserved_follow_job_on_launch_failure(
+                        follow_daemon_client.as_ref(),
+                        &mut reserve_follow_job_task,
+                        &trace.traceId,
+                        &format!(
+                            "Bags sequential setup execution failed for [{setup_label_summary}]: no transactions were returned after sequential send | diagnostics: {}",
+                            diagnostics
+                        ),
+                    )
+                    .await;
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!(
+                                "Bags sequential setup execution failed for [{setup_label_summary}]: no transactions were returned after sequential send | diagnostics: {}",
+                                diagnostics
+                            ),
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+                bags_setup_sent.append(&mut setup_sent);
+            }
+            let launch_compiled = match compile_bags_launch_transaction(
                 &rpc_url,
                 &normalized,
                 &wallet_secret,
                 &compiled_mint,
-                &prepared.config_key,
-                &prepared.metadata_uri,
+                &bags_config_key,
+                &bags_metadata_uri,
             )
             .await
-            .map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": format!("Bags launch transaction build failed after setup send: {error}"),
-                        "traceId": trace.traceId,
-                    })),
-                )
-            })?;
-            if secure_hellomoon_bundle_transport {
-                compiled_transactions = prepared.native_artifacts.compiled_transactions.clone();
-                compiled_transactions.push(launch_compiled);
-                report_value["transactions"] = serde_json::to_value(summarize_bags_transactions(
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    cancel_reserved_follow_job_on_launch_failure(
+                        follow_daemon_client.as_ref(),
+                        &mut reserve_follow_job_task,
+                        &trace.traceId,
+                        &format!("Bags launch transaction build failed: {error}"),
+                    )
+                    .await;
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("Bags launch transaction build failed: {error}"),
+                            "traceId": trace.traceId,
+                        })),
+                    ));
+                }
+            };
+            bags_launch_build_ms = launch_compiled.launch_build_ms.unwrap_or_default();
+            compiled_transactions = vec![launch_compiled.compiled_transaction];
+            if let Some(transactions) = report_value
+                .get_mut("transactions")
+                .and_then(Value::as_array_mut)
+            {
+                let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
                     &compiled_transactions,
                     normalized.tx.dumpBase64,
                 ))
                 .unwrap_or_else(|_| Value::Array(vec![]));
-            } else {
-                for bundle in &prepared.setup_bundles {
-                    let (mut bundle_sent, bundle_warnings, bundle_timing) =
-                        send_transactions_bundle(
-                            &rpc_url,
-                            &transport_plan.jitoBundleEndpoints,
-                            bundle,
-                            &normalized.execution.commitment,
-                            normalized.execution.trackSendBlockHeight,
-                        )
-                        .await
-                        .map_err(|error| {
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "ok": false,
-                                    "error": format!("Bags setup bundle send failed: {error}"),
-                                    "traceId": trace.traceId,
-                                })),
-                            )
-                        })?;
-                    bags_setup_submit_ms += bundle_timing.submit_ms;
-                    bags_setup_confirm_ms += bundle_timing.confirm_ms;
-                    bags_setup_warnings.extend(bundle_warnings);
-                    bags_setup_sent.append(&mut bundle_sent);
-                }
-                if !prepared.setup_transactions.is_empty() {
-                    for setup_transaction in &prepared.setup_transactions {
-                        let setup_batch = vec![setup_transaction.clone()];
-                        let (mut setup_sent, setup_warnings, setup_submit_ms) =
-                            submit_transactions_sequential(
-                                &rpc_url,
-                                &setup_batch,
-                                &normalized.execution.commitment,
-                                transport_plan.skipPreflight,
-                                normalized.execution.trackSendBlockHeight,
-                            )
-                            .await
-                            .map_err(|error| {
-                                (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(json!({
-                                        "ok": false,
-                                        "error": format!("Bags setup transaction send failed for {}: {error}", setup_transaction.label),
-                                        "traceId": trace.traceId,
-                                    })),
-                                )
-                            })?;
-                        let (setup_confirm_warnings, setup_confirm_ms) =
-                            confirm_transactions_with_websocket_fallback(
-                                &rpc_url,
-                                transport_plan.watchEndpoint.as_deref().or_else(|| {
-                                    transport_plan.watchEndpoints.first().map(String::as_str)
-                                }),
-                                &mut setup_sent,
-                                &normalized.execution.commitment,
-                                normalized.execution.trackSendBlockHeight,
-                                225,
-                                400,
-                            )
-                            .await
-                            .map_err(|error| {
-                                (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(json!({
-                                        "ok": false,
-                                        "error": format!(
-                                            "Bags setup transaction confirmation failed for {}: {error}",
-                                            setup_transaction.label
-                                        ),
-                                        "traceId": trace.traceId,
-                                    })),
-                                )
-                            })?;
-                        bags_setup_submit_ms += setup_submit_ms;
-                        bags_setup_confirm_ms += setup_confirm_ms;
-                        bags_setup_warnings.extend(setup_warnings);
-                        bags_setup_warnings.extend(setup_confirm_warnings);
-                        bags_setup_sent.append(&mut setup_sent);
-                    }
-                }
-                compiled_transactions = vec![launch_compiled];
-                if let Some(transactions) = report_value
-                    .get_mut("transactions")
-                    .and_then(Value::as_array_mut)
-                {
-                    let mut launch_summaries = serde_json::to_value(summarize_bags_transactions(
-                        &compiled_transactions,
-                        normalized.tx.dumpBase64,
-                    ))
-                    .unwrap_or_else(|_| Value::Array(vec![]));
-                    if let Some(items) = launch_summaries.as_array_mut() {
-                        transactions.append(items);
-                    }
+                if let Some(items) = launch_summaries.as_array_mut() {
+                    transactions.append(items);
                 }
             }
         }
@@ -4896,9 +5704,14 @@ async fn execute_engine_action_payload(
             })?;
             same_time_sniper_compile_ms =
                 current_time_ms().saturating_sub(same_time_compile_started_ms);
-            if transport_plan.transportType == "jito-bundle" {
+            let same_time_plan =
+                build_buy_transport_plan(&normalized.execution, same_time_compiled.len());
+            if transport_plan.transportType == "jito-bundle"
+                && same_time_plan.transportType == "jito-bundle"
+            {
                 compiled_transactions.extend(same_time_compiled);
             } else {
+                same_time_transport_plan = Some(same_time_plan);
                 same_time_independent_compiled = same_time_compiled;
             }
         }
@@ -4941,32 +5754,53 @@ async fn execute_engine_action_payload(
                 reserved_follow_job = Some(reserved);
             }
         }
+        let launch_transaction_subscribe_account_required = compiled_transactions
+            .first()
+            .map(|transaction| {
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64)
+            })
+            .unwrap_or_default();
         let submit_started_ms = current_time_ms();
         let (mut launch_sent, mut warnings, submit_ms) = if same_time_independent_compiled
             .is_empty()
         {
-            submit_transactions_for_transport(
-                &rpc_url,
-                &transport_plan,
-                &compiled_transactions,
-                &normalized.execution.commitment,
-                normalized.execution.skipPreflight,
-                normalized.execution.trackSendBlockHeight,
-            )
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "ok": false,
-                        "error": error,
-                        "traceId": trace.traceId,
-                    })),
+            if normalized.launchpad == "bagsapp" {
+                match send_transactions_sequential_for_transport(
+                    &rpc_url,
+                    &transport_plan,
+                    &compiled_transactions,
+                    &normalized.execution.commitment,
+                    false,
+                    normalized.execution.trackSendBlockHeight,
+                    Some(bags_confirm_timeout_secs),
                 )
-            })?
-        } else if normalized.launchpad == "bonk" {
-            let (launch_sent, mut launch_warnings, _launch_submit_ms) =
-                submit_transactions_for_transport(
+                .await
+                {
+                    Ok((sent, warnings, timing)) => {
+                        launch_confirmed = true;
+                        launch_transport_confirm_ms = timing.confirm_ms;
+                        (sent, warnings, timing.submit_ms)
+                    }
+                    Err(error) => {
+                        cancel_reserved_follow_job_on_launch_failure(
+                            follow_daemon_client.as_ref(),
+                            &mut reserve_follow_job_task,
+                            &trace.traceId,
+                            &format!("Launch submit failed: {error}"),
+                        )
+                        .await;
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": error,
+                                "traceId": trace.traceId,
+                            })),
+                        ));
+                    }
+                }
+            } else {
+                match submit_transactions_for_transport(
                     &rpc_url,
                     &transport_plan,
                     &compiled_transactions,
@@ -4975,23 +5809,65 @@ async fn execute_engine_action_payload(
                     normalized.execution.trackSendBlockHeight,
                 )
                 .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": error,
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        cancel_reserved_follow_job_on_launch_failure(
+                            follow_daemon_client.as_ref(),
+                            &mut reserve_follow_job_task,
+                            &trace.traceId,
+                            &format!("Launch submit failed: {error}"),
+                        )
+                        .await;
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": error,
+                                "traceId": trace.traceId,
+                            })),
+                        ));
+                    }
+                }
+            }
+        } else if normalized.launchpad == "bonk" {
+            let (launch_sent, mut launch_warnings, _launch_submit_ms) =
+                match submit_transactions_for_transport(
+                    &rpc_url,
+                    &transport_plan,
+                    &compiled_transactions,
+                    &normalized.execution.commitment,
+                    normalized.execution.skipPreflight,
+                    normalized.execution.trackSendBlockHeight,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        cancel_reserved_follow_job_on_launch_failure(
+                            follow_daemon_client.as_ref(),
+                            &mut reserve_follow_job_task,
+                            &trace.traceId,
+                            &format!("Launch submit failed: {error}"),
+                        )
+                        .await;
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": error,
+                                "traceId": trace.traceId,
+                            })),
+                        ));
+                    }
+                };
             launch_warnings.push(
                 "Bonk same-time sniper buys are submitted immediately after the launch transaction on non-bundle transports so the mint exists before buy execution."
                     .to_string(),
             );
             match submit_independent_transactions_for_transport(
                 &rpc_url,
-                &transport_plan,
+                same_time_transport_plan.as_ref().unwrap_or(&transport_plan),
                 &same_time_independent_compiled,
                 &normalized.execution.commitment,
                 normalized.execution.skipPreflight,
@@ -5031,24 +5907,33 @@ async fn execute_engine_action_payload(
             );
             let same_time_submit = submit_independent_transactions_for_transport(
                 &rpc_url,
-                &transport_plan,
+                same_time_transport_plan.as_ref().unwrap_or(&transport_plan),
                 &same_time_independent_compiled,
                 &normalized.execution.commitment,
                 normalized.execution.skipPreflight,
                 normalized.execution.trackSendBlockHeight,
             );
             let (launch_result, same_time_result) = tokio::join!(launch_submit, same_time_submit);
-            let (launch_sent, mut launch_warnings, _launch_submit_ms) =
-                launch_result.map_err(|error| {
-                    (
+            let (launch_sent, mut launch_warnings, _launch_submit_ms) = match launch_result {
+                Ok(value) => value,
+                Err(error) => {
+                    cancel_reserved_follow_job_on_launch_failure(
+                        follow_daemon_client.as_ref(),
+                        &mut reserve_follow_job_task,
+                        &trace.traceId,
+                        &format!("Launch submit failed: {error}"),
+                    )
+                    .await;
+                    return Err((
                         StatusCode::BAD_REQUEST,
                         Json(json!({
                             "ok": false,
                             "error": error,
                             "traceId": trace.traceId,
                         })),
-                    )
-                })?;
+                    ));
+                }
+            };
             match same_time_result {
                 Ok((sent, same_time_warnings, _same_time_submit_ms)) => {
                     same_time_sent = sent;
@@ -5077,19 +5962,128 @@ async fn execute_engine_action_payload(
             warnings = bags_setup_warnings;
             warnings.extend(launch_warnings);
         }
-        let launch_signature = launch_sent
+        let launch_signature = match launch_sent
             .first()
             .and_then(|result| result.signature.clone())
-            .ok_or_else(|| {
-                (
+        {
+            Some(signature) => signature,
+            None => {
+                cancel_reserved_follow_job_on_launch_failure(
+                    follow_daemon_client.as_ref(),
+                    &mut reserve_follow_job_task,
+                    &trace.traceId,
+                    "Launch submit completed without a signature, so follow actions cannot be armed safely.",
+                )
+                .await;
+                return Err((
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "ok": false,
                         "error": "Launch submit completed without a signature, so follow actions cannot be armed safely.",
                         "traceId": trace.traceId,
                     })),
-                )
-            })?;
+                ));
+            }
+        };
+        let launch_submit_at_ms = submit_started_ms.saturating_add(submit_ms);
+        let launch_send_observed_slot = launch_sent
+            .first()
+            .and_then(|result| result.sendObservedSlot);
+        if should_reserve_deferred_follow_job && reserved_follow_job.is_none() {
+            if let Some(task) = reserve_follow_job_task.take() {
+                match task.await {
+                    Ok(Ok((reserved, elapsed_ms))) => {
+                        follow_reserve_ms = elapsed_ms;
+                        reserved_follow_job = Some(reserved);
+                    }
+                    Ok(Err(error)) => {
+                        record_error(
+                            "follow-client",
+                            "Follow daemon reservation failed.",
+                            Some(json!({
+                                "traceId": trace.traceId,
+                                "message": error,
+                            })),
+                        );
+                        let warning = format!(
+                            "Launch was submitted, but follow daemon reservation failed so follow actions were not armed: {error}"
+                        );
+                        let _ = cancel_follow_job_best_effort(
+                            follow_daemon_client.as_ref(),
+                            &trace.traceId,
+                            &warning,
+                        )
+                        .await;
+                        post_send_warnings.push(warning.clone());
+                        send_phase_errors.push(warning);
+                    }
+                    Err(error) => {
+                        record_error(
+                            "follow-client",
+                            "Follow daemon reservation task failed after launch submit.",
+                            Some(json!({
+                                "traceId": trace.traceId,
+                                "message": error.to_string(),
+                            })),
+                        );
+                        let warning = format!(
+                            "Launch was submitted, but follow daemon reservation task failed so follow actions were not armed: {error}"
+                        );
+                        let _ = cancel_follow_job_best_effort(
+                            follow_daemon_client.as_ref(),
+                            &trace.traceId,
+                            &warning,
+                        )
+                        .await;
+                        post_send_warnings.push(warning.clone());
+                        send_phase_errors.push(warning);
+                    }
+                }
+            }
+        }
+        if let Some(client) = follow_daemon_client.as_ref()
+            && reserved_follow_job.is_some()
+        {
+            let follow_arm_started = Instant::now();
+            match client
+                .arm(&FollowArmRequest {
+                    traceId: trace.traceId.clone(),
+                    mint: compiled_mint.clone(),
+                    launchCreator: compiled_launch_creator.clone(),
+                    launchSignature: launch_signature.clone(),
+                    launchTransactionSubscribeAccountRequired:
+                        launch_transaction_subscribe_account_required.clone(),
+                    submitAtMs: launch_submit_at_ms,
+                    sendObservedSlot: launch_send_observed_slot,
+                    confirmedObservedSlot: None,
+                    reportPath: None,
+                    transportPlan: transport_plan.clone(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    follow_arm_ms = follow_arm_ms
+                        .saturating_add(follow_arm_started.elapsed().as_millis());
+                    armed_follow_job = Some(response);
+                }
+                Err(error) => {
+                    follow_arm_ms = follow_arm_ms
+                        .saturating_add(follow_arm_started.elapsed().as_millis());
+                    let warning = format!(
+                        "Follow daemon early arm failed after launch submit; retrying after confirmation: {error}"
+                    );
+                    record_warn(
+                        "follow-client",
+                        "Follow daemon early arm failed.",
+                        Some(json!({
+                            "traceId": trace.traceId,
+                            "message": error,
+                        })),
+                    );
+                    post_send_warnings.push(warning);
+                }
+            }
+        }
         if bags_same_time_compile_after_launch {
             let same_time_compile_started_ms = current_time_ms();
             match compile_same_time_snipes(
@@ -5103,12 +6097,14 @@ async fn execute_engine_action_payload(
             .await
             {
                 Ok(same_time_compiled) => {
+                    let same_time_plan =
+                        build_buy_transport_plan(&normalized.execution, same_time_compiled.len());
                     same_time_sniper_compile_ms = same_time_sniper_compile_ms.saturating_add(
                         current_time_ms().saturating_sub(same_time_compile_started_ms),
                     );
                     match submit_independent_transactions_for_transport(
                         &rpc_url,
-                        &transport_plan,
+                        &same_time_plan,
                         &same_time_compiled,
                         &normalized.execution.commitment,
                         normalized.execution.skipPreflight,
@@ -5125,7 +6121,7 @@ async fn execute_engine_action_payload(
                                     .cloned()
                                     .unwrap_or_default();
                                 existing_warnings.push(Value::String(
-                                    "Bags same-time snipes are compiled immediately after the launch transaction is submitted so the trade route can resolve against the live mint."
+                                    "Bags same-time snipes are compiled immediately after the launch transaction is confirmed so the trade route can resolve against the live mint."
                                         .to_string(),
                                 ));
                                 existing_warnings
@@ -5137,7 +6133,7 @@ async fn execute_engine_action_payload(
                             append_execution_warning(
                                 &mut report_value,
                                 &format!(
-                                    "Same-time Bags sniper submit failed after launch submit; daemon retry is armed for one retry attempt: {error}"
+                                    "Same-time Bags sniper submit failed after launch confirmation; daemon retry is armed for one retry attempt: {error}"
                                 ),
                             );
                         }
@@ -5146,7 +6142,7 @@ async fn execute_engine_action_payload(
                             append_execution_warning(
                                 &mut report_value,
                                 &format!(
-                                    "Same-time Bags sniper submit failed after launch submit: {error}"
+                                    "Same-time Bags sniper submit failed after launch confirmation: {error}"
                                 ),
                             );
                         }
@@ -5157,7 +6153,7 @@ async fn execute_engine_action_payload(
                     append_execution_warning(
                         &mut report_value,
                         &format!(
-                            "Same-time Bags sniper compile failed after launch submit: {error}"
+                            "Same-time Bags sniper compile failed after launch confirmation: {error}"
                         ),
                     );
                 }
@@ -5232,59 +6228,41 @@ async fn execute_engine_action_payload(
             &mut report,
             "sendMs",
             bags_setup_submit_ms
-                .saturating_add(bags_setup_confirm_ms)
-                .saturating_add(submit_ms),
+                .saturating_add(bags_setup_gate_ms)
+                .saturating_add(bags_launch_build_ms)
+                .saturating_add(submit_ms)
+                .saturating_add(launch_transport_confirm_ms),
         );
         set_report_timing(
             &mut report,
             "sendSubmitMs",
-            bags_setup_submit_ms.saturating_add(submit_ms),
+            bags_setup_submit_ms
+                .saturating_add(bags_launch_build_ms)
+                .saturating_add(submit_ms),
         );
         set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
-        set_report_timing(&mut report, "sendConfirmMs", bags_setup_confirm_ms);
-        set_report_timing(&mut report, "sendTransportConfirmMs", 0);
-        if let Some(task) = reserve_follow_job_task.take() {
-            let (reserved, elapsed_ms) = task
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Follow daemon reservation task failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?
-                .map_err(|error| {
-                    record_error(
-                        "follow-client",
-                        "Follow daemon reservation failed.",
-                        Some(json!({
-                            "traceId": trace.traceId,
-                            "message": error,
-                        })),
-                    );
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "ok": false,
-                            "error": format!("Follow daemon reservation failed: {error}"),
-                            "traceId": trace.traceId,
-                        })),
-                    )
-                })?;
-            follow_reserve_ms = elapsed_ms;
-            reserved_follow_job = Some(reserved);
-        }
+        set_report_timing(
+            &mut report,
+            "sendConfirmMs",
+            launch_transport_confirm_ms,
+        );
+        set_report_timing(
+            &mut report,
+            "sendTransportConfirmMs",
+            launch_transport_confirm_ms,
+        );
         set_optional_report_timing(
             &mut report,
             "followDaemonReserveMs",
             Some(follow_reserve_ms),
         );
-        if bags_setup_submit_ms > 0 || bags_setup_confirm_ms > 0 {
+        if bags_setup_submit_ms > 0 || bags_setup_gate_ms > 0 {
             set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
-            set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_confirm_ms);
+            set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_gate_ms);
+            set_report_timing(&mut report, "bagsSetupGateMs", bags_setup_gate_ms);
+        }
+        if bags_launch_build_ms > 0 {
+            set_report_timing(&mut report, "bagsLaunchBuildMs", bags_launch_build_ms);
         }
         attach_follow_daemon_report(
             &mut report,
@@ -5328,7 +6306,9 @@ async fn execute_engine_action_payload(
         } else {
             None
         };
-        let (mut confirm_warnings, mut confirm_ms) =
+        let (mut confirm_warnings, mut confirm_ms) = if launch_confirmed {
+            (vec![], launch_transport_confirm_ms)
+        } else {
             match confirm_submitted_transactions_for_transport(
                 &rpc_url,
                 &transport_plan,
@@ -5359,16 +6339,15 @@ async fn execute_engine_action_payload(
                     send_phase_errors.push(warning.clone());
                     (vec![warning], 0)
                 }
-            };
+            }
+        };
         if launch_confirmed {
-            if let Some(client) = follow_daemon_client.as_ref() {
-                let mut confirmed_follow_block_height = launch_sent
+            if let Some(client) = follow_daemon_client.as_ref()
+                && reserved_follow_job.is_some()
+            {
+                let confirmed_follow_slot = launch_sent
                     .first()
-                    .and_then(|result| result.confirmedObservedBlockHeight);
-                if confirmed_follow_block_height.is_none() {
-                    confirmed_follow_block_height =
-                        fetch_current_block_height(&rpc_url, "confirmed").await.ok();
-                }
+                    .and_then(|result| result.confirmedSlot.or(result.confirmedObservedSlot));
                 let follow_arm_started = Instant::now();
                 match client
                     .arm(&FollowArmRequest {
@@ -5376,32 +6355,44 @@ async fn execute_engine_action_payload(
                         mint: compiled_mint.clone(),
                         launchCreator: compiled_launch_creator.clone(),
                         launchSignature: launch_signature.clone(),
-                        submitAtMs: current_time_ms(),
-                        sendObservedBlockHeight: launch_sent
-                            .first()
-                            .and_then(|result| result.sendObservedBlockHeight),
-                        confirmedObservedBlockHeight: confirmed_follow_block_height,
+                        launchTransactionSubscribeAccountRequired:
+                            launch_transaction_subscribe_account_required.clone(),
+                        submitAtMs: launch_submit_at_ms,
+                        sendObservedSlot: launch_send_observed_slot,
+                        confirmedObservedSlot: confirmed_follow_slot,
                         reportPath: send_log_path.clone(),
                         transportPlan: transport_plan.clone(),
                     })
                     .await
                 {
                     Ok(response) => {
-                        follow_arm_ms = follow_arm_started.elapsed().as_millis();
+                        follow_arm_ms = follow_arm_ms
+                            .saturating_add(follow_arm_started.elapsed().as_millis());
                         armed_follow_job = Some(response);
                     }
                     Err(error) => {
-                        follow_arm_ms = follow_arm_started.elapsed().as_millis();
+                        follow_arm_ms = follow_arm_ms
+                            .saturating_add(follow_arm_started.elapsed().as_millis());
                         let warning =
-                            format!("Launch confirmed, but follow daemon arm failed: {error}");
-                        record_error(
+                            format!("Follow daemon confirm-slot update failed after launch confirmation: {error}");
+                        record_warn(
                             "follow-client",
-                            "Follow daemon arm failed.",
+                            "Follow daemon post-confirm arm update failed.",
                             Some(json!({
                                 "traceId": trace.traceId,
                                 "message": error,
                             })),
                         );
+                        if armed_follow_job.is_none()
+                            && cancel_follow_job_best_effort(
+                                follow_daemon_client.as_ref(),
+                                &trace.traceId,
+                                &warning,
+                            )
+                            .await
+                        {
+                            reserved_follow_job = None;
+                        }
                         post_send_warnings.push(warning.clone());
                         send_phase_errors.push(warning);
                     }
@@ -5465,24 +6456,35 @@ async fn execute_engine_action_payload(
             &mut report,
             "sendMs",
             bags_setup_submit_ms
-                .saturating_add(bags_setup_confirm_ms)
+                .saturating_add(bags_setup_gate_ms)
+                .saturating_add(bags_launch_build_ms)
                 .saturating_add(submit_ms)
                 .saturating_add(confirm_ms),
         );
         set_report_timing(
             &mut report,
             "sendSubmitMs",
-            bags_setup_submit_ms.saturating_add(submit_ms),
+            bags_setup_submit_ms
+                .saturating_add(bags_launch_build_ms)
+                .saturating_add(submit_ms),
         );
         set_report_timing(&mut report, "sendTransportSubmitMs", submit_ms);
         set_report_timing(
             &mut report,
             "sendConfirmMs",
-            bags_setup_confirm_ms.saturating_add(confirm_ms),
+            confirm_ms,
         );
         set_report_timing(&mut report, "sendTransportConfirmMs", confirm_ms);
         set_report_timing(&mut report, "sendCreationSubmitMs", submit_ms);
         set_report_timing(&mut report, "sendCreationConfirmMs", confirm_ms);
+        if bags_setup_submit_ms > 0 || bags_setup_gate_ms > 0 {
+            set_report_timing(&mut report, "bagsSetupSubmitMs", bags_setup_submit_ms);
+            set_report_timing(&mut report, "bagsSetupConfirmMs", bags_setup_gate_ms);
+            set_report_timing(&mut report, "bagsSetupGateMs", bags_setup_gate_ms);
+        }
+        if bags_launch_build_ms > 0 {
+            set_report_timing(&mut report, "bagsLaunchBuildMs", bags_launch_build_ms);
+        }
         if use_phased_follow_pipeline {
             if secure_hellomoon_bundle_transport {
                 append_execution_note(
@@ -5513,13 +6515,7 @@ async fn execute_engine_action_payload(
         set_optional_report_timing(&mut report, "followDaemonArmMs", Some(follow_arm_ms));
         if let Some(execution) = report.get_mut("execution") {
             execution["sent"] = serde_json::to_value(&sent).unwrap_or(Value::Array(vec![]));
-            if let Some(actual_responder) = sent.iter().find_map(|entry| {
-                entry
-                    .endpoint
-                    .as_ref()
-                    .filter(|value| !value.is_empty())
-                    .cloned()
-            }) {
+            if let Some(actual_responder) = actual_helius_sender_endpoint(&sent) {
                 execution["heliusSenderEndpoint"] = Value::String(actual_responder);
             }
             let mut existing_warnings = execution
@@ -5644,7 +6640,7 @@ async fn execute_engine_action_payload(
             "followDaemonReserved": reserved_follow_job,
             "followDaemonArmed": armed_follow_job,
             "text": render_report_value(&report),
-            "metadataUri": prepared_metadata_uri,
+            "metadataUri": response_metadata_uri(prepared_metadata_uri, &report),
             "metadataWarning": prepared_metadata_warning,
         }));
     }
@@ -5674,7 +6670,7 @@ async fn execute_engine_action_payload(
         "assemblyExecutor": assembly_executor,
         "report": report_value,
         "text": text_value,
-        "metadataUri": prepared_metadata_uri,
+        "metadataUri": response_metadata_uri(prepared_metadata_uri, &report_value),
         "metadataWarning": prepared_metadata_warning,
     }))
 }
@@ -6170,6 +7166,68 @@ async fn api_bags_identity_clear() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
+async fn api_bags_fee_recipient_lookup(
+    Query(query): Query<BagsFeeRecipientLookupQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let started_at_ms = current_time_ms();
+    let provider = query
+        .provider
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if provider.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Bags recipient provider is required." })),
+        ));
+    }
+    let username = query.username.unwrap_or_default().trim().to_string();
+    let github_user_id = query.github_user_id.unwrap_or_default().trim().to_string();
+    if username.is_empty() && github_user_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": if provider == "github" {
+                    "Bags GitHub recipient lookup requires a username or user id."
+                } else {
+                    "Bags recipient lookup requires a username."
+                },
+            })),
+        ));
+    }
+    let rpc_url = configured_rpc_url();
+    let result = lookup_fee_recipient(FeeRecipientLookupRequest {
+        launchpad: "bagsapp",
+        rpc_url: &rpc_url,
+        provider: &provider,
+        username: &username,
+        github_user_id: &github_user_id,
+    })
+        .await
+        .and_then(|value| {
+            value.ok_or_else(|| {
+                "Launchpad runtime did not return a Bags fee recipient lookup response."
+                    .to_string()
+            })
+        })
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+        })?;
+    Ok(Json(attach_timing(
+        json!({
+            "ok": true,
+            "lookup": result,
+            "backend": launchpad_action_backend("bagsapp", "fee-recipient-lookup"),
+            "rolloutState": launchpad_action_rollout_state("bagsapp", "fee-recipient-lookup"),
+        }),
+        started_at_ms,
+    )))
+}
+
 async fn api_bootstrap_fast(
     Query(query): Query<StatusQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -6276,6 +7334,9 @@ async fn api_startup_warm(
         ));
     }
     let main_rpc_url = configured_rpc_url();
+    // Read-heavy startup targets (LUTs, pump global, bonk) may use LAUNCHDECK_WARM_RPC_URL to spare
+    // the primary endpoint. Per-launch blockhash priming uses `main_rpc_url` only so the blockhash
+    // cache matches `try_compile_native_launchpad` / Bags (see `launchpad_warm`).
     let rpc_url = configured_warm_rpc_url(&main_rpc_url);
     let selected_routes = startup_warm_routes(&payload);
     {
@@ -6285,37 +7346,29 @@ async fn api_startup_warm(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         warm.selected_routes = selected_routes.clone();
     }
-    let (lookup_tables, pump_global, bonk_state, fee_market) = tokio::join!(
-        warm_default_lookup_tables(&rpc_url),
-        warm_pump_global_state(&rpc_url),
-        warm_bonk_state(&rpc_url),
+    let (launchpad_warm, fee_market) = tokio::join!(
+        warm_launchpads_for_startup(&rpc_url),
         fetch_fee_market_snapshot(&main_rpc_url),
     );
-    let lookup_tables_payload = match lookup_tables {
-        Ok(loaded) => json!({
-            "ok": true,
-            "loaded": loaded,
-        }),
-        Err(error) => json!({
-            "ok": false,
-            "error": error,
-        }),
-    };
-    let pump_global_payload = match pump_global {
-        Ok(()) => json!({
-            "ok": true,
-        }),
-        Err(error) => json!({
-            "ok": false,
-            "error": error,
-        }),
-    };
-    let bonk_state_payload = match bonk_state {
-        Ok(payload) => payload,
-        Err(error) => json!({
-            "ok": false,
-            "error": error,
-        }),
+    let StartupWarmLaunchpadPayloads {
+        lookup_tables: lookup_tables_payload,
+        pump_global: pump_global_payload,
+        bonk_state: bonk_state_payload,
+        bags_helper: bags_helper_payload,
+    } = match launchpad_warm {
+        Ok(payloads) => payloads,
+        Err(error) => {
+            let error_payload = json!({
+                "ok": false,
+                "error": error,
+            });
+            StartupWarmLaunchpadPayloads {
+                lookup_tables: error_payload.clone(),
+                pump_global: error_payload.clone(),
+                bonk_state: error_payload.clone(),
+                bags_helper: error_payload,
+            }
+        }
     };
     let fee_market_payload = match fee_market {
         Ok(snapshot) => json!({
@@ -6330,163 +7383,19 @@ async fn api_startup_warm(
             "error": error,
         }),
     };
-    let mut startup_endpoint_attempts = Vec::new();
-    let mut startup_watch_attempts = Vec::new();
-    if selected_routes
-        .iter()
-        .any(|route| route.provider == "standard-rpc")
-    {
-        for endpoint in configured_standard_rpc_warm_endpoints(&main_rpc_url) {
-            let result = prewarm_rpc_endpoint(&endpoint).await;
-            startup_endpoint_attempts.push(build_warm_target_attempt(
-                "endpoint",
-                Some("standard-rpc"),
-                "Standard RPC",
-                endpoint,
-                match result {
-                    Ok(()) => WarmAttemptResult::Success,
-                    Err(error) => WarmAttemptResult::Error(error),
-                },
-            ));
-        }
-    }
-    if selected_routes
-        .iter()
-        .any(|route| route.provider == "helius-sender")
-    {
-        let mut seen = HashSet::new();
-        for route in selected_routes
-            .iter()
-            .filter(|route| route.provider == "helius-sender")
-        {
-            for endpoint in configured_helius_sender_endpoints_for_profile(&route.endpoint_profile)
-            {
-                if !seen.insert(endpoint.clone()) {
-                    continue;
-                }
-                let result = prewarm_helius_sender_endpoint(&endpoint).await;
-                startup_endpoint_attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("helius-sender"),
-                    "Helius Sender",
-                    endpoint,
-                    match result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    if selected_routes
-        .iter()
-        .any(|route| route.provider == "hellomoon")
-    {
-        let mut seen = HashSet::new();
-        let mev_protect = configured_hellomoon_mev_protect();
-        for route in selected_routes
-            .iter()
-            .filter(|route| route.provider == "hellomoon")
-        {
-            let endpoints = if route.hellomoon_mev_mode == "secure" {
-                configured_hellomoon_bundle_endpoints_for_profile(&route.endpoint_profile)
-            } else {
-                configured_hellomoon_quic_endpoints_for_profile(&route.endpoint_profile)
-            };
-            for endpoint in endpoints {
-                if !seen.insert(endpoint.clone()) {
-                    continue;
-                }
-                let result = if route.hellomoon_mev_mode == "secure" {
-                    prewarm_hellomoon_bundle_endpoint(&endpoint).await
-                } else {
-                    prewarm_hellomoon_quic_endpoint(&endpoint, mev_protect).await
-                };
-                startup_endpoint_attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("hellomoon"),
-                    if route.hellomoon_mev_mode == "secure" {
-                        "Hello Moon Bundle"
-                    } else {
-                        "Hello Moon QUIC"
-                    },
-                    endpoint,
-                    match result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    if selected_routes
-        .iter()
-        .any(|route| route.provider == "jito-bundle")
-    {
-        let mut seen = HashSet::new();
-        for route in selected_routes
-            .iter()
-            .filter(|route| route.provider == "jito-bundle")
-        {
-            for endpoint in configured_jito_bundle_endpoints_for_profile(&route.endpoint_profile) {
-                if !seen.insert(endpoint.send.clone()) {
-                    continue;
-                }
-                let target = endpoint.name.clone();
-                let result = prewarm_jito_bundle_endpoint(&endpoint).await;
-                startup_endpoint_attempts.push(build_warm_target_attempt(
-                    "endpoint",
-                    Some("jito-bundle"),
-                    "Jito Bundle",
-                    target,
-                    match result {
-                        Ok(JitoWarmResult::Warmed) => WarmAttemptResult::Success,
-                        Ok(JitoWarmResult::RateLimited(message)) => {
-                            WarmAttemptResult::RateLimited(message)
-                        }
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
-    for target in configured_watch_warm_targets(&selected_routes) {
-        let result = match target.transport {
-            WatchWarmTransport::StandardWs => prewarm_watch_websocket_endpoint(&target.target).await,
-            WatchWarmTransport::HeliusTransactionSubscribe => {
-                prewarm_helius_transaction_subscribe_endpoint(&target.target).await
-            }
-        };
-        startup_watch_attempts.push(build_warm_target_attempt(
-            "watch-endpoint",
-            None,
-            &target.label,
-            target.target.clone(),
-            match result {
-                Ok(()) => WarmAttemptResult::Success,
-                Err(error) => WarmAttemptResult::Error(error),
-            },
-        ));
-        if target.transport == WatchWarmTransport::HeliusTransactionSubscribe
-            && startup_watch_attempts
-                .last()
-                .is_some_and(|attempt| matches!(attempt.result, WarmAttemptResult::Error(_)))
-        {
-            if let Some(fallback_endpoint) = target.fallback_target.as_deref() {
-                let fallback_result = prewarm_watch_websocket_endpoint(fallback_endpoint).await;
-                startup_watch_attempts.push(build_warm_target_attempt(
-                    "watch-endpoint",
-                    None,
-                    "Watcher WS",
-                    fallback_endpoint.to_string(),
-                    match fallback_result {
-                        Ok(()) => WarmAttemptResult::Success,
-                        Err(error) => WarmAttemptResult::Error(error),
-                    },
-                ));
-            }
-        }
-    }
+    let (startup_endpoint_outcomes, startup_watch_outcomes_nested) = tokio::join!(
+        join_all(endpoint_warm_probe_futures(&selected_routes, &main_rpc_url)),
+        join_all(watch_warm_probe_futures(&selected_routes)),
+    );
+    let startup_endpoint_attempts = startup_endpoint_outcomes
+        .into_iter()
+        .map(|outcome| outcome.attempt)
+        .collect::<Vec<_>>();
+    let startup_watch_attempts = startup_watch_outcomes_nested
+        .into_iter()
+        .flatten()
+        .map(|outcome| outcome.attempt)
+        .collect::<Vec<_>>();
     let startup_endpoint_payload = startup_endpoint_attempts
         .iter()
         .map(|attempt| {
@@ -6550,6 +7459,17 @@ async fn api_startup_warm(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             bonk_state_payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        (
+            "Bags state",
+            bags_helper_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            bags_helper_payload
                 .get("error")
                 .and_then(Value::as_str)
                 .map(str::to_string),
@@ -6675,6 +7595,26 @@ async fn api_startup_warm(
         build_warm_target_attempt(
             "state",
             None,
+            "Bags state",
+            "bags-launchpad-state".to_string(),
+            match bags_helper_payload
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                true => WarmAttemptResult::Success,
+                false => WarmAttemptResult::Error(
+                    bags_helper_payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("startup warm target failed")
+                        .to_string(),
+                ),
+            },
+        ),
+        build_warm_target_attempt(
+            "state",
+            None,
             "Fee Market",
             main_rpc_url.clone(),
             match fee_market_payload
@@ -6693,6 +7633,19 @@ async fn api_startup_warm(
             },
         ),
     ];
+    if should_prewarm_primary_rpc_separately(&main_rpc_url, &rpc_url) {
+        let primary_rpc_result = prewarm_rpc_endpoint(&main_rpc_url).await;
+        startup_attempts.push(build_warm_target_attempt(
+            "state",
+            None,
+            "Primary RPC",
+            main_rpc_url.clone(),
+            match primary_rpc_result {
+                Ok(()) => WarmAttemptResult::Success,
+                Err(error) => WarmAttemptResult::Error(error),
+            },
+        ));
+    }
     startup_attempts.extend(startup_endpoint_attempts.iter().cloned());
     startup_attempts.extend(startup_watch_attempts.iter().cloned());
     let attempt_at_ms = current_time_ms() as u64;
@@ -6729,9 +7682,25 @@ async fn api_startup_warm(
                 "endpointFailures": startup_endpoint_failures,
                 "watchFailures": startup_watch_failures,
             },
+            "launchpadBackends": {
+                "pump": {
+                    "backend": launchpad_action_backend("pump", "startup-warm"),
+                    "rolloutState": launchpad_action_rollout_state("pump", "startup-warm"),
+                },
+                "bonk": {
+                    "backend": launchpad_action_backend("bonk", "startup-warm"),
+                    "rolloutState": launchpad_action_rollout_state("bonk", "startup-warm"),
+                },
+                "bagsapp": {
+                    "backend": launchpad_action_backend("bagsapp", "startup-warm"),
+                    "rolloutState": launchpad_action_rollout_state("bagsapp", "startup-warm"),
+                }
+            },
             "lookupTables": lookup_tables_payload,
             "pumpGlobal": pump_global_payload,
             "bonkState": bonk_state_payload,
+            "bagsState": bags_helper_payload.clone(),
+            "bagsHelper": bags_helper_payload,
             "feeMarket": fee_market_payload,
             "endpointResults": startup_endpoint_payload,
             "watchResults": startup_watch_payload,
@@ -7074,14 +8043,14 @@ async fn api_quote(
             started_at_ms,
         )));
     }
-    let quote = quote_launch_for_launchpad(
-        &configured_rpc_url(),
-        &launchpad,
-        &quote_asset,
-        &launch_mode,
-        &mode,
-        &amount,
-    )
+    let quote = quote_launch(LaunchQuoteRequest {
+        rpc_url: &configured_rpc_url(),
+        launchpad: &launchpad,
+        quote_asset: &quote_asset,
+        launch_mode: &launch_mode,
+        mode: &mode,
+        amount: &amount,
+    })
     .await
     .map_err(|error| {
         (
@@ -7096,6 +8065,8 @@ async fn api_quote(
         json!({
             "ok": true,
             "quote": quote,
+            "backend": launchpad_action_backend(&launchpad, "quote"),
+            "rolloutState": launchpad_action_rollout_state(&launchpad, "quote"),
         }),
         started_at_ms,
     )))
@@ -7244,7 +8215,8 @@ async fn api_upload_image(
     }
     let extension = match content_type.trim().to_ascii_lowercase().as_str() {
         "image/png" => ".png",
-        "image/jpeg" => ".jpg",
+        "image/avif" => ".avif",
+        "image/jpeg" | "image/jpg" => ".jpg",
         "image/webp" => ".webp",
         "image/gif" => ".gif",
         _ => {
@@ -7252,7 +8224,7 @@ async fn api_upload_image(
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "ok": false,
-                    "error": "Only png, jpg, webp, and gif images are supported.",
+                    "error": "Only png, jpg/jpeg, avif, webp, and gif images are supported.",
                 })),
             ));
         }
@@ -7443,34 +8415,51 @@ async fn api_vamp_import(
         })?;
     let mut image = Value::Null;
     let mut warning = String::new();
-    if !imported.imageUrl.is_empty() {
-        match import_remote_image_to_library(
-            &imported.imageUrl,
-            &format!(
-                "{}-vamp",
-                if !imported.symbol.is_empty() {
-                    imported.symbol.clone()
-                } else if !imported.name.is_empty() {
-                    imported.name.clone()
+    let mut image_candidates = Vec::new();
+    for candidate in &imported.imageCandidates {
+        let normalized = candidate.trim();
+        if !normalized.is_empty() && !image_candidates.iter().any(|entry| entry == normalized) {
+            image_candidates.push(normalized.to_string());
+        }
+    }
+    if !imported.imageUrl.trim().is_empty() {
+        let primary = imported.imageUrl.trim().to_string();
+        if !image_candidates.iter().any(|entry| entry == &primary) {
+            image_candidates.push(primary);
+        }
+    }
+    if !image_candidates.is_empty() {
+        for candidate in image_candidates {
+            match import_remote_image_to_library(
+                &candidate,
+                &format!(
+                    "{}-vamp",
+                    if !imported.symbol.is_empty() {
+                        imported.symbol.clone()
+                    } else if !imported.name.is_empty() {
+                        imported.name.clone()
+                    } else {
+                        mint.to_string()
+                    }
+                ),
+                if !imported.name.is_empty() {
+                    &imported.name
+                } else if !imported.symbol.is_empty() {
+                    &imported.symbol
                 } else {
-                    mint.to_string()
+                    "Imported token image"
+                },
+            )
+            .await
+            {
+                Ok(Some(record)) => {
+                    image = serde_json::to_value(record).unwrap_or(Value::Null);
+                    warning.clear();
+                    break;
                 }
-            ),
-            if !imported.name.is_empty() {
-                &imported.name
-            } else if !imported.symbol.is_empty() {
-                &imported.symbol
-            } else {
-                "Imported token image"
-            },
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                image = serde_json::to_value(record).unwrap_or(Value::Null);
+                Ok(None) => {}
+                Err(error) => warning = error,
             }
-            Ok(None) => {}
-            Err(error) => warning = error,
         }
     }
     Ok(Json(json!({
@@ -7552,32 +8541,34 @@ async fn api_vanity_validate(
 async fn static_handler(
     AxumPath(requested): AxumPath<String>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    if requested.is_empty() || requested == "index.html" {
-        return file_response(paths::ui_dir().join("index.html"));
+    let normalized = requested.trim().trim_matches('/').to_string();
+    if normalized.is_empty() || normalized == "index.html" {
+        return file_response(paths::ui_dir().join("launchdeck").join("index.html"));
     }
-    if requested.starts_with("uploads/") {
-        let file_name = std::path::Path::new(requested.trim_start_matches("uploads/"))
+    if normalized == "launchdeck" || normalized == "launchdeck/index.html" {
+        return file_response(paths::ui_dir().join("launchdeck").join("index.html"));
+    }
+    if normalized == "legacy" || normalized.starts_with("legacy/") {
+        return Err(static_not_found());
+    }
+    if normalized.starts_with("uploads/") {
+        let file_name = std::path::Path::new(normalized.trim_start_matches("uploads/"))
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_string();
         return file_response(paths::uploads_dir().join(file_name));
     }
-    let safe_name = std::path::Path::new(&requested)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_string();
-    if safe_name.is_empty() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "ok": false,
-                "error": "Not found",
-            })),
-        ));
+    let Some(relative_path) = safe_ui_relative_path(&requested) else {
+        return Err(static_not_found());
+    };
+    if let Some(response) = try_file_response(paths::ui_dir().join(&relative_path)) {
+        return response;
     }
-    file_response(paths::ui_dir().join(safe_name))
+    if let Some(response) = try_file_response(paths::ui_dir().join("images").join(&relative_path)) {
+        return response;
+    }
+    Err(static_not_found())
 }
 
 async fn runtime_action(
@@ -7676,6 +8667,7 @@ async fn runtime_fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::FollowActionTimings;
     use std::sync::{Arc, Mutex};
 
     fn test_state(warm: WarmControlState) -> Arc<AppState> {
@@ -7735,6 +8727,45 @@ mod tests {
         .expect("sample execution")
     }
 
+    #[test]
+    fn regular_pump_with_custom_fee_recipients_prefers_post_setup_creator_vault() {
+        assert!(launch_prefers_post_setup_creator_vault_for_follow(
+            "pump", "regular", true, true
+        ));
+    }
+
+    #[test]
+    fn regular_pump_without_fee_recipient_follow_up_keeps_default_creator_vault() {
+        assert!(!launch_prefers_post_setup_creator_vault_for_follow(
+            "pump", "regular", false, true
+        ));
+        assert!(!launch_prefers_post_setup_creator_vault_for_follow(
+            "pump", "regular", true, false
+        ));
+    }
+
+    #[test]
+    fn build_buy_transport_plan_uses_buy_route_settings() {
+        let execution = sample_execution();
+        let plan = build_buy_transport_plan(&execution, 2);
+
+        assert_eq!(plan.requestedProvider, "hellomoon");
+        assert_eq!(plan.resolvedProvider, "hellomoon");
+        assert_eq!(plan.requestedEndpointProfile, "fra");
+        assert_eq!(plan.resolvedEndpointProfile, "fra");
+    }
+
+    #[test]
+    fn standard_rpc_transport_plan_overrides_only_bags_setup_route() {
+        let execution = sample_execution();
+        let launch_plan = build_transport_plan(&execution, 1);
+        let setup_plan = standard_rpc_transport_plan(&launch_plan, "https://mainnet.helius-rpc.com");
+
+        assert_eq!(launch_plan.transportType, "helius-sender");
+        assert_eq!(setup_plan.transportType, "standard-rpc-fanout");
+        assert!(setup_plan.heliusSenderEndpoints.is_empty());
+    }
+
     fn sample_follow_job(state: FollowJobState) -> FollowJobRecord {
         FollowJobRecord {
             schemaVersion: FOLLOW_RESPONSE_SCHEMA_VERSION,
@@ -7756,11 +8787,13 @@ mod tests {
             mint: None,
             launchCreator: None,
             launchSignature: None,
+            launchTransactionSubscribeAccountRequired: vec![],
             submitAtMs: None,
-            sendObservedBlockHeight: None,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
             reportPath: None,
             transportPlan: None,
+            bagsLaunch: None,
             followLaunch: NormalizedFollowLaunch {
                 enabled: false,
                 source: String::new(),
@@ -7775,11 +8808,165 @@ mod tests {
                 },
             },
             actions: vec![],
+            reservedPayloadFingerprint: String::new(),
             deferredSetup: None,
             cancelRequested: false,
             lastError: None,
             timings: FollowJobTimings::default(),
         }
+    }
+
+    fn sample_sent_result(
+        transport_type: &str,
+        endpoint: Option<&str>,
+    ) -> crate::rpc::SentResult {
+        crate::rpc::SentResult {
+            label: "launch".to_string(),
+            format: "legacy".to_string(),
+            signature: Some("sig-1".to_string()),
+            explorerUrl: None,
+            transportType: transport_type.to_string(),
+            endpoint: endpoint.map(|value| value.to_string()),
+            attemptedEndpoints: endpoint
+                .map(|value| vec![value.to_string()])
+                .unwrap_or_default(),
+            skipPreflight: true,
+            maxRetries: 0,
+            confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: None,
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
+            confirmedSlot: None,
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: None,
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+            bundleId: None,
+            attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired: vec![],
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
+        }
+    }
+
+    #[test]
+    fn refresh_report_benchmark_keeps_explicit_off_mode_payload() {
+        let mut report = json!({
+            "execution": {
+                "timings": {
+                    "benchmarkMode": "off",
+                    "totalElapsedMs": 123
+                },
+                "sent": [{
+                    "label": "launch",
+                    "confirmationStatus": "confirmed",
+                    "sendObservedSlot": 100,
+                    "confirmedObservedSlot": 101,
+                    "confirmedSlot": 101
+                }]
+            }
+        });
+        refresh_report_benchmark(&mut report);
+        assert!(report["execution"]["timings"].is_null());
+        assert_eq!(report["benchmark"]["mode"], Value::String("off".to_string()));
+        assert_eq!(report["benchmark"]["timingGroups"], Value::Array(vec![]));
+        assert_eq!(report["benchmark"]["sent"], Value::Array(vec![]));
+    }
+
+    #[test]
+    fn actual_helius_sender_endpoint_ignores_non_helius_transports() {
+        let sent = vec![sample_sent_result(
+            "standard-rpc-sequential",
+            Some("https://rpc.example"),
+        )];
+
+        assert_eq!(actual_helius_sender_endpoint(&sent), None);
+    }
+
+    #[test]
+    fn actual_helius_sender_endpoint_uses_helius_send_result_endpoint() {
+        let sent = vec![sample_sent_result(
+            "helius-sender",
+            Some("http://fra-sender.helius-rpc.com/fast"),
+        )];
+
+        assert_eq!(
+            actual_helius_sender_endpoint(&sent),
+            Some("http://fra-sender.helius-rpc.com/fast".to_string())
+        );
+    }
+
+    #[test]
+    fn immediate_presign_candidate_excludes_delayed_and_offset_actions() {
+        let base = crate::follow::FollowActionRecord {
+            actionId: "dev-sell".to_string(),
+            kind: crate::follow::FollowActionKind::DevAutoSell,
+            walletEnvKey: "WALLET_A".to_string(),
+            state: crate::follow::FollowActionState::Queued,
+            buyAmountSol: None,
+            sellPercent: Some(100),
+            submitDelayMs: None,
+            targetBlockOffset: Some(0),
+            delayMs: None,
+            marketCap: None,
+            jitterMs: None,
+            feeJitterBps: None,
+            precheckRequired: false,
+            requireConfirmation: true,
+            skipIfTokenBalancePositive: false,
+            attemptCount: 0,
+            scheduledForMs: None,
+            eligibleAtMs: None,
+            submitStartedAtMs: None,
+            submittedAtMs: None,
+            confirmedAtMs: None,
+            provider: None,
+            endpointProfile: None,
+            transportType: None,
+            watcherMode: None,
+            watcherFallbackReason: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
+            confirmedTokenBalanceRaw: None,
+            eligibilityObservedSlot: None,
+            slotsToConfirm: None,
+            signature: None,
+            explorerUrl: None,
+            endpoint: None,
+            bundleId: None,
+            lastError: None,
+            triggerKey: Some("slot:0".to_string()),
+            orderIndex: 0,
+            preSignedTransactions: vec![],
+            poolId: None,
+            timings: FollowActionTimings::default(),
+        };
+        assert!(follow_action_is_immediate_presign_candidate(&base));
+
+        let mut delayed = base.clone();
+        delayed.delayMs = Some(1000);
+        assert!(!follow_action_is_immediate_presign_candidate(&delayed));
+
+        let mut offset = base.clone();
+        offset.targetBlockOffset = Some(1);
+        assert!(!follow_action_is_immediate_presign_candidate(&offset));
+
+        let mut market_cap = base;
+        market_cap.marketCap = Some(crate::follow::FollowMarketCapTrigger {
+            direction: "above".to_string(),
+            threshold: "100".to_string(),
+            scanTimeoutSeconds: 30,
+            timeoutAction: "stop".to_string(),
+        });
+        assert!(!follow_action_is_immediate_presign_candidate(&market_cap));
     }
 
     #[tokio::test]
@@ -7788,6 +8975,51 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.service, "launchdeck-engine");
         assert_eq!(response.mode, "rust-native-only");
+    }
+
+    #[test]
+    fn runtime_status_backend_payload_reports_bags_launch_follow_and_snapshot_as_rust_owned() {
+        let payload = build_launchpad_backend_status_payload();
+        assert_eq!(
+            payload
+                .get("bagsapp")
+                .and_then(|value| value.get("market-snapshot"))
+                .and_then(|value| value.get("backend"))
+                .and_then(Value::as_str),
+            Some("rust-native")
+        );
+        assert_eq!(
+            payload
+                .get("bagsapp")
+                .and_then(|value| value.get("follow-buy"))
+                .and_then(|value| value.get("backend"))
+                .and_then(Value::as_str),
+            Some("rust-native")
+        );
+        assert_eq!(
+            payload
+                .get("bagsapp")
+                .and_then(|value| value.get("follow-sell"))
+                .and_then(|value| value.get("backend"))
+                .and_then(Value::as_str),
+            Some("rust-native")
+        );
+        assert_eq!(
+            payload
+                .get("bagsapp")
+                .and_then(|value| value.get("prepare-launch"))
+                .and_then(|value| value.get("backend"))
+                .and_then(Value::as_str),
+            Some("rust-native")
+        );
+        assert_eq!(
+            payload
+                .get("bagsapp")
+                .and_then(|value| value.get("build-launch"))
+                .and_then(|value| value.get("backend"))
+                .and_then(Value::as_str),
+            Some("rust-native")
+        );
     }
 
     #[test]
@@ -7914,12 +9146,19 @@ mod tests {
                 label: "Hello Moon QUIC".to_string(),
                 target: "https://example.invalid".to_string(),
                 active: false,
-                last_attempt_at_ms: Some((now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64),
+                last_attempt_at_ms: Some(
+                    (now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64
+                ),
                 status: WarmTargetHealth::Healthy,
-                last_success_at_ms: Some((now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64),
+                last_success_at_ms: Some(
+                    (now_ms.saturating_sub(1_000)).min(u128::from(u64::MAX)) as u64
+                ),
                 last_rate_limited_at_ms: None,
                 last_rate_limit_message: None,
                 last_error: None,
+                last_error_at_ms: None,
+                last_recovered_at_ms: None,
+                last_recovered_error: None,
                 consecutive_failures: 0,
             },
         );
@@ -8078,6 +9317,9 @@ mod tests {
                 last_rate_limited_at_ms: None,
                 last_rate_limit_message: None,
                 last_error: None,
+                last_error_at_ms: None,
+                last_recovered_at_ms: None,
+                last_recovered_error: None,
                 consecutive_failures: 0,
             },
         );
@@ -8126,6 +9368,9 @@ mod tests {
                 last_rate_limited_at_ms: None,
                 last_rate_limit_message: None,
                 last_error: None,
+                last_error_at_ms: None,
+                last_recovered_at_ms: None,
+                last_recovered_error: None,
                 consecutive_failures: 0,
             },
         );
@@ -8144,6 +9389,9 @@ mod tests {
                 last_rate_limited_at_ms: None,
                 last_rate_limit_message: None,
                 last_error: Some("timeout".to_string()),
+                last_error_at_ms: None,
+                last_recovered_at_ms: None,
+                last_recovered_error: None,
                 consecutive_failures: 2,
             },
         );
@@ -8277,7 +9525,8 @@ mod tests {
     fn background_request_gate_stays_active_for_follow_jobs() {
         let now_ms = current_time_ms();
         let warm = WarmControlState {
-            last_activity_at_ms: now_ms.saturating_sub(u128::from(configured_idle_warm_timeout_ms()) + 5_000),
+            last_activity_at_ms: now_ms
+                .saturating_sub(u128::from(configured_idle_warm_timeout_ms()) + 5_000),
             follow_jobs_active: true,
             ..WarmControlState::default()
         };
@@ -8300,7 +9549,10 @@ mod tests {
             attempt_at_ms,
         );
         assert_eq!(warm.last_activity_at_ms, u128::from(attempt_at_ms));
-        assert_eq!(warm.last_warm_success_at_ms, Some(u128::from(attempt_at_ms)));
+        assert_eq!(
+            warm.last_warm_success_at_ms,
+            Some(u128::from(attempt_at_ms))
+        );
         assert!(warm.browser_active);
         assert!(warm.continuous_active);
         assert_eq!(warm.current_reason, "active-operator-activity");
@@ -8312,17 +9564,21 @@ mod tests {
         sync_follow_job_warm_state(&mut warm, 1, &[sample_follow_job(FollowJobState::Running)]);
         assert!(warm.follow_jobs_active);
         assert_eq!(warm.follow_job_routes.len(), 3);
-        assert!(warm.follow_job_routes.iter().any(|route| {
-            route.provider == "helius-sender" && route.endpoint_profile == "ams"
-        }));
+        assert!(
+            warm.follow_job_routes.iter().any(|route| {
+                route.provider == "helius-sender" && route.endpoint_profile == "ams"
+            })
+        );
         assert!(warm.follow_job_routes.iter().any(|route| {
             route.provider == "hellomoon"
                 && route.endpoint_profile == "fra"
                 && route.hellomoon_mev_mode == "secure"
         }));
-        assert!(warm.follow_job_routes.iter().any(|route| {
-            route.provider == "jito-bundle" && route.endpoint_profile == "ewr"
-        }));
+        assert!(
+            warm.follow_job_routes.iter().any(|route| {
+                route.provider == "jito-bundle" && route.endpoint_profile == "ewr"
+            })
+        );
     }
 
     #[test]
@@ -8470,13 +9726,8 @@ mod tests {
 
     #[test]
     fn clamp_auto_fee_tip_errors_when_cap_below_minimum() {
-        let err = clamp_auto_fee_tip_to_provider_minimum(
-            50_000,
-            "hellomoon",
-            Some(100_000),
-            "Buy",
-        )
-        .expect_err("cap below minimum");
+        let err = clamp_auto_fee_tip_to_provider_minimum(50_000, "hellomoon", Some(100_000), "Buy")
+            .expect_err("cap below minimum");
         assert!(err.contains("max auto fee is below"));
         assert!(err.contains("hellomoon"));
     }
@@ -8544,6 +9795,46 @@ mod tests {
         assert!(err.contains("must be above"));
         assert!(err.contains("hellomoon"));
     }
+
+    #[tokio::test]
+    async fn bags_fee_recipient_lookup_requires_provider() {
+        let result = api_bags_fee_recipient_lookup(Query(BagsFeeRecipientLookupQuery {
+            provider: None,
+            username: Some("launchdeck".to_string()),
+            github_user_id: None,
+        }))
+        .await;
+        let (status, Json(payload)) = result.expect_err("missing provider should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("provider"),
+        );
+    }
+
+    #[tokio::test]
+    async fn bags_fee_recipient_lookup_requires_username_or_github_id() {
+        let result = api_bags_fee_recipient_lookup(Query(BagsFeeRecipientLookupQuery {
+            provider: Some("github".to_string()),
+            username: None,
+            github_user_id: None,
+        }))
+        .await;
+        let (status, Json(payload)) = result.expect_err("missing identifier should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("username or user id"),
+        );
+    }
 }
 
 #[tokio::main]
@@ -8570,11 +9861,11 @@ async fn main() {
         .route("/health", get(health))
         .route(
             "/",
-            get(|| async { file_response(paths::ui_dir().join("index.html")) }),
+            get(|| async { file_response(paths::ui_dir().join("launchdeck").join("index.html")) }),
         )
         .route(
             "/index.html",
-            get(|| async { file_response(paths::ui_dir().join("index.html")) }),
+            get(|| async { file_response(paths::ui_dir().join("launchdeck").join("index.html")) }),
         )
         .route("/api/bootstrap-fast", get(api_bootstrap_fast))
         .route("/api/bootstrap", get(api_bootstrap))
@@ -8595,6 +9886,10 @@ async fn main() {
         .route("/api/bags/identity/init", post(api_bags_identity_init))
         .route("/api/bags/identity/verify", post(api_bags_identity_verify))
         .route("/api/bags/identity/clear", post(api_bags_identity_clear))
+        .route(
+            "/api/bags/fee-recipient-lookup",
+            get(api_bags_fee_recipient_lookup),
+        )
         .route(
             "/api/settings",
             get(api_settings_get).post(api_settings_save),

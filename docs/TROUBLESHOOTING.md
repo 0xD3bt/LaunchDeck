@@ -174,11 +174,35 @@ What to check:
 - selected mode
 - fee-sharing settings
 
-## postBuySell rejected
+## Pump `creator_vault` / `Custom 2006` retries
 
-This is expected in the current runtime.
+Current behavior:
 
-`followLaunch.snipes[].postBuySell` is not a shipped feature and is rejected by validation.
+- Pump pre-signed sniper buys can rebuild/retry automatically on the special `creator_vault` / `Custom 2006` failure path
+- Pump dev-auto-sells and Pump sniper-sells can also rebuild/retry automatically on that same failure path
+- both of those recovery paths default to enabled
+
+What to check:
+
+- whether the report or follow-daemon state shows `creator_vault`, `ConstraintSeeds`, or `Custom: 2006`
+- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY`
+- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY`
+
+What to do:
+
+1. leave both flags enabled unless you intentionally want LaunchDeck to stop resending that recovery buy or sell
+2. if you want to disable the recovery resend path, set the relevant flag to `false` and restart with `npm restart`
+3. inspect the saved report / follow-daemon state to confirm whether the action failed before retry, retried, or stayed failed after the retry path was disabled
+
+## postBuySell semantics
+
+`followLaunch.snipes[].postBuySell` is supported in the current runtime.
+
+Current behavior:
+
+- slot offsets mean `+N slots after the matching buy confirms`
+- market-cap autosells start watching after the matching buy confirms
+- older saved/imported payloads keep the same field names and now follow the same buy-relative meaning
 
 ## Metadata upload problems
 
@@ -193,6 +217,23 @@ What to check:
 - `PINATA_JWT`
 - the UI warning message
 - the final report output
+
+## Market-cap follow trigger did not fire
+
+Common causes:
+
+- the threshold or timeout action was configured differently than you expected
+- no usable Helius RPC URL was available for the primary SOL price lookup
+- outbound access to the configured SOL/USD HTTP price source failed
+- the market-cap watch timed out before the threshold was reached
+
+What to check:
+
+- `HELIUS_RPC_URL`
+- whether `SOLANA_RPC_URL` is already Helius-hosted
+- `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL`
+- follow-job outcome details in the saved report
+- daemon logs for price-source or watcher errors
 
 ## Bonk or Bags helper worker problems
 
@@ -247,4 +288,5 @@ npm restart
 - `docs/ENV_REFERENCE.md`
 - `docs/PROVIDERS.md`
 - `docs/FOLLOW_DAEMON.md`
+- `docs/VPS_SETUP.md`
 

@@ -18,18 +18,24 @@ Related local data:
 
 You can override the report location with `LAUNCHDECK_SEND_LOG_DIR`.
 
-## History In The UI
+## Dashboard In The UI
 
-Open `History` from the main app to browse saved activity.
+Open `Dashboard` from the main app to browse saved activity and live follow state.
 
-The History interface exposes two views:
+The dashboard exposes four views:
 
 - `Transactions`
 - `Launches`
+- `Jobs`
+- `Logs`
 
 Use `Transactions` when you want to inspect raw execution output for a run.
 
 Use `Launches` when you want the higher-level launch history and reuse flow.
+
+Use `Jobs` when you want the current active follow jobs, their state, and cancel controls.
+
+Use `Logs` when you want recent engine or follow-daemon output without leaving the browser.
 
 Current report detail highlights in the UI include:
 
@@ -146,7 +152,7 @@ These values are historical visibility data, not automatic throttles.
 
 ## Reuse And Relaunch
 
-History is also an operator workflow tool, not just an audit log.
+The `Launches` view inside `Dashboard` is also an operator workflow tool, not just an audit log.
 
 From the UI you can:
 

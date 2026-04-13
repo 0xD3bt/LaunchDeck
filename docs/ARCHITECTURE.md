@@ -6,9 +6,11 @@ This document explains how LaunchDeck is organized today from an operator perspe
 
 LaunchDeck is a local multi-process application with three main layers:
 
-- `ui/`: the browser application for form entry, presets, settings, image management, reporting, and follow-action configuration
+- `ui/launchdeck/`: the current browser application shell for form entry, presets, settings, image management, dashboard/reporting, runtime status, and follow-action configuration
 - `rust/launchdeck-engine`: the main Rust host that serves the UI and owns config normalization, launch execution, reporting, and local persistence
 - `rust/launchdeck-engine/src/bin/launchdeck-follow-daemon.rs`: a separate Rust daemon for follow actions that need to keep running after the main launch request has been submitted
+
+Archived pre-shell UI and legacy helpers live under `Legacy/`. They are not the current frontend/runtime path.
 
 There is also an operator CLI:
 
@@ -38,6 +40,7 @@ The main host is responsible for:
 - building, simulating, and sending launch transactions
 - reserving and arming follow jobs with the daemon
 - writing durable reports
+- exposing runtime warm telemetry and operator activity endpoints
 - exposing the image library, report browser, and Bags identity control plane
 
 ### Follow Daemon Responsibilities
@@ -67,7 +70,7 @@ A normal UI-driven launch follows this path:
 7. the host simulates and/or sends the launch flow
 8. if follow behavior is enabled, the host reserves and then arms a follow job with launch-specific context
 9. the follow daemon takes over delayed and watcher-driven actions
-10. reports are persisted for later review in History
+10. reports are persisted for later review in Dashboard
 
 ## Launchpad Boundaries
 
@@ -121,7 +124,7 @@ Verified Bonk support includes:
 
 ### Bagsapp
 
-Bagsapp is available when configured, but it is still experimental.
+Bagsapp is a supported launchpad path when configured.
 
 - availability depends on Bags credentials
 - launch/trade assembly uses the hosted Bags API or SDK bridge
@@ -198,23 +201,30 @@ The important point for operators is that settings, images, uploads, and histori
 
 The current runtime uses several caching and warm-up paths to reduce launch latency:
 
+- startup launchpad warm for lookup tables, Pump global state, Bonk state, and Bags helper state
 - background metadata pre-upload from the browser
 - warmed lookup tables cached in memory and persisted locally
 - cached blockhash refresh in the host and daemon
 - cached Pump global state for compile-time launch assembly and dev-buy quoting
 - arm-time preparation of delayed sniper buys
 - daemon-side hot-state refresh for delayed follow jobs
+- runtime-status and warm-target telemetry surfaced back to the UI
 - concurrency for same-time compile and non-bundle submit paths that preserve launch ordering
 
 Reports separate user-visible wait from backend execution so operators can tell whether latency came from metadata, compile, or chain confirmation.
 
 ## Frontend Module Layout
 
-The UI is still one browser app, but several operator-facing features are broken into dedicated modules:
+The UI is still one browser app, but it is now organized as a shell plus feature/domain modules:
 
-- `ui/sniper-feature.js`
-- `ui/auto-sell-feature.js`
-- `ui/images-feature.js`
-- `ui/reports-feature.js`
+- `ui/launchdeck/index.html`: current shell and modal/layout markup
+- `ui/launchdeck/app.js`: main app composition and shared state
+- `ui/launchdeck/sniper-feature.js`: sniper editor behavior
+- `ui/launchdeck/auto-sell-feature.js`: dev auto-sell and sniper autosell behavior
+- `ui/launchdeck/images-feature.js`: image-library rendering and actions
+- `ui/launchdeck/reports-feature.js`: dashboard/report terminal behavior
+- `ui/launchdeck/app/settings-domain.js`: settings modal and preset routing defaults
+- `ui/launchdeck/app/wallet-runtime-domain.js`: wallet refresh, runtime status, warm indicators, and follow status chrome
+- `ui/launchdeck/app/reports-history.js` and `ui/launchdeck/app/reports-presenters.js`: launch-history assembly plus dashboard presentation
 
-This is mainly useful to know when you are trying to understand which part of the app owns a specific feature, such as snipers, auto-sell, image library behavior, or History rendering.
+This is mainly useful to know when you are trying to understand which part of the app owns a feature such as snipers, auto-sell, image library behavior, dashboard rendering, or runtime indicators.

@@ -62,6 +62,10 @@ pub fn lookup_table_cache_path() -> PathBuf {
     local_root_dir().join("lookup-tables.json")
 }
 
+pub fn bonk_lookup_table_cache_path() -> PathBuf {
+    local_root_dir().join("bonk-lookup-tables.json")
+}
+
 pub fn runtime_state_path() -> PathBuf {
     if let Ok(explicit) = env::var("LAUNCHDECK_ENGINE_RUNTIME_PATH") {
         let trimmed = explicit.trim();

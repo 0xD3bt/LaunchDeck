@@ -37,7 +37,9 @@ use crate::{
     report::{LaunchReport, build_report, render_report},
     rpc::{
         CompiledTransaction, fetch_account_data, fetch_account_exists,
-        fetch_latest_blockhash_cached, fetch_multiple_account_data, fetch_multiple_account_exists,
+        COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS, fetch_latest_blockhash_cached,
+        fetch_latest_blockhash_cached_with_prime,
+        fetch_multiple_account_data, fetch_multiple_account_exists,
     },
     transport::TransportPlan,
     wallet::read_keypair_bytes,
@@ -175,6 +177,7 @@ pub async fn try_compile_native_pump(
     built_at: String,
     creator_public_key: String,
     config_path: Option<String>,
+    launch_blockhash_prime: Option<(String, u64)>,
 ) -> Result<Option<NativePumpArtifacts>, String> {
     if !supports_native_pump_compile(config) {
         return Ok(None);
@@ -200,9 +203,18 @@ pub async fn try_compile_native_pump(
         let tables = load_lookup_table_accounts(rpc_url, config).await?;
         Ok::<_, String>((started.elapsed().as_millis(), tables))
     };
-    let blockhash_future = async {
+    let rpc_for_blockhash = rpc_url.to_string();
+    let blockhash_commitment = config.execution.commitment.clone();
+    let blockhash_prime = launch_blockhash_prime;
+    let blockhash_future = async move {
         let started = Instant::now();
-        let blockhash = fetch_latest_blockhash_cached(rpc_url, "confirmed").await?;
+        let blockhash = fetch_latest_blockhash_cached_with_prime(
+            &rpc_for_blockhash,
+            &blockhash_commitment,
+            blockhash_prime,
+            COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS,
+        )
+        .await?;
         Ok::<_, String>((started.elapsed().as_millis(), blockhash))
     };
     let global_future = async {
@@ -609,6 +621,15 @@ struct PumpGlobalState {
     reserved_fee_recipients: [Pubkey; 7],
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PumpPreviewBasis {
+    pub initialVirtualTokenReserves: String,
+    pub initialVirtualSolReserves: String,
+    pub initialRealTokenReserves: String,
+    pub feeBasisPoints: String,
+    pub creatorFeeBasisPoints: String,
+}
+
 #[derive(Debug, Clone)]
 struct PumpBondingCurveState {
     virtual_token_reserves: u64,
@@ -666,6 +687,16 @@ fn cache_global_state(state: &PumpGlobalState) {
     }
 }
 
+fn pump_preview_basis_from_global(global: &PumpGlobalState) -> PumpPreviewBasis {
+    PumpPreviewBasis {
+        initialVirtualTokenReserves: global.initial_virtual_token_reserves.to_string(),
+        initialVirtualSolReserves: global.initial_virtual_sol_reserves.to_string(),
+        initialRealTokenReserves: global.initial_real_token_reserves.to_string(),
+        feeBasisPoints: global.fee_basis_points.to_string(),
+        creatorFeeBasisPoints: global.creator_fee_basis_points.to_string(),
+    }
+}
+
 fn keypair_from_secret_bytes(bytes: &[u8]) -> Result<Keypair, String> {
     Keypair::try_from(bytes).map_err(|error| error.to_string())
 }
@@ -719,6 +750,14 @@ fn pump_amm_program_id() -> Result<Pubkey, String> {
 
 fn token_2022_program_id() -> Result<Pubkey, String> {
     parse_pubkey(TOKEN_2022_PROGRAM_ID, "Token 2022 program id")
+}
+
+pub fn derive_follow_owner_token_account(owner: &Pubkey, mint: &Pubkey) -> Result<Pubkey, String> {
+    Ok(get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        &token_2022_program_id()?,
+    ))
 }
 
 fn token_program_id() -> Result<Pubkey, String> {
@@ -884,10 +923,10 @@ async fn fetch_global_state_cached(rpc_url: &str) -> Result<PumpGlobalState, Str
 }
 
 #[allow(dead_code)]
-pub async fn warm_pump_global_state(rpc_url: &str) -> Result<(), String> {
+pub async fn warm_pump_global_state(rpc_url: &str) -> Result<PumpPreviewBasis, String> {
     let global = fetch_global_state(rpc_url).await?;
     cache_global_state(&global);
-    Ok(())
+    Ok(pump_preview_basis_from_global(&global))
 }
 
 fn read_bool(data: &[u8], offset: &mut usize) -> Result<bool, String> {
@@ -995,15 +1034,17 @@ fn parse_bonding_curve_state(data: &[u8]) -> Result<PumpBondingCurveState, Strin
     })
 }
 
-fn parse_pump_amm_pool_state(account_pubkey: &str, data: &[u8]) -> Result<PumpAmmPoolState, String> {
+fn parse_pump_amm_pool_state(
+    account_pubkey: &str,
+    data: &[u8],
+) -> Result<PumpAmmPoolState, String> {
     if data.len() < PUMP_AMM_POOL_ACCOUNT_SIZE {
         return Err("Pump AMM pool account data was too short.".to_string());
     }
     let mut offset = PUMP_AMM_POOL_DISCRIMINATOR_BYTES;
-    let _pool_bump = data
-        .get(offset)
-        .copied()
-        .ok_or_else(|| "Pump AMM pool account was too short while reading pool bump.".to_string())?;
+    let _pool_bump = data.get(offset).copied().ok_or_else(|| {
+        "Pump AMM pool account was too short while reading pool bump.".to_string()
+    })?;
     offset += 1;
     offset += 2; // index
     let creator = read_pubkey(data, &mut offset)?;
@@ -1087,7 +1128,13 @@ fn derive_pump_amm_pool_address(
     let program_id = parse_pubkey(PUMP_AMM_PROGRAM_ID, "pump amm program")?;
     let index_bytes = index.to_le_bytes();
     let (pubkey, _) = Pubkey::find_program_address(
-        &[b"pool", &index_bytes, creator.as_ref(), mint.as_ref(), quote_mint.as_ref()],
+        &[
+            b"pool",
+            &index_bytes,
+            creator.as_ref(),
+            mint.as_ref(),
+            quote_mint.as_ref(),
+        ],
         &program_id,
     );
     Ok(pubkey)
@@ -1133,7 +1180,9 @@ async fn find_pump_amm_pool_state(
         .filter_map(|(pubkey, data)| {
             data.and_then(|bytes| parse_pump_amm_pool_state(&pubkey, &bytes).ok())
         })
-        .filter(|pool| pool.base_mint == *mint && quote_asset_meta_for_mint(&pool.quote_mint).is_some())
+        .filter(|pool| {
+            pool.base_mint == *mint && quote_asset_meta_for_mint(&pool.quote_mint).is_some()
+        })
         .collect::<Vec<_>>();
     pools.sort_by_key(|pool| pump_amm_quote_priority(&pool.quote_mint));
     Ok(pools.into_iter().next())
@@ -1167,11 +1216,21 @@ async fn fetch_pump_amm_market_snapshot_for_mint(
     let base_vault = accounts
         .first()
         .and_then(|entry| entry.as_ref())
-        .ok_or_else(|| format!("Pump AMM base vault {} was not found.", pool.pool_base_token_account))?;
+        .ok_or_else(|| {
+            format!(
+                "Pump AMM base vault {} was not found.",
+                pool.pool_base_token_account
+            )
+        })?;
     let quote_vault = accounts
         .get(1)
         .and_then(|entry| entry.as_ref())
-        .ok_or_else(|| format!("Pump AMM quote vault {} was not found.", pool.pool_quote_token_account))?;
+        .ok_or_else(|| {
+            format!(
+                "Pump AMM quote vault {} was not found.",
+                pool.pool_quote_token_account
+            )
+        })?;
     let mint_account = accounts
         .get(2)
         .and_then(|entry| entry.as_ref())
@@ -1191,11 +1250,7 @@ async fn fetch_pump_amm_market_snapshot_for_mint(
         tokenTotalSupply: total_supply,
         complete: true,
         marketCapLamports: market_cap_quote_units,
-        marketCapSol: format_decimal_u128(
-            u128::from(market_cap_quote_units),
-            quote_decimals,
-            6,
-        ),
+        marketCapSol: format_decimal_u128(u128::from(market_cap_quote_units), quote_decimals, 6),
         quoteAsset: quote_asset.to_string(),
         quoteAssetLabel: quote_asset_label.to_string(),
     })
@@ -1387,6 +1442,31 @@ fn quote_buy_curve_input_from_tokens(global: &PumpGlobalState, token_amount: u64
         .unwrap_or(u64::MAX)
 }
 
+fn synthetic_curve_after_buy_tokens(
+    global: &PumpGlobalState,
+    launch_creator: &Pubkey,
+    token_amount: u64,
+    cashback_enabled: bool,
+) -> PumpBondingCurveState {
+    let curve_input = quote_buy_curve_input_from_tokens(global, token_amount);
+    PumpBondingCurveState {
+        virtual_token_reserves: global
+            .initial_virtual_token_reserves
+            .saturating_sub(token_amount),
+        virtual_sol_reserves: global
+            .initial_virtual_sol_reserves
+            .saturating_add(curve_input),
+        real_token_reserves: global
+            .initial_real_token_reserves
+            .saturating_sub(token_amount),
+        real_sol_reserves: curve_input,
+        token_total_supply: global.initial_real_token_reserves,
+        complete: false,
+        creator: *launch_creator,
+        cashback_enabled,
+    }
+}
+
 fn current_market_cap_lamports(curve: &PumpBondingCurveState) -> u64 {
     if curve.virtual_token_reserves == 0 {
         return 0;
@@ -1514,7 +1594,8 @@ pub async fn fetch_pump_market_snapshot(
                 quoteAsset: "sol".to_string(),
                 quoteAssetLabel: "SOL".to_string(),
             };
-            if !curve.complete && curve.virtual_token_reserves > 0 && curve.virtual_sol_reserves > 0 {
+            if !curve.complete && curve.virtual_token_reserves > 0 && curve.virtual_sol_reserves > 0
+            {
                 return Ok(curve_snapshot);
             }
             fetch_pump_amm_market_snapshot_for_mint(rpc_url, &mint, &curve.creator)
@@ -1696,6 +1777,10 @@ pub async fn finalize_follow_buy_transaction(
     }
     let token_amount =
         quote_buy_tokens_from_curve(&runtime.curve, &runtime.global, prepared.sol_amount);
+    let max_sol_cost = apply_buy_slippage_buffer(
+        prepared.sol_amount,
+        slippage_bps_from_percent(&execution.buySlippagePercent)?,
+    );
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
     let instructions = vec![
@@ -1705,7 +1790,7 @@ pub async fn finalize_follow_buy_transaction(
             &prepared.mint,
             &runtime.creator_vault_authority,
             &user,
-            apply_atomic_buy_buffer(prepared.sol_amount),
+            max_sol_cost,
             token_amount,
             token_mayhem_mode,
         )?,
@@ -1739,6 +1824,8 @@ pub async fn compile_atomic_follow_buy_transaction(
     mint: &str,
     launch_creator: &str,
     buy_amount_sol: &str,
+    predicted_prior_buy_token_amount: Option<u64>,
+    cashback_enabled_override: Option<bool>,
 ) -> Result<CompiledTransaction, String> {
     let user_keypair = keypair_from_secret_bytes(wallet_secret)?;
     let user = user_keypair.pubkey();
@@ -1748,7 +1835,18 @@ pub async fn compile_atomic_follow_buy_transaction(
     let (blockhash, last_valid_block_height) =
         fetch_latest_blockhash_cached(rpc_url, &execution.commitment).await?;
     let sol_amount = parse_decimal_u64(buy_amount_sol, 9, "followLaunch.snipes.buyAmountSol")?;
-    let tokens_out = quote_buy_tokens_from_sol(&global, sol_amount);
+    let buy_slippage_bps = slippage_bps_from_percent(&execution.buySlippagePercent)?;
+    let tokens_out = if let Some(token_amount) = predicted_prior_buy_token_amount {
+        let curve = synthetic_curve_after_buy_tokens(
+            &global,
+            &launch_creator,
+            token_amount,
+            cashback_enabled_override.unwrap_or(false),
+        );
+        quote_buy_tokens_from_curve(&curve, &global, sol_amount)
+    } else {
+        quote_buy_tokens_from_sol(&global, sol_amount)
+    };
     let instructions = vec![
         build_create_token_ata_instruction(&user, &mint)?,
         build_buy_instruction(
@@ -1756,7 +1854,7 @@ pub async fn compile_atomic_follow_buy_transaction(
             &mint,
             &launch_creator,
             &user,
-            apply_atomic_buy_buffer(sol_amount),
+            apply_buy_slippage_buffer(sol_amount, buy_slippage_bps),
             tokens_out,
             token_mayhem_mode,
         )?,
@@ -1848,23 +1946,12 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
     .await?;
     let global = fetch_global_state_cached(rpc_url).await?;
     let curve = if let Some(token_amount_override) = token_amount_override {
-        let curve_input = quote_buy_curve_input_from_tokens(&global, token_amount_override);
-        PumpBondingCurveState {
-            virtual_token_reserves: global
-                .initial_virtual_token_reserves
-                .saturating_sub(token_amount_override),
-            virtual_sol_reserves: global
-                .initial_virtual_sol_reserves
-                .saturating_add(curve_input),
-            real_token_reserves: global
-                .initial_real_token_reserves
-                .saturating_sub(token_amount_override),
-            real_sol_reserves: curve_input,
-            token_total_supply: global.initial_real_token_reserves,
-            complete: false,
-            creator: launch_creator,
-            cashback_enabled: cashback_enabled_override.unwrap_or(false),
-        }
+        synthetic_curve_after_buy_tokens(
+            &global,
+            &launch_creator,
+            token_amount_override,
+            cashback_enabled_override.unwrap_or(false),
+        )
     } else {
         fetch_bonding_curve_state(rpc_url, &mint).await?
     };
@@ -1952,7 +2039,15 @@ pub async fn compile_follow_sell_transaction_with_token_amount(
 }
 
 fn apply_atomic_buy_buffer(sol_amount: u64) -> u64 {
-    ceil_div(u128::from(sol_amount) * 10_100, 10_000).min(u128::from(u64::MAX)) as u64
+    apply_buy_slippage_buffer(sol_amount, 100)
+}
+
+fn apply_buy_slippage_buffer(sol_amount: u64, slippage_bps: u64) -> u64 {
+    ceil_div(
+        u128::from(sol_amount) * u128::from(10_000u64.saturating_add(slippage_bps)),
+        10_000,
+    )
+    .min(u128::from(u64::MAX)) as u64
 }
 
 fn select_buy_fee_recipient(global: &PumpGlobalState, mayhem_mode: bool) -> Pubkey {
@@ -2054,6 +2149,7 @@ fn build_launch_instructions(
     )?];
     if let Some(global) = global {
         if let Some((sol_amount, token_amount)) = resolve_dev_buy_quote(config, global)? {
+            let buy_slippage_bps = slippage_bps_from_percent(&config.execution.buySlippagePercent)?;
             instructions.push(build_extend_account_instruction(
                 &bonding_curve_pda(&mint)?,
                 &creator,
@@ -2064,7 +2160,7 @@ fn build_launch_instructions(
                 &mint,
                 &launch_creator,
                 &creator,
-                apply_atomic_buy_buffer(sol_amount),
+                apply_buy_slippage_buffer(sol_amount, buy_slippage_bps),
                 token_amount,
                 config.token.mayhemMode,
             )?);
@@ -3776,6 +3872,7 @@ mod tests {
     #[test]
     fn launch_instructions_match_sdk_create_and_buy_shape_for_sol_dev_buy() {
         let mut config = regular_config();
+        config.execution.buySlippagePercent = "5".to_string();
         config.devBuy = Some(crate::config::NormalizedDevBuy {
             mode: "sol".to_string(),
             amount: "0.5".to_string(),
@@ -3815,11 +3912,41 @@ mod tests {
 
         let quoted_sol_amount =
             quote_buy_sol_from_tokens(&global, quote_buy_tokens_from_sol(&global, 500_000_000));
-        let expected_max_sol_cost = apply_atomic_buy_buffer(quoted_sol_amount);
+        let expected_max_sol_cost = apply_buy_slippage_buffer(quoted_sol_amount, 500);
         assert_eq!(
             &instructions[3].data[16..24],
             &expected_max_sol_cost.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn synthetic_curve_after_buy_reduces_follow_buy_output() {
+        let global = PumpGlobalState {
+            fee_recipient: Pubkey::new_unique(),
+            initial_virtual_token_reserves: 1_073_000_000_000_000,
+            initial_virtual_sol_reserves: 30_000_000_000,
+            initial_real_token_reserves: 793_100_000_000_000,
+            fee_basis_points: 100,
+            creator_fee_basis_points: 50,
+            fee_recipients: [Pubkey::default(); 7],
+            reserved_fee_recipient: Pubkey::default(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+        };
+        let launch_creator = Pubkey::new_unique();
+        let spend_lamports = 500_000_000;
+        let creator_dev_buy_tokens = quote_buy_tokens_from_sol(&global, 250_000_000);
+        let base_quote = quote_buy_tokens_from_sol(&global, spend_lamports);
+        let advanced_curve = synthetic_curve_after_buy_tokens(
+            &global,
+            &launch_creator,
+            creator_dev_buy_tokens,
+            false,
+        );
+        let advanced_quote = quote_buy_tokens_from_curve(&advanced_curve, &global, spend_lamports);
+
+        assert!(advanced_quote < base_quote);
+        assert!(advanced_curve.real_sol_reserves > 0);
+        assert!(advanced_curve.real_token_reserves < global.initial_real_token_reserves);
     }
 
     #[test]
@@ -4124,13 +4251,9 @@ mod tests {
 
     #[test]
     fn hellomoon_follow_tip_requires_at_least_point_zero_zero_one_sol() {
-        let (lamports, account) = resolve_follow_tip_config(
-            "hellomoon",
-            "0.001",
-            "tip-account",
-            "buy tip",
-        )
-        .expect("valid hellomoon tip");
+        let (lamports, account) =
+            resolve_follow_tip_config("hellomoon", "0.001", "tip-account", "buy tip")
+                .expect("valid hellomoon tip");
         assert_eq!(lamports, 1_000_000);
         assert_eq!(account, "tip-account");
         let error = resolve_follow_tip_config("hellomoon", "0.0001", "tip-account", "buy tip")
@@ -4222,8 +4345,7 @@ mod tests {
         offset += 8;
         data[offset..offset + 32].copy_from_slice(coin_creator.as_ref());
 
-        let parsed =
-            parse_pump_amm_pool_state("pool", &data).expect("pump amm pool should parse");
+        let parsed = parse_pump_amm_pool_state("pool", &data).expect("pump amm pool should parse");
         assert_eq!(parsed.pubkey, "pool");
         assert_eq!(parsed.creator, creator);
         assert_eq!(parsed.base_mint, base_mint);

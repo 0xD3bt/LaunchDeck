@@ -32,6 +32,8 @@ const themeToggleButton = document.getElementById("toggle-theme-button");
 const themeToggleSunIcon = themeToggleButton ? themeToggleButton.querySelector(".theme-icon-sun") : null;
 const themeToggleMoonIcon = themeToggleButton ? themeToggleButton.querySelector(".theme-icon-moon") : null;
 const feeSplitPill = document.getElementById("fee-split-pill");
+const feeSplitPillTitle = document.getElementById("fee-split-pill-title");
+const feeSplitPillProgress = document.getElementById("fee-split-pill-progress");
 const imageInput = document.getElementById("image-input");
 const openImageLibraryButton = document.getElementById("open-image-library-button");
 const imageLayoutToggle = document.getElementById("image-layout-toggle");
@@ -104,20 +106,6 @@ const bonkQuoteAssetInput = getNamedInput("quoteAsset");
 const bonkQuoteAssetToggle = document.getElementById("bonk-quote-asset-toggle");
 const bonkQuoteAssetToggleSolIcon = document.getElementById("bonk-quote-asset-toggle-sol-icon");
 const bonkQuoteAssetToggleUsd1Icon = document.getElementById("bonk-quote-asset-toggle-usd1-icon");
-const bagsIdentityButton = document.getElementById("bags-identity-button");
-const bagsIdentityButtonLabel = document.getElementById("bags-identity-button-label");
-const bagsIdentityModal = document.getElementById("bags-identity-modal");
-const bagsIdentityClose = document.getElementById("bags-identity-close");
-const bagsIdentityCancel = document.getElementById("bags-identity-cancel");
-const bagsIdentityVerifyButton = document.getElementById("bags-identity-verify");
-const bagsIdentityInitButton = document.getElementById("bags-identity-init-button");
-const bagsIdentityCurrent = document.getElementById("bags-identity-current");
-const bagsApiKeyInput = document.getElementById("bags-api-key-input");
-const bagsApiKeySave = document.getElementById("bags-api-key-save");
-const bagsAgentUsernameInput = document.getElementById("bags-agent-username-input");
-const bagsVerificationContent = document.getElementById("bags-verification-content");
-const bagsPostIdInput = document.getElementById("bags-post-id-input");
-const bagsIdentityError = document.getElementById("bags-identity-error");
 const devBuyQuotePrefixIcon = document.getElementById("dev-buy-quote-prefix-icon");
 const devBuyQuotePrefixText = document.getElementById("dev-buy-quote-prefix-text");
 const creationTipInput = document.getElementById("creation-tip-input");
@@ -180,6 +168,15 @@ const feeSplitClose = document.getElementById("fee-split-close");
 const feeSplitDisable = document.getElementById("fee-split-disable");
 const feeSplitSave = document.getElementById("fee-split-save");
 const feeSplitModalError = document.getElementById("fee-split-modal-error");
+const feeSplitTitle = document.getElementById("fee-split-title");
+const feeSplitIntro = document.getElementById("fee-split-intro");
+const feeSplitRecipientsCopy = document.getElementById("fee-split-recipients-copy");
+const bagsFeeSplitSummary = document.getElementById("bags-fee-split-summary");
+const feeSplitSummaryPrimaryLabel = document.getElementById("fee-split-summary-primary-label");
+const feeSplitSummarySecondaryLabel = document.getElementById("fee-split-summary-secondary-label");
+const bagsFeeSplitCreatorShare = document.getElementById("bags-fee-split-creator-share");
+const bagsFeeSplitSharedShare = document.getElementById("bags-fee-split-shared-share");
+const bagsFeeSplitValidationCopy = document.getElementById("bags-fee-split-validation-copy");
 const deployModal = document.getElementById("deploy-modal");
 const modalBody = document.getElementById("modal-body");
 const modalClose = document.getElementById("modal-close");
@@ -270,12 +267,9 @@ const SELECTED_BONK_QUOTE_ASSET_STORAGE_KEY = "launchdeck.bonkQuoteAsset";
 const FEE_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.feeSplitDraft.v1";
 const AGENT_SPLIT_DRAFT_STORAGE_KEY = "launchdeck.agentSplitDraft.v1";
 const AUTO_SELL_DRAFT_STORAGE_KEY = "launchdeck.autoSellDraft.v1";
+let activeFeeSplitDraftLaunchpad = "pump";
+let suspendFeeSplitDraftPersistence = false;
 let settingsModalInitialConfig = null;
-const bagsIdentityModeInput = getNamedInput("bagsIdentityMode");
-const bagsAgentUsernameHiddenInput = getNamedInput("bagsAgentUsername");
-const bagsAuthTokenInput = getNamedInput("bagsAuthToken");
-const bagsIdentityVerifiedWalletInput = getNamedInput("bagsIdentityVerifiedWallet");
-
 const POPOUT_FORM_WIDTH = 532;
 const POPOUT_REPORTS_WIDTH = 560;
 const POPOUT_WORKSPACE_GAP = 12;
@@ -408,18 +402,6 @@ let uploadedImage = null;
 let latestWalletStatus = null;
 let latestRuntimeStatus = null;
 let latestLaunchpadRegistry = {};
-let bagsIdentityState = {
-  mode: "wallet-only",
-  configuredApiKey: false,
-  verified: false,
-  agentUsername: "",
-  authToken: "",
-  verifiedWallet: "",
-  publicIdentifier: "",
-  secret: "",
-  verificationPostContent: "",
-  error: "",
-};
 let importedCreatorFeeState = {
   mode: "",
   address: "",
@@ -428,6 +410,10 @@ let importedCreatorFeeState = {
 };
 let feeSplitModalSnapshot = null;
 let feeSplitClearAllRestoreSnapshot = null;
+let feeSplitRowSerial = 0;
+const bagsFeeSplitLookupCache = new Map();
+const bagsFeeSplitLookupTimers = new Map();
+const bagsFeeSplitLookupState = new Map();
 let agentSplitClearAllRestoreSnapshot = null;
 let walletStatusRequestSerial = 0;
 let appBootstrapState = {
@@ -466,6 +452,7 @@ const requestStates = {
   reportView: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   images: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
   quote: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
+  bagsFeeRecipientLookup: RequestUtils.createLatestRequestState ? RequestUtils.createLatestRequestState() : { serial: 0, controller: null, debounceTimer: null },
 };
 const renderCache = {
   walletDropdown: "",
@@ -573,6 +560,8 @@ const DEFAULT_QUICK_DEV_BUY_AMOUNTS = ["0.5", "1", "2"];
 const DEFAULT_PRESET_ID = "preset1";
 const METADATA_PREUPLOAD_DEBOUNCE_MS = 500;
 const MAX_FEE_SPLIT_RECIPIENTS = 10;
+const BAGS_FEE_SPLIT_VISIBLE_CARD_COUNT = 5;
+const BAGS_FEE_SPLIT_VIEWPORT_BUFFER_PX = 4;
 const SNIPER_EXECUTION_RESERVE_SOL = 0.005;
 const SNIPER_BALANCE_PRESETS = [
   { label: "MAX", ratio: 1 },
@@ -789,29 +778,837 @@ function setStoredBonkQuoteAsset(asset) {
 }
 
 function serializeFeeSplitDraft() {
+  const implicitCreatorShare = usesImplicitCreatorShareMode();
   return {
     enabled: Boolean(feeSplitEnabled && feeSplitEnabled.checked),
     suppressDefaultRow: feeSplitList ? feeSplitList.dataset.suppressDefaultRow === "true" : false,
-    rows: getFeeSplitRows().map((row) => ({
-      type: row.dataset.type || "wallet",
-      value: row.querySelector(".recipient-target")?.value?.trim() || "",
-      githubUserId: row.dataset.githubUserId || "",
-      sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
-      defaultReceiver: row.dataset.defaultReceiver === "true",
-      targetLocked: row.dataset.targetLocked === "true",
-    })),
+    rows: getFeeSplitRows()
+      .map((row) => ({
+        type: row.dataset.type || "wallet",
+        value: row.querySelector(".recipient-target")?.value?.trim() || "",
+        githubUserId: row.dataset.githubUserId || "",
+        sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
+        defaultReceiver: row.dataset.defaultReceiver === "true",
+        targetLocked: row.dataset.targetLocked === "true",
+        lookupState: serializeFeeSplitLookupState(row),
+      }))
+      .filter((row) => !implicitCreatorShare || !row.defaultReceiver),
   };
+}
+
+const SUPPORTED_SOCIAL_RECIPIENT_TYPES = ["github", "twitter", "x", "kick", "tiktok"];
+
+function normalizeRecipientType(type, { allowAgent = false } = {}) {
+  const normalized = String(type || "").trim().toLowerCase();
+  if (allowAgent && normalized === "agent") return "agent";
+  if (normalized === "wallet") return "wallet";
+  if (normalized === "x") return "twitter";
+  return SUPPORTED_SOCIAL_RECIPIENT_TYPES.includes(normalized) ? normalized : "wallet";
+}
+
+function launchpadSupportsExtendedSocialRecipients(launchpad = getLaunchpad()) {
+  return normalizeLaunchpad(launchpad) === "bagsapp";
+}
+
+function supportedRecipientTypesForLaunchpad(launchpad = getLaunchpad(), { allowAgent = false } = {}) {
+  const types = ["wallet", "github"];
+  if (launchpadSupportsExtendedSocialRecipients(launchpad)) {
+    types.push("twitter", "kick", "tiktok");
+  }
+  if (allowAgent) {
+    types.unshift("agent");
+  }
+  return types;
+}
+
+function isRecipientTypeSupportedForLaunchpad(type, launchpad = getLaunchpad(), { allowAgent = false } = {}) {
+  return supportedRecipientTypesForLaunchpad(launchpad, { allowAgent }).includes(normalizeRecipientType(type, { allowAgent }));
+}
+
+function recipientTypeTabsMarkup() {
+  return ["wallet", "github", "twitter", "kick", "tiktok"]
+    .map((type) => `
+      <button
+        type="button"
+        class="recipient-type-tab"
+        data-type="${type}"
+        title="${escapeHTML(recipientTypeLabel(type))}"
+        aria-label="${escapeHTML(recipientTypeLabel(type))}"
+      >
+        ${recipientTypeIconMarkup(type)}
+        <span class="recipient-type-tab-label">${escapeHTML(recipientTypeLabel(type))}</span>
+      </button>
+    `)
+    .join("");
+}
+
+function syncRecipientTypeTabVisibility(row) {
+  if (!row) return;
+  row.querySelectorAll(".recipient-type-tab").forEach((button) => {
+    if (!button.dataset.type) return;
+    const allowed = isRecipientTypeSupportedForLaunchpad(button.dataset.type, getLaunchpad(), {
+      allowAgent: row.dataset.locked === "true",
+    });
+    button.hidden = !allowed && button.dataset.type !== row.dataset.type;
+  });
+}
+
+function isSocialRecipientType(type) {
+  return SUPPORTED_SOCIAL_RECIPIENT_TYPES.includes(normalizeRecipientType(type));
+}
+
+function recipientTypeLabel(type) {
+  switch (normalizeRecipientType(type)) {
+    case "github":
+      return "GitHub";
+    case "twitter":
+    case "x":
+      return "X";
+    case "kick":
+      return "Kick";
+    case "tiktok":
+      return "TikTok";
+    default:
+      return "Wallet";
+  }
+}
+
+function recipientTypeIconSrc(type) {
+  switch (normalizeRecipientType(type)) {
+    case "github":
+      return "/recipient-github.png";
+    case "twitter":
+    case "x":
+      return "/recipient-x.png";
+    case "kick":
+      return "/recipient-kick.png";
+    case "tiktok":
+      return "/recipient-tiktok.png";
+    default:
+      return "/recipient-wallet.png";
+  }
+}
+
+function recipientTypeIconMarkup(type) {
+  const normalized = normalizeRecipientType(type);
+  return `<span class="recipient-platform-icon recipient-platform-icon-${normalized}" aria-hidden="true"><img class="recipient-platform-icon-image" src="${recipientTypeIconSrc(normalized)}" alt=""></span>`;
+}
+
+function recipientTargetPlaceholder(type) {
+  switch (normalizeRecipientType(type)) {
+    case "github":
+      return "GitHub username or user id";
+    case "twitter":
+    case "x":
+      return "X username";
+    case "kick":
+      return "Kick username";
+    case "tiktok":
+      return "TikTok username";
+    default:
+      return "Wallet address";
+  }
+}
+
+function recipientDisplayValueFromEntry(entry) {
+  if (!entry) return "";
+  return isSocialRecipientType(entry.type)
+    ? String(entry.githubUsername || entry.githubUserId || "").trim().replace(/^@+/, "")
+    : String(entry.address || "").trim();
+}
+
+function isBagsFeeSplitLaunchpad(launchpad = getLaunchpad()) {
+  return normalizeLaunchpad(launchpad) === "bagsapp";
+}
+
+function isPumpFeeSplitLaunchpad(launchpad = getLaunchpad()) {
+  return normalizeLaunchpad(launchpad) === "pump";
+}
+
+function usesImplicitBagsCreatorShareMode(mode = getMode(), launchpad = getLaunchpad()) {
+  return isBagsFeeSplitLaunchpad(launchpad) && String(mode || "").trim().startsWith("bags-");
+}
+
+function usesImplicitPumpCreatorShareMode(mode = getMode(), launchpad = getLaunchpad()) {
+  return isPumpFeeSplitLaunchpad(launchpad) && normalizeLaunchMode(mode) === "regular";
+}
+
+function usesImplicitCreatorShareMode(mode = getMode(), launchpad = getLaunchpad()) {
+  return usesImplicitBagsCreatorShareMode(mode, launchpad) || usesImplicitPumpCreatorShareMode(mode, launchpad);
+}
+
+function nextFeeSplitRowId() {
+  feeSplitRowSerial += 1;
+  return `fee-split-row-${feeSplitRowSerial}`;
+}
+
+function getFeeSplitRowState(row) {
+  if (!row) return null;
+  return bagsFeeSplitLookupState.get(String(row.dataset.rowId || "").trim()) || null;
+}
+
+function clearFeeSplitRowLookupTimer(rowId) {
+  const activeTimer = bagsFeeSplitLookupTimers.get(rowId);
+  if (activeTimer) {
+    clearTimeout(activeTimer);
+    bagsFeeSplitLookupTimers.delete(rowId);
+  }
+}
+
+function clearFeeSplitRowState(row) {
+  if (!row) return;
+  const rowId = String(row.dataset.rowId || "").trim();
+  if (!rowId) return;
+  clearFeeSplitRowLookupTimer(rowId);
+  bagsFeeSplitLookupState.delete(rowId);
+  delete row.dataset.validationState;
+}
+
+function normalizeFeeSplitLookupState(value) {
+  if (!value || typeof value !== "object") return null;
+  const status = String(value.status || "").trim();
+  const rawLookup = value.lookup && typeof value.lookup === "object" ? value.lookup : {};
+  const normalized = {
+    status: ["idle", "checking", "valid", "invalid"].includes(status) ? status : "idle",
+    key: String(value.key || rawLookup.cacheKey || "").trim(),
+    lookup: {
+      provider: String(rawLookup.provider || "").trim(),
+      username: String(rawLookup.username || "").trim(),
+      githubUserId: String(rawLookup.githubUserId || "").trim(),
+      lookupTarget: String(rawLookup.lookupTarget || "").trim(),
+      cacheKey: String(rawLookup.cacheKey || "").trim(),
+      wallet: String(rawLookup.wallet || "").trim(),
+      resolvedUsername: String(rawLookup.resolvedUsername || "").trim(),
+      error: String(rawLookup.error || "").trim(),
+      found: Boolean(rawLookup.found),
+      notFound: Boolean(rawLookup.notFound),
+    },
+    wallet: String(value.wallet || rawLookup.wallet || "").trim(),
+    message: String(value.message || "").trim(),
+  };
+  return normalized.key || normalized.wallet || normalized.message ? normalized : null;
+}
+
+function serializeFeeSplitLookupState(row) {
+  return normalizeFeeSplitLookupState(getFeeSplitRowState(row));
+}
+
+function restoreFeeSplitLookupState(row, value) {
+  if (!row) return;
+  const rowId = String(row.dataset.rowId || "").trim();
+  if (!rowId) return;
+  const normalized = normalizeFeeSplitLookupState(value);
+  if (!normalized) return;
+  bagsFeeSplitLookupState.set(rowId, normalized);
+  if (normalized.key) {
+    bagsFeeSplitLookupCache.set(normalized.key, normalized);
+  }
+}
+
+function validateFeeSplitSocialTarget(type, value, { githubUserId = "" } = {}) {
+  const normalizedType = normalizeRecipientType(type);
+  const rawValue = String(value || "").trim();
+  if (!isSocialRecipientType(normalizedType)) {
+    return {
+      valid: true,
+      empty: !rawValue,
+      username: "",
+      githubUserId: "",
+      lookupTarget: "",
+      error: "",
+    };
+  }
+  const providerLabel = recipientTypeLabel(normalizedType);
+  if (normalizedType === "github") {
+    const parsedGithubTarget = parseGithubRecipientTarget(rawValue);
+    const resolvedGithubUserId = String(githubUserId || parsedGithubTarget.githubUserId || "").trim();
+    if (resolvedGithubUserId && !parsedGithubTarget.githubUsername) {
+      return {
+        valid: true,
+        empty: false,
+        username: "",
+        githubUserId: resolvedGithubUserId,
+        lookupTarget: resolvedGithubUserId,
+        error: "",
+      };
+    }
+    const username = parsedGithubTarget.githubUsername;
+    if (!username) {
+      return {
+        valid: false,
+        empty: true,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "",
+      };
+    }
+    if (/\s/.test(username)) {
+      return { valid: false, empty: false, username: "", githubUserId: "", lookupTarget: "", error: "GitHub usernames cannot contain spaces." };
+    }
+    if (username.length > 39) {
+      return { valid: false, empty: false, username: "", githubUserId: "", lookupTarget: "", error: "GitHub usernames can be at most 39 characters." };
+    }
+    if (!/^[A-Za-z0-9-]+$/.test(username)) {
+      return { valid: false, empty: false, username: "", githubUserId: "", lookupTarget: "", error: "GitHub usernames can only use letters, numbers, and hyphens." };
+    }
+    if (username.startsWith("-") || username.endsWith("-")) {
+      return { valid: false, empty: false, username: "", githubUserId: "", lookupTarget: "", error: "GitHub usernames cannot start or end with a hyphen." };
+    }
+    if (username.includes("--")) {
+      return { valid: false, empty: false, username: "", githubUserId: "", lookupTarget: "", error: "GitHub usernames cannot contain consecutive hyphens." };
+    }
+    return {
+      valid: true,
+      empty: false,
+      username,
+      githubUserId: "",
+      lookupTarget: username,
+      error: "",
+    };
+  }
+  const username = rawValue.replace(/^@+/, "");
+  if (!username) {
+    return {
+      valid: false,
+      empty: true,
+      username: "",
+      githubUserId: "",
+      lookupTarget: "",
+      error: "",
+    };
+  }
+  if (/\s/.test(username)) {
+    return {
+      valid: false,
+      empty: false,
+      username: "",
+      githubUserId: "",
+      lookupTarget: "",
+      error: `${providerLabel} usernames cannot contain spaces.`,
+    };
+  }
+  if (normalizedType === "twitter") {
+    if (username.length < 4 || username.length > 15) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "X usernames must be between 4 and 15 characters.",
+      };
+    }
+    if (!/^[A-Za-z0-9_]+$/.test(username)) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "X usernames can only use letters, numbers, and underscores.",
+      };
+    }
+  } else if (normalizedType === "kick") {
+    if (username.length < 4 || username.length > 24) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "Kick usernames must be between 4 and 24 characters.",
+      };
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(username)) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "Kick usernames can only use letters, numbers, hyphens, and underscores.",
+      };
+    }
+  } else if (normalizedType === "tiktok") {
+    if (username.length < 2 || username.length > 24) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "TikTok usernames must be between 2 and 24 characters.",
+      };
+    }
+    if (!/^[A-Za-z0-9._]+$/.test(username)) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "TikTok usernames can only use letters, numbers, periods, and underscores.",
+      };
+    }
+    if (/^[._]|[._]$/.test(username)) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "TikTok usernames cannot start or end with a period or underscore.",
+      };
+    }
+    if (username.includes("..")) {
+      return {
+        valid: false,
+        empty: false,
+        username: "",
+        githubUserId: "",
+        lookupTarget: "",
+        error: "TikTok usernames cannot contain consecutive periods.",
+      };
+    }
+  }
+  return {
+    valid: true,
+    empty: false,
+    username,
+    githubUserId: "",
+    lookupTarget: username,
+    error: "",
+  };
+}
+
+function buildFeeSplitLookupDescriptor(row) {
+  if (!row) return null;
+  const type = normalizeRecipientType(row.dataset.type);
+  if (!isSocialRecipientType(type)) return null;
+  const value = String(row.querySelector(".recipient-target")?.value || "").trim();
+  const githubUserIdFromDataset = String(row.dataset.githubUserId || "").trim();
+  const validation = validateFeeSplitSocialTarget(type, value, { githubUserId: githubUserIdFromDataset });
+  if (!validation.valid || validation.empty || !validation.lookupTarget) return null;
+  return {
+    provider: type,
+    username: validation.username,
+    githubUserId: validation.githubUserId,
+    lookupTarget: validation.lookupTarget,
+    cacheKey: `${type}:${validation.githubUserId}:${validation.username}`,
+  };
+}
+
+function describeFeeSplitLookupFailure(descriptor, lookup = {}) {
+  const providerLabel = recipientTypeLabel(descriptor.provider);
+  const targetLabel = descriptor.provider === "github" && descriptor.githubUserId
+    ? `GitHub id ${descriptor.githubUserId}`
+    : `${providerLabel} @${descriptor.username || descriptor.lookupTarget}`;
+  if (lookup && lookup.notFound) {
+    return `${targetLabel} is not linked to a Bags launch wallet.`;
+  }
+  return String(lookup && lookup.error || "").trim() || `${targetLabel} could not be validated with Bags.`;
+}
+
+function syncBagsFeeSplitSummary() {
+  if (!bagsFeeSplitSummary) return;
+  const isBags = isBagsFeeSplitLaunchpad();
+  const isImplicitPump = usesImplicitPumpCreatorShareMode();
+  const showSummary = isBags || isImplicitPump;
+  bagsFeeSplitSummary.hidden = !showSummary;
+  if (!showSummary) return;
+  const rows = getFeeSplitRows();
+  const total = rows.reduce((sum, row) => sum + (Number(row.querySelector(".recipient-share")?.value || 0) || 0), 0);
+  const creatorShare = Math.max(0, Number((100 - total).toFixed(2)));
+  const shared = Math.max(0, total);
+  if (feeSplitSummaryPrimaryLabel) {
+    feeSplitSummaryPrimaryLabel.textContent = isBags ? "You Keep" : "Creator Share";
+  }
+  if (feeSplitSummarySecondaryLabel) {
+    feeSplitSummarySecondaryLabel.textContent = isBags ? "Others Get" : "Recipients Get";
+  }
+  if (bagsFeeSplitCreatorShare) {
+    bagsFeeSplitCreatorShare.textContent = `${creatorShare.toFixed(2).replace(/\.00$/, "")}%`;
+  }
+  if (bagsFeeSplitSharedShare) {
+    bagsFeeSplitSharedShare.textContent = `${shared.toFixed(2).replace(/\.00$/, "")}%`;
+  }
+  if (!isBags) return;
+  const socialRows = rows.filter((row) => isSocialRecipientType(row.dataset.type));
+  const currentState = socialRows.reduce((accumulator, row) => {
+    const targetValidation = validateFeeSplitSocialTarget(
+      row.dataset.type,
+      String(row.querySelector(".recipient-target")?.value || "").trim(),
+      { githubUserId: String(row.dataset.githubUserId || "").trim() },
+    );
+    const descriptor = buildFeeSplitLookupDescriptor(row);
+    const state = getFeeSplitRowState(row);
+    if (!targetValidation.empty && targetValidation.error) {
+      accumulator.invalid += 1;
+      return accumulator;
+    }
+    if (!descriptor) {
+      accumulator.pending += 1;
+      return accumulator;
+    }
+    if (!state || state.key !== descriptor.cacheKey) {
+      accumulator.pending += 1;
+      return accumulator;
+    }
+    if (state.status === "valid") accumulator.valid += 1;
+    else if (state.status === "invalid") accumulator.invalid += 1;
+    else accumulator.pending += 1;
+    return accumulator;
+  }, { valid: 0, invalid: 0, pending: 0 });
+  if (bagsFeeSplitValidationCopy) {
+    if (socialRows.length === 0) {
+      bagsFeeSplitValidationCopy.textContent = "Raw usernames are checked against Bags before deploy.";
+    } else if (currentState.invalid > 0) {
+      bagsFeeSplitValidationCopy.textContent = `${currentState.invalid} recipient${currentState.invalid === 1 ? "" : "s"} need attention before deploy.`;
+    } else if (currentState.pending > 0) {
+      bagsFeeSplitValidationCopy.textContent = `${currentState.valid} validated, ${currentState.pending} still checking.`;
+    } else {
+      bagsFeeSplitValidationCopy.textContent = `${currentState.valid} social recipient${currentState.valid === 1 ? "" : "s"} validated with Bags.`;
+    }
+  }
+}
+
+function removeImplicitCreatorRows() {
+  if (!usesImplicitCreatorShareMode() || !feeSplitList) return false;
+  const defaultRows = getFeeSplitRows().filter((row) => row.dataset.defaultReceiver === "true");
+  if (defaultRows.length === 0) return false;
+  defaultRows.forEach((row) => {
+    clearFeeSplitRowState(row);
+    row.remove();
+  });
+  return true;
+}
+
+function syncFeeSplitModalPresentation() {
+  const removedImplicitCreatorRows = removeImplicitCreatorRows();
+  const isBags = isBagsFeeSplitLaunchpad();
+  const isImplicitPump = usesImplicitPumpCreatorShareMode();
+  const usesCompactPresentation = isBags || isImplicitPump;
+  const feeSplitModalShell = feeSplitModal ? feeSplitModal.querySelector(".fee-split-modal") : null;
+  if (feeSplitModalShell) {
+    feeSplitModalShell.classList.toggle("compact-fee-split-modal", usesCompactPresentation);
+    feeSplitModalShell.classList.toggle("bags-fee-split-modal", isBags);
+  }
+  syncFeeSplitPillSummary();
+  if (feeSplitIntro) {
+    feeSplitIntro.hidden = usesCompactPresentation;
+    feeSplitIntro.textContent = usesCompactPresentation
+      ? ""
+      : "Wallet addresses or GitHub usernames. Total must equal 100%.";
+  }
+  if (feeSplitRecipientsCopy) {
+    feeSplitRecipientsCopy.hidden = usesCompactPresentation;
+    feeSplitRecipientsCopy.textContent = usesCompactPresentation
+      ? ""
+      : "Creator rewards will be routed using this split after launch.";
+  }
+  if (feeSplitAdd) feeSplitAdd.textContent = isBags ? "+ Add claimer" : "+ Add recipient";
+  getFeeSplitRows().forEach((row) => {
+    row.classList.toggle("bags-fee-split-row", isBags);
+  });
+  if (removedImplicitCreatorRows) {
+    syncFeeSplitTotals();
+    setStoredFeeSplitDraft(serializeFeeSplitDraft());
+  }
+  syncCompactFeeSplitListViewport();
+  syncBagsFeeSplitSummary();
+}
+
+function syncCompactFeeSplitListViewport() {
+  if (!feeSplitList) return;
+  const usesCompactPresentation = usesImplicitCreatorShareMode();
+  if (!usesCompactPresentation) {
+    feeSplitList.classList.remove("bags-fee-split-list-scrollable");
+    feeSplitList.style.maxHeight = "";
+    feeSplitList.style.overflowY = "";
+    return;
+  }
+  const rows = getFeeSplitRows();
+  if (!rows.length) {
+    feeSplitList.classList.remove("bags-fee-split-list-scrollable");
+    feeSplitList.style.maxHeight = "";
+    feeSplitList.style.overflowY = "";
+    return;
+  }
+  if (!feeSplitModal || feeSplitModal.hidden || feeSplitList.getBoundingClientRect().width === 0) return;
+  const listStyles = window.getComputedStyle(feeSplitList);
+  const rowGap = Number.parseFloat(listStyles.rowGap || listStyles.gap || "0") || 0;
+  const visibleRows = rows.slice(0, BAGS_FEE_SPLIT_VISIBLE_CARD_COUNT);
+  const maxHeight = visibleRows.reduce((sum, row) => sum + row.getBoundingClientRect().height, 0)
+    + Math.max(visibleRows.length - 1, 0) * rowGap
+    + BAGS_FEE_SPLIT_VIEWPORT_BUFFER_PX;
+  feeSplitList.style.maxHeight = `${Math.ceil(maxHeight)}px`;
+  const shouldScroll = rows.length > BAGS_FEE_SPLIT_VISIBLE_CARD_COUNT;
+  feeSplitList.classList.toggle("bags-fee-split-list-scrollable", shouldScroll);
+  feeSplitList.style.overflowY = shouldScroll ? "auto" : "hidden";
+}
+
+function syncAgentSplitListViewport() {
+  if (!agentSplitList) return;
+  const rows = getAgentSplitRows();
+  if (!rows.length) {
+    agentSplitList.classList.remove("bags-fee-split-list-scrollable");
+    agentSplitList.style.maxHeight = "";
+    agentSplitList.style.overflowY = "";
+    return;
+  }
+  if (!agentSplitModal || agentSplitModal.hidden || agentSplitList.getBoundingClientRect().width === 0) return;
+  const listStyles = window.getComputedStyle(agentSplitList);
+  const rowGap = Number.parseFloat(listStyles.rowGap || listStyles.gap || "0") || 0;
+  const visibleRows = rows.slice(0, BAGS_FEE_SPLIT_VISIBLE_CARD_COUNT);
+  const maxHeight = visibleRows.reduce((sum, row) => sum + row.getBoundingClientRect().height, 0)
+    + Math.max(visibleRows.length - 1, 0) * rowGap
+    + BAGS_FEE_SPLIT_VIEWPORT_BUFFER_PX;
+  agentSplitList.style.maxHeight = `${Math.ceil(maxHeight)}px`;
+  const shouldScroll = rows.length > BAGS_FEE_SPLIT_VISIBLE_CARD_COUNT;
+  agentSplitList.classList.toggle("bags-fee-split-list-scrollable", shouldScroll);
+  agentSplitList.style.overflowY = shouldScroll ? "auto" : "hidden";
+}
+
+async function copyBagsResolvedWallet(button) {
+  const value = String(button?.dataset.copyValue || "").trim();
+  if (!value) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const probe = document.createElement("textarea");
+      probe.value = value;
+      probe.setAttribute("readonly", "");
+      probe.style.position = "absolute";
+      probe.style.left = "-9999px";
+      document.body.appendChild(probe);
+      probe.select();
+      document.execCommand("copy");
+      probe.remove();
+    }
+    if (button._copyFeedbackTimer) {
+      window.clearTimeout(button._copyFeedbackTimer);
+    }
+    button.classList.remove("is-copied");
+    void button.offsetWidth;
+    button.classList.add("is-copied");
+    button.title = "Copied";
+    button.setAttribute("aria-label", "Copied resolved wallet");
+    button._copyFeedbackTimer = window.setTimeout(() => {
+      button.classList.remove("is-copied");
+      button.title = "Copy resolved wallet";
+      button.setAttribute("aria-label", "Copy resolved wallet");
+      button._copyFeedbackTimer = null;
+    }, 1200);
+  } catch {}
+}
+
+function updateFeeSplitRowValidationUi(row) {
+  if (!row) return;
+  const isBags = isBagsFeeSplitLaunchpad();
+  const isWallet = normalizeRecipientType(row.dataset.type) === "wallet";
+  const targetValue = String(row.querySelector(".recipient-target")?.value || "").trim();
+  const providerChip = row.querySelector(".bags-fee-row-chip");
+  const statusChip = row.querySelector(".bags-fee-row-status");
+  const meta = row.querySelector(".bags-fee-row-meta");
+  const copyButton = row.querySelector(".bags-fee-row-copy");
+  if (providerChip) {
+    providerChip.hidden = false;
+    providerChip.innerHTML = `${recipientTypeIconMarkup(row.dataset.type)}<span class="bags-fee-row-chip-label">${escapeHTML(recipientTypeLabel(row.dataset.type))}</span>`;
+    providerChip.title = recipientTypeLabel(row.dataset.type);
+  }
+  if (meta) meta.hidden = !isBags || isWallet;
+  if (!isBags) {
+    delete row.dataset.validationState;
+    if (statusChip) statusChip.textContent = "";
+    if (copyButton) {
+      copyButton.hidden = true;
+      copyButton.dataset.copyValue = "";
+      copyButton.classList.remove("is-copied");
+    }
+    syncCompactFeeSplitListViewport();
+    return;
+  }
+  const descriptor = buildFeeSplitLookupDescriptor(row);
+  const targetValidation = validateFeeSplitSocialTarget(row.dataset.type, targetValue, {
+    githubUserId: String(row.dataset.githubUserId || "").trim(),
+  });
+  const state = getFeeSplitRowState(row);
+  let status = "idle";
+  let copyValue = "";
+  let message = row.dataset.type === "github"
+      ? "GitHub username or id"
+      : `${recipientTypeLabel(row.dataset.type)} username`;
+  if (isWallet) {
+    row.dataset.validationState = "idle";
+    if (statusChip) {
+      statusChip.textContent = "";
+      statusChip.title = "";
+    }
+    if (copyButton) {
+      copyButton.hidden = true;
+      copyButton.dataset.copyValue = "";
+      copyButton.classList.remove("is-copied");
+    }
+    syncCompactFeeSplitListViewport();
+    syncBagsFeeSplitSummary();
+    return;
+  }
+  if (!targetValidation.empty && targetValidation.error) {
+    status = "invalid";
+    message = targetValidation.error;
+  } else if (descriptor && state && state.key === descriptor.cacheKey) {
+    status = state.status || "idle";
+    if (status === "checking") {
+      message = "Checking...";
+    } else if (status === "valid") {
+      if (providerChip) providerChip.hidden = true;
+      message = state.wallet ? `Resolved to ${shortenAddress(state.wallet)}` : "Validated with Bags.";
+      copyValue = state.wallet || "";
+    } else if (status === "invalid") {
+      message = state.message || describeFeeSplitLookupFailure(descriptor, state.lookup || {});
+    }
+  } else if (descriptor) {
+    message = "Pending validation";
+  }
+  row.dataset.validationState = status;
+  if (statusChip) {
+    statusChip.textContent = message;
+    statusChip.title = message;
+  }
+  if (copyButton) {
+    copyButton.hidden = !copyValue;
+    copyButton.dataset.copyValue = copyValue;
+    if (!copyValue) {
+      copyButton.classList.remove("is-copied");
+      copyButton.title = "Copy resolved wallet";
+      copyButton.setAttribute("aria-label", "Copy resolved wallet");
+    }
+  }
+  syncCompactFeeSplitListViewport();
+  syncBagsFeeSplitSummary();
+}
+
+async function runFeeSplitLookup(row, descriptor) {
+  if (!row || !descriptor || !isBagsFeeSplitLaunchpad()) return;
+  const rowId = String(row.dataset.rowId || "").trim();
+  if (!rowId) return;
+  const setState = (nextState) => {
+    bagsFeeSplitLookupState.set(rowId, nextState);
+    updateFeeSplitRowValidationUi(row);
+  };
+  if (bagsFeeSplitLookupCache.has(descriptor.cacheKey)) {
+    setState(bagsFeeSplitLookupCache.get(descriptor.cacheKey));
+    return;
+  }
+  setState({ status: "checking", key: descriptor.cacheKey, lookup: descriptor, wallet: "", message: "Checking Bags wallet..." });
+  const url = new URL("/api/bags/fee-recipient-lookup", window.location.origin);
+  url.searchParams.set("provider", descriptor.provider);
+  if (descriptor.username) url.searchParams.set("username", descriptor.username);
+  if (descriptor.githubUserId) url.searchParams.set("githubUserId", descriptor.githubUserId);
+  try {
+    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "Failed to validate Bags recipient.");
+    }
+    const lookup = payload.lookup || {};
+    const nextState = lookup && lookup.found
+      ? {
+        status: "valid",
+        key: descriptor.cacheKey,
+        lookup,
+        wallet: String(lookup.wallet || "").trim(),
+        message: String(lookup.wallet || "").trim(),
+      }
+      : {
+        status: "invalid",
+        key: descriptor.cacheKey,
+        lookup,
+        wallet: "",
+        message: describeFeeSplitLookupFailure(descriptor, lookup),
+      };
+    bagsFeeSplitLookupCache.set(descriptor.cacheKey, nextState);
+    if (row.isConnected && row.dataset.rowId === rowId) {
+      const currentDescriptor = buildFeeSplitLookupDescriptor(row);
+      if (currentDescriptor && currentDescriptor.cacheKey === descriptor.cacheKey) {
+        setState(nextState);
+      }
+    }
+  } catch (error) {
+    const nextState = {
+      status: "invalid",
+      key: descriptor.cacheKey,
+      lookup: descriptor,
+      wallet: "",
+      message: error && error.message ? error.message : "Failed to validate Bags recipient.",
+    };
+    if (row.isConnected && row.dataset.rowId === rowId) {
+      const currentDescriptor = buildFeeSplitLookupDescriptor(row);
+      if (currentDescriptor && currentDescriptor.cacheKey === descriptor.cacheKey) {
+        setState(nextState);
+      }
+    }
+  }
+}
+
+function scheduleFeeSplitLookup(row, { immediate = false } = {}) {
+  if (!row) return;
+  const rowId = String(row.dataset.rowId || "").trim();
+  if (!rowId) return;
+  clearFeeSplitRowLookupTimer(rowId);
+  if (!isBagsFeeSplitLaunchpad()) {
+    clearFeeSplitRowState(row);
+    updateFeeSplitRowValidationUi(row);
+    return;
+  }
+  const targetValidation = validateFeeSplitSocialTarget(
+    row.dataset.type,
+    String(row.querySelector(".recipient-target")?.value || "").trim(),
+    { githubUserId: String(row.dataset.githubUserId || "").trim() },
+  );
+  if (!targetValidation.valid || targetValidation.empty) {
+    bagsFeeSplitLookupState.delete(rowId);
+    updateFeeSplitRowValidationUi(row);
+    return;
+  }
+  const descriptor = buildFeeSplitLookupDescriptor(row);
+  if (!descriptor) {
+    bagsFeeSplitLookupState.delete(rowId);
+    updateFeeSplitRowValidationUi(row);
+    return;
+  }
+  if (bagsFeeSplitLookupCache.has(descriptor.cacheKey)) {
+    bagsFeeSplitLookupState.set(rowId, bagsFeeSplitLookupCache.get(descriptor.cacheKey));
+    updateFeeSplitRowValidationUi(row);
+    return;
+  }
+  bagsFeeSplitLookupState.set(rowId, {
+    status: "checking",
+    key: descriptor.cacheKey,
+    lookup: descriptor,
+    wallet: "",
+    message: "Checking Bags wallet...",
+  });
+  updateFeeSplitRowValidationUi(row);
+  const timer = window.setTimeout(() => {
+    bagsFeeSplitLookupTimers.delete(rowId);
+    runFeeSplitLookup(row, descriptor);
+  }, immediate ? 0 : 350);
+  bagsFeeSplitLookupTimers.set(rowId, timer);
 }
 
 function normalizeFeeSplitDraft(value) {
   const rows = Array.isArray(value && value.rows)
     ? value.rows.map((entry) => ({
-      type: entry && entry.type === "github" ? "github" : "wallet",
+      type: normalizeRecipientType(entry && entry.type),
       value: String(entry && entry.value || "").trim(),
       githubUserId: String(entry && entry.githubUserId || "").trim(),
       sharePercent: normalizeDecimalInput(entry && entry.sharePercent || "", 2),
       defaultReceiver: Boolean(entry && entry.defaultReceiver),
       targetLocked: Boolean(entry && entry.targetLocked),
+      lookupState: normalizeFeeSplitLookupState(entry && entry.lookupState),
     }))
     : [];
   return {
@@ -821,31 +1618,117 @@ function normalizeFeeSplitDraft(value) {
   };
 }
 
-function getStoredFeeSplitDraft() {
+function stripImplicitCreatorRowsFromFeeSplitDraftRows(rows, launchpad = currentFeeSplitDraftLaunchpad()) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const normalizedRows = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  if (normalizedLaunchpad !== "bagsapp" && normalizedLaunchpad !== "pump") {
+    return normalizedRows;
+  }
+  const deployerAddress = getDeployerFeeSplitAddress();
+  return normalizedRows.filter((row) => {
+    if (row.defaultReceiver) return false;
+    if (
+      normalizedLaunchpad === "pump"
+      && normalizeRecipientType(row.type) === "wallet"
+      && row.targetLocked
+      && deployerAddress
+      && String(row.value || "").trim() === deployerAddress
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function normalizeFeeSplitDraftForLaunchpad(value, launchpad = currentFeeSplitDraftLaunchpad()) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const draft = normalizeFeeSplitDraft(value);
+  if (normalizedLaunchpad !== "bagsapp" && normalizedLaunchpad !== "pump") {
+    return draft;
+  }
+  const rows = stripImplicitCreatorRowsFromFeeSplitDraftRows(draft.rows, normalizedLaunchpad);
+  return normalizeFeeSplitDraft({
+    enabled: normalizedLaunchpad === "pump" ? (draft.enabled && rows.length > 0) : draft.enabled,
+    suppressDefaultRow: false,
+    rows,
+  });
+}
+
+function currentFeeSplitDraftLaunchpad(launchpad = activeFeeSplitDraftLaunchpad || getLaunchpad()) {
+  return normalizeLaunchpad(launchpad);
+}
+
+function feeSplitDraftStorageKey(launchpad = currentFeeSplitDraftLaunchpad()) {
+  return `launchdeck.feeSplitDraft.${normalizeLaunchpad(launchpad)}.v2`;
+}
+
+function feeSplitDraftSessionStorageKey(launchpad = currentFeeSplitDraftLaunchpad()) {
+  return `launchdeck.feeSplitDraft.${normalizeLaunchpad(launchpad)}.session.v2`;
+}
+
+function getStoredFeeSplitDraft(launchpad = currentFeeSplitDraftLaunchpad()) {
   try {
-    const raw = window.localStorage.getItem(FEE_SPLIT_DRAFT_STORAGE_KEY);
-    if (!raw) return null;
-    return normalizeFeeSplitDraft(JSON.parse(raw));
+    const sessionKey = feeSplitDraftSessionStorageKey(launchpad);
+    const localKey = feeSplitDraftStorageKey(launchpad);
+    const keys = [
+      { storage: window.sessionStorage, key: sessionKey },
+      { storage: window.localStorage, key: localKey },
+      { storage: window.localStorage, key: FEE_SPLIT_DRAFT_STORAGE_KEY },
+    ];
+    for (const key of keys) {
+      const raw = key.storage.getItem(key.key);
+      if (!raw) continue;
+      const normalized = normalizeFeeSplitDraftForLaunchpad(JSON.parse(raw), launchpad);
+      if (key.key !== sessionKey) {
+        window.sessionStorage.setItem(sessionKey, JSON.stringify(normalized));
+      }
+      if (key.key !== localKey) {
+        window.localStorage.setItem(localKey, JSON.stringify(normalized));
+      }
+      return normalized;
+    }
+    return null;
   } catch (_error) {
     return null;
   }
 }
 
-function setStoredFeeSplitDraft(value) {
+function setStoredFeeSplitDraft(value, { launchpad = currentFeeSplitDraftLaunchpad() } = {}) {
+  if (suspendFeeSplitDraftPersistence) return;
   try {
-    const normalized = normalizeFeeSplitDraft(value);
+    const normalized = normalizeFeeSplitDraftForLaunchpad(value, launchpad);
+    const key = feeSplitDraftStorageKey(launchpad);
+    const sessionKey = feeSplitDraftSessionStorageKey(launchpad);
     if (!normalized.enabled && normalized.rows.length === 0) {
-      window.localStorage.removeItem(FEE_SPLIT_DRAFT_STORAGE_KEY);
+      window.sessionStorage.removeItem(sessionKey);
+      window.localStorage.removeItem(key);
       return;
     }
-    window.localStorage.setItem(FEE_SPLIT_DRAFT_STORAGE_KEY, JSON.stringify(normalized));
+    window.sessionStorage.setItem(sessionKey, JSON.stringify(normalized));
+    window.localStorage.setItem(key, JSON.stringify(normalized));
   } catch (_error) {
     // Ignore storage failures and keep fee split controls functional.
   }
 }
 
+function withSuspendedFeeSplitDraftPersistence(callback) {
+  const previous = suspendFeeSplitDraftPersistence;
+  suspendFeeSplitDraftPersistence = true;
+  try {
+    return callback();
+  } finally {
+    suspendFeeSplitDraftPersistence = previous;
+  }
+}
+
+function restoreFeeSplitDraftForLaunchpad(launchpad) {
+  activeFeeSplitDraftLaunchpad = normalizeLaunchpad(launchpad);
+  applyFeeSplitDraft(getStoredFeeSplitDraft(activeFeeSplitDraftLaunchpad), { persist: false });
+  updateFeeSplitVisibility();
+}
+
 function applyFeeSplitDraft(value, { persist = false } = {}) {
-  const draft = normalizeFeeSplitDraft(value);
+  const draft = normalizeFeeSplitDraftForLaunchpad(value, currentFeeSplitDraftLaunchpad());
   if (feeSplitEnabled) feeSplitEnabled.checked = draft.enabled;
   if (feeSplitList) {
     if (draft.suppressDefaultRow) {
@@ -858,12 +1741,24 @@ function applyFeeSplitDraft(value, { persist = false } = {}) {
       feeSplitList.appendChild(createFeeSplitRow(entry));
     });
   }
-  if (draft.enabled) ensureFeeSplitDefaultRow();
+  if (draft.enabled && !usesImplicitCreatorShareMode()) ensureFeeSplitDefaultRow();
+  getFeeSplitRows().forEach((row) => {
+    updateFeeSplitRowValidationUi(row);
+    scheduleFeeSplitLookup(row, { immediate: true });
+  });
+  syncFeeSplitModalPresentation();
   syncFeeSplitTotals();
   if (persist) setStoredFeeSplitDraft(draft);
 }
 
 function feeSplitClearAllDraft() {
+  if (usesImplicitCreatorShareMode()) {
+    return normalizeFeeSplitDraft({
+      enabled: true,
+      suppressDefaultRow: false,
+      rows: [],
+    });
+  }
   const deployerAddress = latestWalletStatus && latestWalletStatus.wallet ? latestWalletStatus.wallet : "";
   return normalizeFeeSplitDraft({
     enabled: true,
@@ -918,6 +1813,7 @@ function serializeAgentSplitDraft() {
       locked: row.dataset.locked === "true",
       type: row.dataset.type || "wallet",
       value: row.querySelector(".recipient-target")?.value?.trim() || "",
+      githubUserId: row.dataset.githubUserId || "",
       sharePercent: row.querySelector(".recipient-share")?.value?.trim() || "",
       defaultReceiver: row.dataset.defaultReceiver === "true",
       targetLocked: row.dataset.targetLocked === "true",
@@ -929,8 +1825,9 @@ function normalizeAgentSplitDraft(value) {
   const rows = Array.isArray(value && value.rows)
     ? value.rows.map((entry) => ({
       locked: Boolean(entry && entry.locked),
-      type: entry && entry.type === "github" ? "github" : "wallet",
+      type: normalizeRecipientType(entry && entry.type, { allowAgent: true }),
       value: String(entry && entry.value || "").trim(),
+      githubUserId: String(entry && entry.githubUserId || "").trim(),
       sharePercent: normalizeDecimalInput(entry && entry.sharePercent || "", 2),
       defaultReceiver: Boolean(entry && entry.defaultReceiver),
       targetLocked: Boolean(entry && entry.targetLocked),
@@ -940,8 +1837,21 @@ function normalizeAgentSplitDraft(value) {
 }
 
 function buildAgentSplitDraftFromFeeSplitDraft(value) {
-  const draft = normalizeFeeSplitDraft(value);
+  const draft = normalizeFeeSplitDraftForLaunchpad(value, getLaunchpad());
+  const shouldSeedImplicitPumpCreator = usesImplicitPumpCreatorShareMode("regular", getLaunchpad());
   if (!draft.enabled && draft.rows.length === 0) {
+    if (shouldSeedImplicitPumpCreator) {
+      return normalizeAgentSplitDraft({
+        rows: [{
+          locked: true,
+          type: "wallet",
+          value: "",
+          sharePercent: "100",
+          defaultReceiver: false,
+          targetLocked: true,
+        }],
+      });
+    }
     return normalizeAgentSplitDraft({ rows: [] });
   }
   const defaultReceiverRow = draft.rows.find((row) => row.defaultReceiver);
@@ -949,13 +1859,29 @@ function buildAgentSplitDraftFromFeeSplitDraft(value) {
     .filter((row) => !row.defaultReceiver)
     .map((row) => ({
       locked: false,
-      type: row.type === "github" ? "github" : "wallet",
+      type: normalizeRecipientType(row.type),
       value: row.value,
+      githubUserId: row.githubUserId || "",
       sharePercent: row.sharePercent,
       defaultReceiver: false,
       targetLocked: Boolean(row.targetLocked),
     }));
+  const implicitCreatorSharePercent = !defaultReceiverRow && usesImplicitCreatorShareMode("regular", getLaunchpad())
+    ? formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(row.sharePercent) || 0), 0)))
+    : "";
   if (!defaultReceiverRow && carriedRows.length === 0) {
+    if (shouldSeedImplicitPumpCreator) {
+      return normalizeAgentSplitDraft({
+        rows: [{
+          locked: true,
+          type: "wallet",
+          value: "",
+          sharePercent: "100",
+          defaultReceiver: false,
+          targetLocked: true,
+        }],
+      });
+    }
     return normalizeAgentSplitDraft({ rows: [] });
   }
   return normalizeAgentSplitDraft({
@@ -964,7 +1890,9 @@ function buildAgentSplitDraftFromFeeSplitDraft(value) {
         locked: true,
         type: "wallet",
         value: "",
-        sharePercent: defaultReceiverRow ? defaultReceiverRow.sharePercent : (carriedRows.length > 0 ? "0" : ""),
+        sharePercent: defaultReceiverRow
+          ? defaultReceiverRow.sharePercent
+          : (carriedRows.length > 0 ? implicitCreatorSharePercent : ""),
         defaultReceiver: false,
         targetLocked: true,
       },
@@ -983,15 +1911,22 @@ function buildFeeSplitDraftFromAgentSplitDraft(value) {
   const carriedRows = draft.rows
     .filter((row) => !row.locked && row.type !== "agent")
     .map((row) => ({
-      type: row.type === "github" ? "github" : "wallet",
+      type: normalizeRecipientType(row.type),
       value: row.value,
-      githubUserId: "",
+      githubUserId: row.type === "github" ? (row.githubUserId || "") : "",
       sharePercent: row.sharePercent,
       defaultReceiver: false,
       targetLocked: Boolean(row.targetLocked),
     }));
   if ((!agentRow || !agentRow.sharePercent) && carriedRows.length === 0) {
     return normalizeFeeSplitDraft({ enabled: false, rows: [] });
+  }
+  if (usesImplicitPumpCreatorShareMode("regular", getLaunchpad())) {
+    return normalizeFeeSplitDraftForLaunchpad({
+      enabled: carriedRows.length > 0,
+      suppressDefaultRow: false,
+      rows: carriedRows,
+    }, getLaunchpad());
   }
   return normalizeFeeSplitDraft({
     enabled: carriedRows.length > 0 || Boolean(agentRow && agentRow.sharePercent),
@@ -1163,23 +2098,58 @@ function setImportedCreatorFeeState(value) {
   importedCreatorFeeState = normalizeImportedCreatorFeeState(value);
 }
 
-function buildFeeSplitDraftFromRecipients(recipients, { enabled = false } = {}) {
-  return {
-    enabled,
-    suppressDefaultRow: Array.isArray(recipients) && recipients.length > 0,
-    rows: Array.isArray(recipients)
-      ? recipients.map((entry) => ({
-        type: entry && entry.type === "github" ? "github" : "wallet",
-        value: entry && entry.type === "github"
-          ? String(entry.githubUsername || entry.githubUserId || "").trim().replace(/^@+/, "")
-          : String(entry && entry.address || "").trim(),
-        githubUserId: String(entry && entry.githubUserId || "").trim(),
-        sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
-        defaultReceiver: false,
-        targetLocked: false,
-      })).filter((entry) => entry.value || entry.sharePercent)
-      : [],
-  };
+function matchesImportedCreatorFeeRecipient(entry, creatorFee = importedCreatorFeeState) {
+  if (!entry) return false;
+  const normalizedCreatorFee = normalizeImportedCreatorFeeState(creatorFee);
+  const entryType = normalizeRecipientType(entry.type);
+  const entryValue = String(entry.value || "").trim();
+  if (!normalizedCreatorFee.mode) return false;
+  if (normalizedCreatorFee.mode === "deployer") {
+    const deployerAddress = getDeployerFeeSplitAddress();
+    return entryType === "wallet" && Boolean(deployerAddress) && entryValue === deployerAddress;
+  }
+  if (normalizedCreatorFee.mode === "wallet") {
+    return entryType === "wallet" && Boolean(normalizedCreatorFee.address) && entryValue === normalizedCreatorFee.address;
+  }
+  if (normalizedCreatorFee.mode === "github" && entryType === "github") {
+    const parsedTarget = parseGithubRecipientTarget(entryValue);
+    const entryGithubUserId = String(entry.githubUserId || parsedTarget.githubUserId || "").trim();
+    const entryGithubUsername = String(parsedTarget.githubUsername || "").trim();
+    return (
+      (normalizedCreatorFee.githubUserId && normalizedCreatorFee.githubUserId === entryGithubUserId)
+      || (normalizedCreatorFee.githubUsername && normalizedCreatorFee.githubUsername === entryGithubUsername)
+    );
+  }
+  return false;
+}
+
+function buildFeeSplitDraftFromRecipients(recipients, { enabled = false, launchpad = getLaunchpad(), creatorFee = importedCreatorFeeState } = {}) {
+  const normalizedLaunchpad = normalizeLaunchpad(launchpad);
+  const rows = Array.isArray(recipients)
+    ? recipients.map((entry) => ({
+      type: normalizeRecipientType(entry && entry.type),
+      value: recipientDisplayValueFromEntry(entry),
+      githubUserId: String(entry && entry.githubUserId || "").trim(),
+      sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
+      defaultReceiver: false,
+      targetLocked: false,
+    })).filter((entry) => entry.value || entry.sharePercent)
+    : [];
+  let importedCreatorCollapsed = false;
+  const filteredRows = normalizedLaunchpad === "pump"
+    ? rows.filter((entry) => {
+      if (!importedCreatorCollapsed && matchesImportedCreatorFeeRecipient(entry, creatorFee)) {
+        importedCreatorCollapsed = true;
+        return false;
+      }
+      return true;
+    })
+    : rows;
+  return normalizeFeeSplitDraftForLaunchpad({
+    enabled: normalizedLaunchpad === "pump" ? (enabled && filteredRows.length > 0) : enabled,
+    suppressDefaultRow: filteredRows.length > 0,
+    rows: filteredRows,
+  }, launchpad);
 }
 
 function buildAgentSplitDraftFromRecipients(recipients) {
@@ -1199,10 +2169,9 @@ function buildAgentSplitDraftFromRecipients(recipients) {
         }
         return {
           locked: false,
-          type: type === "github" ? "github" : "wallet",
-          value: type === "github"
-            ? String(entry && entry.githubUsername || "").trim().replace(/^@+/, "")
-            : String(entry && entry.address || "").trim(),
+          type: normalizeRecipientType(type),
+          value: recipientDisplayValueFromEntry(entry),
+          githubUserId: String(entry && entry.githubUserId || "").trim(),
           sharePercent: formatShareBpsAsPercent(entry && entry.shareBps),
           defaultReceiver: false,
           targetLocked: false,
@@ -1221,14 +2190,16 @@ function applyImportedRouteState({
   const nextLaunchpad = normalizeLaunchpad(launchpad);
   const feeRecipients = Array.isArray(feeSharingRecipients) ? feeSharingRecipients : [];
   const agentRecipients = Array.isArray(agentFeeRecipients) ? agentFeeRecipients : [];
+  setImportedCreatorFeeState(creatorFee || null);
   applyFeeSplitDraft(
     buildFeeSplitDraftFromRecipients(feeRecipients, {
       enabled: nextLaunchpad === "bagsapp" || feeRecipients.length > 0,
+      launchpad: nextLaunchpad,
+      creatorFee,
     }),
     { persist: false },
   );
   applyAgentSplitDraft(buildAgentSplitDraftFromRecipients(agentRecipients), { persist: false });
-  setImportedCreatorFeeState(creatorFee || null);
 }
 
 function normalizeDecimalInput(value, maxDecimals = 6) {
@@ -1384,6 +2355,8 @@ setReportsTerminalListWidth(getStoredReportsTerminalListWidth(), { persist: fals
 syncReportsTerminalChrome();
 window.addEventListener("resize", () => {
   syncReportsTerminalLayoutHeight();
+  syncCompactFeeSplitListViewport();
+  syncAgentSplitListViewport();
 });
 
 const imagesFeature = window.ImagesFeature.create({
@@ -2252,6 +3225,18 @@ function summarizeWarmRateLimits(targets, limit = 2) {
   return items.join(" | ");
 }
 
+function summarizeWarmRecoveries(targets, limit = 2) {
+  const items = targets.slice(0, limit).map((target) => {
+    const name = formatWarmTargetName(target);
+    const error = truncateStatusText(target && target.lastRecoveredError || "", 100);
+    return error ? `${name}: recovered from ${error}` : `${name}: recovered recently`;
+  });
+  if (targets.length > limit) {
+    items.push(`+${targets.length - limit} more`);
+  }
+  return items.join(" | ");
+}
+
 function latestWarmTargetSuccess(targets) {
   const values = targets
     .map((target) => Number(target && target.lastSuccessAtMs || 0))
@@ -2297,6 +3282,17 @@ function buildWarmTooltipRowsFromTargets(targets, nowMs) {
       };
     }
     if (isWarmTelemetryTargetHealthy(target, nowMs)) {
+      if (isWarmTelemetryTargetRecentlyRecovered(target, nowMs)) {
+        const recoveredAt = formatWarmTimestamp(target && target.lastRecoveredAtMs);
+        const recoveredError = truncateStatusText(target && target.lastRecoveredError || "", 120);
+        return {
+          tone: "blue",
+          label,
+          detail: recoveredError
+            ? `Recovered recently${recoveredAt !== "--" ? ` • ${recoveredAt}` : ""} • ${recoveredError}`
+            : `Recovered recently${recoveredAt !== "--" ? ` • ${recoveredAt}` : ""}`,
+        };
+      }
       return {
         tone: "green",
         label,
@@ -2411,6 +3407,7 @@ function syncWalletStatusRefreshLoop({ immediateResume = false } = {}) {
 
 /** Fresh success window (~3× default 10s keep-warm interval, capped). */
 const WARM_TELEMETRY_FRESH_MS = 180000;
+const WARM_TELEMETRY_RECENT_RECOVERY_MS = 120000;
 
 function warmTargetFreshSuccess(target, refNowMs) {
   const t = Number(target && target.lastSuccessAtMs || 0);
@@ -2429,6 +3426,20 @@ function isWarmTelemetryTargetHealthy(target, refNowMs) {
     return false;
   }
   return warmTargetFreshSuccess(target, refNowMs);
+}
+
+function isWarmTelemetryTargetRecentlyRecovered(target, refNowMs) {
+  if (!isWarmTelemetryTargetHealthy(target, refNowMs)) {
+    return false;
+  }
+  const recoveredError = String(target && target.lastRecoveredError || "").trim();
+  if (!recoveredError) {
+    return false;
+  }
+  const recoveredAt = Number(target && target.lastRecoveredAtMs || 0);
+  return Number.isFinite(recoveredAt)
+    && recoveredAt > 0
+    && (refNowMs - recoveredAt) <= WARM_TELEMETRY_RECENT_RECOVERY_MS;
 }
 
 function startupWarmSnapshot() {
@@ -2590,6 +3601,9 @@ function buildPlatformRuntimeIndicatorState() {
   const rateLimitedActiveStateTargets = activeStateTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
   const rateLimitedActiveEndpointTargets = activeEndpointTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
   const rateLimitedActiveWatchTargets = activeWatchTargets.filter((target) => isWarmTelemetryTargetRateLimited(target));
+  const recoveredActiveStateTargets = activeStateTargets.filter((target) => isWarmTelemetryTargetRecentlyRecovered(target, nowMs));
+  const recoveredActiveEndpointTargets = activeEndpointTargets.filter((target) => isWarmTelemetryTargetRecentlyRecovered(target, nowMs));
+  const recoveredActiveWatchTargets = activeWatchTargets.filter((target) => isWarmTelemetryTargetRecentlyRecovered(target, nowMs));
   const staleActiveStateTargets = activeStateTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
   const staleActiveEndpointTargets = activeEndpointTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
   const staleActiveWatchTargets = activeWatchTargets.filter((target) => !isWarmTelemetryTargetHealthy(target, nowMs) && !isWarmTelemetryTargetRateLimited(target) && !String(target && target.lastError || "").trim());
@@ -2673,6 +3687,11 @@ function buildPlatformRuntimeIndicatorState() {
       stateWarm = {
         tone: "yellow",
         title: `State Warm: waiting. ${staleActiveStateTargets.length} active target${staleActiveStateTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
+      };
+    } else if (recoveredActiveStateTargets.length > 0) {
+      stateWarm = {
+        tone: "blue",
+        title: `State Warm: recently recovered. ${summarizeWarmRecoveries(recoveredActiveStateTargets)}`,
       };
     } else if (activeStateTargets.length > 0) {
       const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeStateTargets));
@@ -2767,6 +3786,11 @@ function buildPlatformRuntimeIndicatorState() {
         tone: "yellow",
         title: `${endpointWarmLabel}: waiting. ${staleActiveEndpointTargets.length} active target${staleActiveEndpointTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
       };
+    } else if (recoveredActiveEndpointTargets.length > 0) {
+      endpointPrewarm = {
+        tone: "blue",
+        title: `${endpointWarmLabel}: recently recovered. ${summarizeWarmRecoveries(recoveredActiveEndpointTargets)}`,
+      };
     } else if (activeEndpointTargets.length > 0) {
       const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeEndpointTargets));
       endpointPrewarm = {
@@ -2860,6 +3884,11 @@ function buildPlatformRuntimeIndicatorState() {
       watchPrewarm = {
         tone: "yellow",
         title: `Watcher WS warm: waiting. ${staleActiveWatchTargets.length} active target${staleActiveWatchTargets.length === 1 ? "" : "s"} without a fresh success probe (>${Math.round(WARM_TELEMETRY_FRESH_MS / 1000)}s).`,
+      };
+    } else if (recoveredActiveWatchTargets.length > 0) {
+      watchPrewarm = {
+        tone: "blue",
+        title: `Watcher WS warm: recently recovered. ${summarizeWarmRecoveries(recoveredActiveWatchTargets)}`,
       };
     } else if (activeWatchTargets.length > 0) {
       const latestSuccess = formatWarmTimestamp(latestWarmTargetSuccess(activeWatchTargets));
@@ -3390,8 +4419,7 @@ function isRefreshPersistedFormControlKey(key) {
     || key === "name:postLaunchStrategy"
     || key === "name:sniperEnabled"
     || key === "name:automaticDevSellEnabled:value:"
-    || key === "name:feeSplitEnabled:value:"
-    || key === "name:bagsIdentityMode";
+    || key === "name:feeSplitEnabled:value:";
 }
 
 function filterRefreshPersistedFormControls(formControls) {
@@ -3451,6 +4479,7 @@ function buildLiveSyncPayload() {
       metaText: metaNode ? String(metaNode.textContent || "") : "",
       outputText: output ? String(output.textContent || "") : "",
     },
+    feeSplitDraft: normalizeFeeSplitDraft(serializeFeeSplitDraft()),
     formControls: buildLiveSyncFormControls(),
   };
 }
@@ -3469,6 +4498,7 @@ function buildEarlyBootSnapshot(payload = buildLiveSyncPayload()) {
     walletStatusSnapshot: payload.walletStatusSnapshot || null,
     runtimeStatusSnapshot: payload.runtimeStatusSnapshot || null,
     startupWarmSnapshot: payload.startupWarmSnapshot || null,
+    feeSplitDraft: payload.feeSplitDraft || null,
     formControls: payload.formControls || {},
   };
 }
@@ -3518,6 +4548,7 @@ function buildPersistedLiveSyncPayload(payload = buildLiveSyncPayload()) {
         }
       : null,
     outputSnapshot: payload.outputSnapshot || null,
+    feeSplitDraft: payload.feeSplitDraft || null,
     formControls: payload.formControls || {},
   };
 }
@@ -3771,6 +4802,11 @@ function applyIncomingLiveSyncPayload(payload, {
       applyLiveSyncFormControls(filterRefreshPersistedFormControls(payload.formControls));
     } else if (!skipFormControls) {
       applyLiveSyncFormControls(payload.formControls);
+    }
+    if (payload.feeSplitDraft && typeof payload.feeSplitDraft === "object") {
+      const normalizedDraft = normalizeFeeSplitDraft(payload.feeSplitDraft);
+      applyFeeSplitDraft(normalizedDraft, { persist: false });
+      setStoredFeeSplitDraft(normalizedDraft);
     }
   } finally {
     isApplyingLiveSync = false;
@@ -4166,160 +5202,19 @@ function syncBonkQuoteAssetUI() {
 }
 
 function getBagsIdentityMode() {
-  return String(bagsIdentityModeInput && bagsIdentityModeInput.value || "wallet-only").trim().toLowerCase() === "linked"
-    ? "linked"
-    : "wallet-only";
-}
-
-function setBagsIdentityStateInputs(nextState = {}) {
-  bagsIdentityState = {
-    ...bagsIdentityState,
-    ...nextState,
-  };
-  if (bagsIdentityModeInput) bagsIdentityModeInput.value = bagsIdentityState.mode === "linked" ? "linked" : "wallet-only";
-  if (bagsAgentUsernameHiddenInput) bagsAgentUsernameHiddenInput.value = bagsIdentityState.agentUsername || "";
-  if (bagsAuthTokenInput) bagsAuthTokenInput.value = bagsIdentityState.authToken || "";
-  if (bagsIdentityVerifiedWalletInput) bagsIdentityVerifiedWalletInput.value = bagsIdentityState.verifiedWallet || "";
+  return "wallet-only";
 }
 
 function describeBagsIdentity() {
-  if (getBagsIdentityMode() !== "linked") return "Wallet Only";
-  if (bagsIdentityState.agentUsername) return `Linked Bags Identity (@${bagsIdentityState.agentUsername})`;
-  return "Linked Bags Identity";
+  return "Wallet Only";
 }
 
 function syncBagsIdentityUI() {
-  const visible = getLaunchpad() === "bagsapp";
-  if (bagsIdentityButton) bagsIdentityButton.hidden = !visible;
-  if (bagsIdentityButtonLabel) {
-    bagsIdentityButtonLabel.textContent = getBagsIdentityMode() === "linked"
-      ? (bagsIdentityState.agentUsername ? `Linked Identity (@${bagsIdentityState.agentUsername})` : "Linked Identity")
-      : "Wallet Only";
-  }
-  if (bagsIdentityButton) {
-    bagsIdentityButton.classList.toggle("active", visible && getBagsIdentityMode() === "linked");
-    bagsIdentityButton.title = visible
-      ? describeBagsIdentity()
-      : "";
-  }
+  // Bags launches are intentionally fixed to the connected wallet path.
 }
 
-function setBagsIdentityError(message = "") {
-  if (bagsIdentityError) bagsIdentityError.textContent = message;
-}
-
-function showBagsIdentityModal() {
-  if (!bagsIdentityModal) return;
-  if (bagsIdentityCurrent) {
-    const message = bagsIdentityState.configuredApiKey
-      ? `Configured API key detected. Selected wallet must belong to the same Bags account to keep linked mode enabled.`
-      : "No Bags API key is configured yet.";
-    bagsIdentityCurrent.hidden = false;
-    bagsIdentityCurrent.textContent = message;
-  }
-  if (bagsAgentUsernameInput) bagsAgentUsernameInput.value = bagsIdentityState.agentUsername || "";
-  if (bagsVerificationContent) bagsVerificationContent.value = bagsIdentityState.verificationPostContent || "";
-  if (bagsPostIdInput) bagsPostIdInput.value = "";
-  setBagsIdentityError("");
-  bagsIdentityModal.hidden = false;
-}
-
-function hideBagsIdentityModal({ preserveLinked = false } = {}) {
-  if (!bagsIdentityModal) return;
-  bagsIdentityModal.hidden = true;
-  if (!preserveLinked && getBagsIdentityMode() === "linked" && !bagsIdentityState.verified) {
-    setBagsIdentityStateInputs({
-      mode: "wallet-only",
-      agentUsername: "",
-      authToken: "",
-      verifiedWallet: "",
-      publicIdentifier: "",
-      secret: "",
-      verificationPostContent: "",
-      error: "",
-    });
-    syncBagsIdentityUI();
-  }
-}
-
-async function refreshBagsIdentityStatus() {
-  const walletKey = selectedWalletKey();
-  const query = walletKey ? `?wallet=${encodeURIComponent(walletKey)}` : "";
-  const response = await fetch(`/api/bags/identity/status${query}`);
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to load Bags identity status.");
-  }
-  setBagsIdentityStateInputs({
-    configuredApiKey: Boolean(payload.configuredApiKey),
-    verified: Boolean(payload.verified),
-    agentUsername: payload.agentUsername || "",
-    authToken: payload.authToken || "",
-    verifiedWallet: payload.verifiedWallet || "",
-    mode: payload.mode === "linked" && payload.verified ? "linked" : getBagsIdentityMode(),
-  });
-  if (getBagsIdentityMode() === "linked" && !payload.verified) {
-    setBagsIdentityStateInputs({ mode: "wallet-only" });
-  }
-  syncBagsIdentityUI();
-  return payload;
-}
-
-async function initBagsIdentityVerification() {
-  const response = await fetch("/api/bags/identity/init", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      apiKey: bagsApiKeyInput ? bagsApiKeyInput.value.trim() : "",
-      saveApiKey: Boolean(bagsApiKeySave && bagsApiKeySave.checked),
-      agentUsername: bagsAgentUsernameInput ? bagsAgentUsernameInput.value.trim() : "",
-    }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to initialize Bags identity verification.");
-  }
-  setBagsIdentityStateInputs({
-    configuredApiKey: Boolean(payload.configuredApiKey),
-    agentUsername: payload.agentUsername || "",
-    publicIdentifier: payload.publicIdentifier || "",
-    secret: payload.secret || "",
-    verificationPostContent: payload.verificationPostContent || "",
-  });
-  if (bagsVerificationContent) bagsVerificationContent.value = payload.verificationPostContent || "";
-  if (bagsAgentUsernameInput) bagsAgentUsernameInput.value = payload.agentUsername || "";
-  syncBagsIdentityUI();
-  return payload;
-}
-
-async function verifyBagsIdentity() {
-  const response = await fetch("/api/bags/identity/verify", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      apiKey: bagsApiKeyInput ? bagsApiKeyInput.value.trim() : "",
-      saveApiKey: Boolean(bagsApiKeySave && bagsApiKeySave.checked),
-      agentUsername: bagsAgentUsernameInput ? bagsAgentUsernameInput.value.trim() : "",
-      publicIdentifier: bagsIdentityState.publicIdentifier || "",
-      secret: bagsIdentityState.secret || "",
-      postId: bagsPostIdInput ? bagsPostIdInput.value.trim() : "",
-      walletEnvKey: selectedWalletKey(),
-    }),
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) {
-    throw new Error(payload.error || "Failed to verify Bags identity.");
-  }
-  setBagsIdentityStateInputs({
-    mode: "linked",
-    configuredApiKey: Boolean(payload.configuredApiKey),
-    verified: Boolean(payload.verified),
-    agentUsername: payload.agentUsername || "",
-    authToken: payload.authToken || "",
-    verifiedWallet: payload.verifiedWallet || "",
-  });
-  syncBagsIdentityUI();
-  hideBagsIdentityModal({ preserveLinked: true });
+function setBagsIdentityStateInputs(_value = {}) {
+  // Bags identity is fixed to wallet-only now; keep a no-op shim for automation.
 }
 
 function setLaunchpad(launchpad, { resetMode = false, persistMode = false } = {}) {
@@ -4328,6 +5223,12 @@ function setLaunchpad(launchpad, { resetMode = false, persistMode = false } = {}
     || document.querySelector('input[name="launchpad"][value="pump"]');
   if (!target || target.disabled) return;
   target.checked = true;
+  activeFeeSplitDraftLaunchpad = normalized;
+  getFeeSplitRows().forEach((row) => updateFeeSplitRowType(row, row.dataset.type || "wallet"));
+  getAgentSplitRows().forEach((row) => {
+    if (row.dataset.locked === "true") return;
+    updateFeeSplitRowType(row, row.dataset.type || "wallet");
+  });
   if (resetMode) {
     setImportedCreatorFeeState(null);
     const nextMode = defaultLaunchModeForLaunchpad(normalized);
@@ -4338,7 +5239,9 @@ function setLaunchpad(launchpad, { resetMode = false, persistMode = false } = {}
 
 function applyImportedLaunchContext(token = {}) {
   const launchpad = normalizeLaunchpad(token.launchpad || getLaunchpad());
-  setLaunchpad(launchpad, { resetMode: true, persistMode: false });
+  withSuspendedFeeSplitDraftPersistence(() => {
+    setLaunchpad(launchpad, { resetMode: true, persistMode: false });
+  });
   setMode(token.mode || defaultLaunchModeForLaunchpad(launchpad));
   if (launchpad === "bonk") {
     setNamedValue("quoteAsset", normalizeQuoteAsset(token.quoteAsset || "sol"));
@@ -5252,15 +6155,27 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
   const markup = wallets.map((wallet) => {
     const solValue = walletBalanceSol(wallet);
     const usdValue = walletUsdValue(wallet);
+    const walletAddress = String(wallet.publicKey || "").trim();
     return `
-      <button
-        type="button"
+      <div
         class="wallet-option-button${wallet.envKey === selectedKey ? " is-selected" : ""}"
         data-wallet-key="${escapeHTML(wallet.envKey || "")}"
+        role="button"
+        tabindex="0"
+        aria-pressed="${wallet.envKey === selectedKey ? "true" : "false"}"
       >
         <span class="wallet-option-main">
           <span class="wallet-option-name">${escapeHTML(walletDisplayName(wallet))}</span>
-          <span class="wallet-option-meta">${escapeHTML(shortenAddress(wallet.publicKey || "Unavailable"))}</span>
+          <span class="wallet-option-meta">
+            <span class="wallet-option-meta-address" title="${escapeHTML(walletAddress || "Unavailable")}">${escapeHTML(shortenAddress(walletAddress || "Unavailable"))}</span>
+            ${walletAddress
+              ? `<button type="button" class="wallet-option-copy" data-copy-value="${escapeHTML(walletAddress)}" aria-label="Copy wallet address" title="Copy wallet address">
+                  <svg class="wallet-option-copy-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M16 1H4C2.9 1 2 1.9 2 3v12h2V3h12V1zm3 4H8C6.9 5 6 5.9 6 7v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"></path>
+                  </svg>
+                </button>`
+              : ""}
+          </span>
         </span>
         <span class="wallet-option-balances">
           <span class="wallet-option-sol">
@@ -5272,7 +6187,7 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
             <span>${escapeHTML(formatWalletDropdownAmount(usdValue))}</span>
           </span>
         </span>
-      </button>
+      </div>
     `;
   }).join("");
   if (RenderUtils.setCachedHTML) {
@@ -5280,6 +6195,40 @@ function renderWalletDropdownList(wallets = [], selectedKey = "") {
   } else {
     walletDropdownList.innerHTML = markup;
   }
+}
+
+async function copyWalletDropdownAddress(button) {
+  const value = String(button?.dataset.copyValue || "").trim();
+  if (!value) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const probe = document.createElement("textarea");
+      probe.value = value;
+      probe.setAttribute("readonly", "");
+      probe.style.position = "absolute";
+      probe.style.left = "-9999px";
+      document.body.appendChild(probe);
+      probe.select();
+      document.execCommand("copy");
+      probe.remove();
+    }
+    if (button._copyFeedbackTimer) {
+      window.clearTimeout(button._copyFeedbackTimer);
+    }
+    button.classList.remove("is-copied");
+    void button.offsetWidth;
+    button.classList.add("is-copied");
+    button.title = "Copied";
+    button.setAttribute("aria-label", "Copied wallet address");
+    button._copyFeedbackTimer = window.setTimeout(() => {
+      button.classList.remove("is-copied");
+      button.title = "Copy wallet address";
+      button.setAttribute("aria-label", "Copy wallet address");
+      button._copyFeedbackTimer = null;
+    }, 1200);
+  } catch {}
 }
 
 function setWalletDropdownOpen(isOpen) {
@@ -5300,13 +6249,16 @@ function shortenAddress(addr, chars = 6) {
   return addr.slice(0, chars) + "..." + addr.slice(-chars);
 }
 
-function formatLegendRecipientLabel(type, value, fallback = "wallet") {
+function formatLegendRecipientLabel(type, value, fallback = "wallet", { compactSocialLabel = false } = {}) {
   const normalized = String(value || "").trim();
   if (!normalized) {
     return { full: fallback, short: fallback };
   }
-  if (type === "github") {
-    const full = `@${normalized.replace(/^@+/, "")}`;
+  if (isSocialRecipientType(type)) {
+    const handle = `@${normalized.replace(/^@+/, "")}`;
+    const full = compactSocialLabel
+      ? handle
+      : (recipientTypeLabel(type) === "GitHub" ? handle : `${recipientTypeLabel(type)} ${handle}`);
     return {
       full,
       short: full.length > 14 ? `${full.slice(0, 7)}...${full.slice(-4)}` : full,
@@ -5320,6 +6272,16 @@ function formatLegendRecipientLabel(type, value, fallback = "wallet") {
 
 function setFeeSplitModalError(message = "") {
   if (feeSplitModalError) feeSplitModalError.textContent = message;
+}
+
+function formatFeeSplitTotalLabel(total) {
+  return `Total: ${total.toFixed(2).replace(/\.00$/, "")}%`;
+}
+
+function formatPercentNumber(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "0";
+  return numeric.toFixed(2).replace(/\.00$/, "").replace(/(\.\d*[1-9])0$/, "$1");
 }
 
 function getDeployerFeeSplitAddress() {
@@ -5387,7 +6349,8 @@ function getFeeSplitRows() {
 function createFeeSplitRow(entry = {}) {
   const row = document.createElement("div");
   row.className = "fee-split-row";
-  row.dataset.type = entry.type || "wallet";
+  row.dataset.rowId = nextFeeSplitRowId();
+  row.dataset.type = normalizeRecipientType(entry.type);
   if (row.dataset.type === "github") {
     const parsedGithubTarget = parseGithubRecipientTarget(entry.value || "");
     const githubUserId = String(entry.githubUserId || parsedGithubTarget.githubUserId || "").trim();
@@ -5396,11 +6359,21 @@ function createFeeSplitRow(entry = {}) {
   if (entry.defaultReceiver) row.dataset.defaultReceiver = "true";
   row.innerHTML = `
     <div class="fee-split-row-top">
-      <div class="recipient-type-tabs">
-        <button type="button" class="recipient-type-tab" data-type="wallet">Wallet</button>
-        <button type="button" class="recipient-type-tab" data-type="github">GitHub</button>
+      <div class="bags-fee-row-header">
+        <div class="recipient-type-tabs">
+          ${recipientTypeTabsMarkup()}
+        </div>
+        <div class="bags-fee-row-meta" hidden>
+          <span class="bags-fee-row-chip">Wallet</span>
+          <span class="bags-fee-row-status"></span>
+          <button type="button" class="bags-fee-row-copy" hidden aria-label="Copy resolved wallet" title="Copy resolved wallet">
+            <img class="bags-fee-row-copy-icon" src="/recipient-copy.png" alt="">
+          </button>
+        </div>
       </div>
-      <button type="button" class="recipient-remove" aria-label="Remove recipient">×</button>
+      <button type="button" class="recipient-remove" aria-label="Remove recipient">
+        <img class="recipient-remove-icon" src="/recipient-remove.png" alt="">
+      </button>
     </div>
     <div class="fee-split-row-main">
       <div class="recipient-target-wrap">
@@ -5420,17 +6393,22 @@ function createFeeSplitRow(entry = {}) {
   row.querySelector(".recipient-slider").value = entry.sharePercent || "0";
   updateFeeSplitRowType(row, row.dataset.type);
   setRecipientTargetLocked(row, Boolean(entry.targetLocked));
+  restoreFeeSplitLookupState(row, entry.lookupState);
+  updateFeeSplitRowValidationUi(row);
   return row;
 }
 
 function updateFeeSplitRowType(row, type) {
-  row.dataset.type = type;
-  if (type !== "github") delete row.dataset.githubUserId;
+  row.dataset.type = normalizeRecipientType(type);
+  if (row.dataset.type !== "github") delete row.dataset.githubUserId;
+  clearFeeSplitRowState(row);
+  syncRecipientTypeTabVisibility(row);
   row.querySelectorAll(".recipient-type-tab").forEach((button) => {
-    button.classList.toggle("active", button.dataset.type === type);
+    button.classList.toggle("active", button.dataset.type === row.dataset.type);
   });
   const target = row.querySelector(".recipient-target");
-  target.placeholder = type === "github" ? "GitHub username or user id" : "Wallet address";
+  target.placeholder = recipientTargetPlaceholder(row.dataset.type);
+  updateFeeSplitRowValidationUi(row);
 }
 
 function setRecipientTargetLocked(row, locked) {
@@ -5445,8 +6423,12 @@ function setRecipientTargetLocked(row, locked) {
       target.focus();
       return;
     }
-    if (row.dataset.type === "github" && looksLikeSolanaAddress(target.value)) {
-      target.setCustomValidity("GitHub recipients must use a GitHub username or numeric user id, not a Solana address.");
+    if (isSocialRecipientType(row.dataset.type) && looksLikeSolanaAddress(target.value)) {
+      target.setCustomValidity(
+        row.dataset.type === "github"
+          ? "GitHub recipients must use a GitHub username or numeric user id, not a Solana address."
+          : `${recipientTypeLabel(row.dataset.type)} recipients must use a username, not a Solana address.`,
+      );
       target.reportValidity();
       target.focus();
       return;
@@ -5467,10 +6449,12 @@ function setRecipientTargetLocked(row, locked) {
   row.querySelectorAll(".recipient-type-tab").forEach((button) => {
     button.disabled = locked;
   });
+  updateFeeSplitRowValidationUi(row);
 }
 
 function ensureFeeSplitDefaultRow() {
   if (!feeSplitList) return;
+  if (usesImplicitCreatorShareMode()) return;
   const hasNonDefaultRows = getFeeSplitRows().some((row) => row.dataset.defaultReceiver !== "true");
   if (feeSplitList.dataset.suppressDefaultRow === "true") {
     if (hasNonDefaultRows) return;
@@ -5500,14 +6484,45 @@ function ensureFeeSplitDefaultRow() {
   setRecipientTargetLocked(defaultRow, true);
 }
 
+function formatFeeSplitRecipientProgress(count) {
+  const numeric = Number(count);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "0/100";
+  return `${Math.max(0, Math.round(numeric))}/100`;
+}
+
+function syncFeeSplitPillSummary(rows = getFeeSplitRows()) {
+  const isBags = isBagsFeeSplitLaunchpad();
+  const configuredRows = rows.filter((row) => row.dataset.defaultReceiver !== "true");
+  const configuredCount = configuredRows.filter((row) => {
+    const value = row.querySelector(".recipient-target").value.trim();
+    const share = Number(row.querySelector(".recipient-share").value || 0);
+    return Boolean(value) || (Number.isFinite(share) && share > 0);
+  }).length;
+  if (feeSplitPillTitle) feeSplitPillTitle.textContent = isBags ? "Fee Share" : "Fee Split";
+  if (feeSplitPillProgress) {
+    feeSplitPillProgress.textContent = `(${configuredCount})`;
+    feeSplitPillProgress.title = `${configuredCount} recipient${configuredCount === 1 ? "" : "s"} configured`;
+    feeSplitPillProgress.setAttribute("aria-label", feeSplitPillProgress.title);
+  }
+  if (feeSplitTitle) {
+    feeSplitTitle.textContent = isBags
+      ? `Free Share ${formatFeeSplitRecipientProgress(configuredCount)}`
+      : "Fee Split";
+  }
+}
+
 function syncFeeSplitTotals() {
   const rows = getFeeSplitRows();
   const total = rows.reduce((sum, row) => {
     const value = Number(row.querySelector(".recipient-share").value || 0);
     return sum + (Number.isFinite(value) ? value : 0);
   }, 0);
-  feeSplitTotal.textContent = `${total.toFixed(2).replace(/\.00$/, "")}%`;
-  feeSplitTotal.classList.toggle("invalid", Math.abs(total - 100) > 0.001 && total !== 0);
+  feeSplitTotal.textContent = formatFeeSplitTotalLabel(total);
+  syncFeeSplitPillSummary(rows);
+  feeSplitTotal.classList.toggle(
+    "invalid",
+    usesImplicitCreatorShareMode() ? total > 100.001 : (Math.abs(total - 100) > 0.001 && total !== 0),
+  );
   feeSplitReset.disabled = rows.length === 0;
   feeSplitEven.disabled = rows.length === 0;
   if (feeSplitAdd) feeSplitAdd.disabled = rows.length >= MAX_FEE_SPLIT_RECIPIENTS;
@@ -5526,9 +6541,10 @@ function syncFeeSplitTotals() {
     const color = SPLIT_COLORS[index % SPLIT_COLORS.length];
     const targetValue = row.querySelector(".recipient-target").value.trim();
     const label = formatLegendRecipientLabel(
-      row.dataset.type === "github" ? "github" : "wallet",
+      row.dataset.type,
       targetValue,
-      row.dataset.type === "github" ? "@github" : "wallet"
+      isSocialRecipientType(row.dataset.type) ? recipientTypeLabel(row.dataset.type) : "wallet",
+      { compactSocialLabel: usesImplicitCreatorShareMode() }
     );
     if (share > 0) {
       const start = running;
@@ -5548,6 +6564,7 @@ function syncFeeSplitTotals() {
     ? `linear-gradient(90deg, ${gradientStops.join(", ")})`
     : "#1e2630";
   feeSplitLegendList.innerHTML = legendItems.join("");
+  syncBagsFeeSplitSummary();
 }
 
 function updateFeeSplitVisibility() {
@@ -5558,8 +6575,10 @@ function updateFeeSplitVisibility() {
     || (isBagsMode && hasMeaningfulFeeSplitConfiguration());
   feeSplitPill.classList.toggle("active", active);
   feeSplitPill.disabled = mode !== "regular" && mode !== "agent-custom" && !isBagsMode;
-  if ((mode === "regular" && feeSplitEnabled.checked) || isBagsMode) ensureFeeSplitDefaultRow();
+  syncFeeSplitPillSummary();
+  if (mode === "regular" && feeSplitEnabled.checked) ensureFeeSplitDefaultRow();
   if (mode !== "regular" && !isBagsMode && feeSplitModal) feeSplitModal.hidden = true;
+  syncFeeSplitModalPresentation();
   syncFeeSplitTotals();
   syncSettingsCapabilities();
 }
@@ -5571,9 +6590,14 @@ function showFeeSplitModal() {
     clearFeeSplitRestoreState();
     feeSplitEnabled.checked = true;
     updateFeeSplitVisibility();
-    ensureFeeSplitDefaultRow();
+    if (!usesImplicitCreatorShareMode()) ensureFeeSplitDefaultRow();
+    getFeeSplitRows().forEach((row) => {
+      updateFeeSplitRowValidationUi(row);
+      scheduleFeeSplitLookup(row, { immediate: true });
+    });
     setFeeSplitModalError("");
     if (feeSplitModal) feeSplitModal.hidden = false;
+    syncFeeSplitModalPresentation();
     return;
   }
   if (mode === "agent-custom") {
@@ -5584,6 +6608,7 @@ function showFeeSplitModal() {
 function hideFeeSplitModal() {
   setFeeSplitModalError("");
   clearFeeSplitRestoreState();
+  syncFeeSplitModalPresentation();
   if (feeSplitModal) feeSplitModal.hidden = true;
 }
 
@@ -5615,8 +6640,13 @@ function createAgentSplitRow(entry = {}) {
   const isAgent = entry.locked === true;
   const row = document.createElement("div");
   row.className = "fee-split-row";
-  row.dataset.type = isAgent ? "agent" : (entry.type || "wallet");
+  row.dataset.type = isAgent ? "agent" : normalizeRecipientType(entry.type);
   if (isAgent) row.dataset.locked = "true";
+  if (row.dataset.type === "github") {
+    const parsedGithubTarget = parseGithubRecipientTarget(entry.value || "");
+    const githubUserId = String(entry.githubUserId || parsedGithubTarget.githubUserId || "").trim();
+    if (githubUserId) row.dataset.githubUserId = githubUserId;
+  }
   if (entry.defaultReceiver) row.dataset.defaultReceiver = "true";
 
   if (isAgent) {
@@ -5639,10 +6669,11 @@ function createAgentSplitRow(entry = {}) {
     row.innerHTML = `
       <div class="fee-split-row-top">
         <div class="recipient-type-tabs">
-          <button type="button" class="recipient-type-tab" data-type="wallet">Wallet</button>
-          <button type="button" class="recipient-type-tab" data-type="github">GitHub</button>
+          ${recipientTypeTabsMarkup()}
         </div>
-        <button type="button" class="recipient-remove" aria-label="Remove recipient">×</button>
+        <button type="button" class="recipient-remove" aria-label="Remove recipient">
+          <img class="recipient-remove-icon" src="/recipient-remove.png" alt="">
+        </button>
       </div>
       <div class="fee-split-row-main">
         <div class="recipient-target-wrap">
@@ -5675,7 +6706,7 @@ function syncAgentSplitTotals() {
     const value = Number(row.querySelector(".recipient-share").value || 0);
     return sum + (Number.isFinite(value) ? value : 0);
   }, 0);
-  agentSplitTotal.textContent = `${total.toFixed(2).replace(/\.00$/, "")}%`;
+  agentSplitTotal.textContent = formatFeeSplitTotalLabel(total);
   agentSplitTotal.classList.toggle("invalid", Math.abs(total - 100) > 0.001 && total !== 0);
   agentSplitReset.disabled = rows.length === 0;
   agentSplitEven.disabled = rows.length === 0;
@@ -5684,6 +6715,7 @@ function syncAgentSplitTotals() {
   if (rows.length === 0 || total === 0) {
     agentSplitBar.style.background = "#1e2630";
     agentSplitLegendList.innerHTML = "";
+    syncAgentSplitListViewport();
     return;
   }
 
@@ -5697,7 +6729,7 @@ function syncAgentSplitTotals() {
     const label = row.dataset.locked
       ? { full: "Agent Buyback", short: "Agent" }
       : formatLegendRecipientLabel(
-        row.dataset.type === "github" ? "github" : "wallet",
+        row.dataset.type,
         targetValue,
         "wallet"
       );
@@ -5719,6 +6751,7 @@ function syncAgentSplitTotals() {
     ? `linear-gradient(90deg, ${gradientStops.join(", ")})`
     : "#1e2630";
   agentSplitLegendList.innerHTML = legendItems.join("");
+  syncAgentSplitListViewport();
 }
 
 function initAgentSplitIfEmpty() {
@@ -5736,11 +6769,17 @@ function showAgentSplitModal() {
   syncAgentSplitTotals();
   if (agentSplitModalError) agentSplitModalError.textContent = "";
   if (agentSplitModal) agentSplitModal.hidden = false;
+  syncAgentSplitListViewport();
 }
 
 function hideAgentSplitModal() {
   clearAgentSplitRestoreState();
   if (agentSplitModal) agentSplitModal.hidden = true;
+  if (agentSplitList) {
+    agentSplitList.classList.remove("bags-fee-split-list-scrollable");
+    agentSplitList.style.maxHeight = "";
+    agentSplitList.style.overflowY = "";
+  }
 }
 
 function setAgentSplitModalError(message = "") {
@@ -5750,11 +6789,17 @@ function setAgentSplitModalError(message = "") {
 function seedAgentSplitFromFeeSplit() {
   if (!agentSplitList) return false;
   const regularRows = getFeeSplitRows();
-  if (!regularRows.length) return false;
+  if (!regularRows.length) {
+    if (!usesImplicitPumpCreatorShareMode("regular", getLaunchpad())) return false;
+    agentSplitList.innerHTML = "";
+    agentSplitList.appendChild(createAgentSplitRow({ locked: true, sharePercent: "100" }));
+    syncAgentSplitTotals();
+    setAgentSplitModalError("");
+    return true;
+  }
   const defaultReceiverRow = regularRows.find((row) => row.dataset.defaultReceiver === "true");
-  if (!defaultReceiverRow) return false;
+  if (!defaultReceiverRow && !usesImplicitCreatorShareMode("regular", getLaunchpad())) return false;
 
-  const agentSharePercent = defaultReceiverRow.querySelector(".recipient-share").value.trim() || "0";
   const carriedRows = regularRows
     .filter((row) => row !== defaultReceiverRow)
     .map((row) => ({
@@ -5764,6 +6809,9 @@ function seedAgentSplitFromFeeSplit() {
       targetLocked: row.dataset.targetLocked === "true",
     }))
     .filter((entry) => entry.value || entry.sharePercent);
+  const agentSharePercent = defaultReceiverRow
+    ? (defaultReceiverRow.querySelector(".recipient-share").value.trim() || "0")
+    : formatPercentNumber(Math.max(0, 100 - carriedRows.reduce((sum, row) => sum + (Number(row.sharePercent) || 0), 0)));
 
   agentSplitList.innerHTML = "";
   agentSplitList.appendChild(createAgentSplitRow({ locked: true, sharePercent: agentSharePercent }));
@@ -5845,6 +6893,7 @@ function collectAgentSplitRecipients() {
     }
     const type = row.dataset.type || "wallet";
     const value = row.querySelector(".recipient-target").value.trim();
+    const githubUserId = String(row.dataset.githubUserId || "").trim();
     const parsedGithubTarget = parseGithubRecipientTarget(value);
     const sharePercent = row.querySelector(".recipient-share").value.trim();
     if (!value && !sharePercent) return null;
@@ -5852,8 +6901,10 @@ function collectAgentSplitRecipients() {
     return {
       type,
       address: type === "wallet" ? value : "",
-      githubUsername: type === "github" ? parsedGithubTarget.githubUsername : "",
-      githubUserId: type === "github" ? parsedGithubTarget.githubUserId : "",
+      githubUsername: isSocialRecipientType(type)
+        ? (type === "github" ? parsedGithubTarget.githubUsername : value.replace(/^@+/, ""))
+        : "",
+      githubUserId: type === "github" ? (githubUserId || parsedGithubTarget.githubUserId) : "",
       shareBps: Number.isFinite(numericShare) ? Math.round(numericShare * 100) : NaN,
     };
   }).filter(Boolean);
@@ -5962,13 +7013,14 @@ function applyPersistentDefaults(config) {
   const storedMode = getStoredLaunchMode();
   const storedLaunchpad = getStoredLaunchpad();
   const storedBonkQuoteAsset = getStoredBonkQuoteAsset();
-  const storedFeeSplitDraft = isPopoutMode ? getStoredFeeSplitDraft() : null;
-  const storedAgentSplitDraft = isPopoutMode ? getStoredAgentSplitDraft() : null;
+  const resolvedLaunchpad = storedLaunchpad || defaults.launchpad || "pump";
+  const storedFeeSplitDraft = getStoredFeeSplitDraft(resolvedLaunchpad);
+  const storedAgentSplitDraft = getStoredAgentSplitDraft();
   const storedAutoSellDraft = getStoredAutoSellDraft();
   const resolvedMode = storedMode || defaultMode;
   const resolvedFeeSplitDraft = storedFeeSplitDraft || (defaults.misc && defaults.misc.feeSplitDraft) || null;
   const resolvedAgentSplitDraft = storedAgentSplitDraft || (defaults.misc && defaults.misc.agentSplitDraft) || null;
-  setLaunchpad(storedLaunchpad || defaults.launchpad || "pump");
+  setLaunchpad(resolvedLaunchpad);
   if (bonkQuoteAssetInput) bonkQuoteAssetInput.value = normalizeQuoteAsset(storedBonkQuoteAsset || "sol");
   setConfig(config);
   applyPresetToSettingsInputs(getActivePreset(config));
@@ -6002,6 +7054,7 @@ function applyPersistentDefaults(config) {
       marketCapTimeoutAction: defaults.automaticDevSell.marketCapTimeoutAction || "stop",
     }, { persist: false });
   }
+  setMode(resolvedMode);
   applyFeeSplitDraft(resolvedFeeSplitDraft, { persist: false });
   applyAgentSplitDraft(resolvedAgentSplitDraft, { persist: false });
   if (resolvedMode === "agent-custom" && resolvedAgentSplitDraft) {
@@ -6009,15 +7062,6 @@ function applyPersistentDefaults(config) {
   } else if (resolvedFeeSplitDraft) {
     syncAgentSplitDraftFromFeeSplitDraft(resolvedFeeSplitDraft);
   }
-  if (defaults.misc && defaults.misc.bagsIdentity) {
-    setBagsIdentityStateInputs({
-      mode: String(defaults.misc.bagsIdentity.mode || "wallet-only").trim().toLowerCase() === "linked"
-        ? "linked"
-        : "wallet-only",
-      agentUsername: defaults.misc.bagsIdentity.agentUsername || "",
-    });
-  }
-  setMode(resolvedMode);
   setPresetEditing(Boolean(defaults.presetEditing));
   if (!storedSniperDraft && defaults.misc && defaults.misc.sniperDraft) {
     sniperFeature.setState(normalizeSniperDraftState(defaults.misc.sniperDraft));
@@ -6038,15 +7082,50 @@ function collectFeeSplitRecipients() {
       const sharePercent = row.querySelector(".recipient-share").value.trim();
       if (!value && !sharePercent) return null;
       const numericShare = Number(sharePercent);
+      const descriptor = isSocialRecipientType(type) ? buildFeeSplitLookupDescriptor(row) : null;
+      const state = descriptor ? getFeeSplitRowState(row) : null;
+      const resolvedWallet = descriptor
+        && state
+        && state.key === descriptor.cacheKey
+        && state.status === "valid"
+        && String(state.wallet || "").trim()
+        ? String(state.wallet || "").trim()
+        : "";
+      const normalizedType = resolvedWallet ? "wallet" : type;
       return {
-        type,
-        address: type === "wallet" ? value : "",
-        githubUsername: type === "github" ? parsedGithubTarget.githubUsername : "",
-        githubUserId: type === "github" ? (githubUserId || parsedGithubTarget.githubUserId) : "",
+        type: normalizedType,
+        address: normalizedType === "wallet" ? (resolvedWallet || value) : "",
+        githubUsername: normalizedType !== "wallet" && isSocialRecipientType(type)
+          ? (type === "github" ? parsedGithubTarget.githubUsername : value.replace(/^@+/, ""))
+          : "",
+        githubUserId: normalizedType !== "wallet" && type === "github" ? (githubUserId || parsedGithubTarget.githubUserId) : "",
         shareBps: Number.isFinite(numericShare) ? Math.round(numericShare * 100) : NaN,
       };
     })
     .filter(Boolean);
+}
+
+function collectSubmittedFeeSplitRecipients(mode = getMode()) {
+  const recipients = collectFeeSplitRecipients();
+  if (!usesImplicitCreatorShareMode(mode, getLaunchpad())) {
+    return recipients;
+  }
+  const total = recipients.reduce((sum, entry) => sum + (Number(entry.shareBps) || 0), 0);
+  const remainder = Math.max(0, 10_000 - total);
+  if (remainder <= 0) {
+    return recipients;
+  }
+  const deployerAddress = getDeployerFeeSplitAddress();
+  if (!deployerAddress) {
+    return recipients;
+  }
+  return recipients.concat({
+    type: "wallet",
+    address: deployerAddress,
+    githubUsername: "",
+    githubUserId: "",
+    shareBps: remainder,
+  });
 }
 
 function readForm() {
@@ -6137,8 +7216,8 @@ function readForm() {
     trackSendBlockHeight: isTrackSendBlockHeightEnabled(),
     feeSplitEnabled: meaningfulFeeSplitEnabled,
     feeSplitRecipients: mode === "regular"
-      ? (meaningfulFeeSplitEnabled ? collectFeeSplitRecipients() : [])
-      : (mode.startsWith("bags-") ? collectFeeSplitRecipients() : []),
+      ? (meaningfulFeeSplitEnabled ? collectSubmittedFeeSplitRecipients(mode) : [])
+      : (mode.startsWith("bags-") ? collectSubmittedFeeSplitRecipients(mode) : []),
     creatorFeeMode: importedCreatorFeeState.mode || "",
     creatorFeeAddress: importedCreatorFeeState.address || "",
     creatorFeeGithubUsername: importedCreatorFeeState.githubUsername || "",
@@ -6163,10 +7242,6 @@ function readForm() {
     vanityPrivateKey: getNamedValue("vanityPrivateKey") || "",
     imageFileName: uploadedImage ? uploadedImage.fileName : "",
     metadataUri: metadataUri.value || "",
-    bagsIdentityMode: getBagsIdentityMode(),
-    bagsAgentUsername: bagsIdentityState.agentUsername || "",
-    bagsAuthToken: bagsIdentityState.authToken || "",
-    bagsIdentityVerifiedWallet: bagsIdentityState.verifiedWallet || "",
   };
 }
 
@@ -6641,6 +7716,10 @@ function queueWarmActivity({ immediate = false } = {}) {
 
 function startRuntimeStatusRefreshLoop() {
   if (runtimeStatusRefreshTimer) window.clearInterval(runtimeStatusRefreshTimer);
+  refreshRuntimeStatus().catch(() => {});
+  if (reportsTerminalSection && !reportsTerminalSection.hidden && normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
+    refreshActiveLogs({ showLoading: false }).catch(() => {});
+  }
   runtimeStatusRefreshTimer = window.setInterval(() => {
     refreshRuntimeStatus().catch(() => {});
     if (reportsTerminalSection && !reportsTerminalSection.hidden && normalizeReportsTerminalView(reportsTerminalState.view) === "active-logs") {
@@ -6939,11 +8018,14 @@ async function bootstrapApp() {
   applyBootstrapFastPayload(payload);
   setBootOverlayMessage(null, "Syncing wallets, runtime status, and warm caches…");
   const startupWarmPromise = beginStartupWarmup().catch(() => {});
+  const warmActivityHydrationPromise = flushWarmActivity()
+    .catch(() => {})
+    .then(() => refreshRuntimeStatus().catch(() => {}));
   const runtimeHydrationPromise = refreshRuntimeStatus().catch(() => {});
   const walletStatusPromise = refreshWalletStatus(true, true).catch(() => {});
-  refreshBagsIdentityStatus().catch(() => {});
   await Promise.allSettled([
     startupWarmPromise,
+    warmActivityHydrationPromise,
     runtimeHydrationPromise,
     walletStatusPromise,
   ]);
@@ -7324,14 +8406,24 @@ function validateAgentSplit() {
       return;
     }
     if (entry.type === "agent") return;
+    if (!isRecipientTypeSupportedForLaunchpad(entry.type, getLaunchpad(), { allowAgent: true })) {
+      errors.push(
+        `Agent split recipient ${index + 1} uses ${recipientTypeLabel(entry.type)}, which is only supported for Bags fee splits.`,
+      );
+      return;
+    }
     if (entry.type === "wallet" && !entry.address) {
       errors.push(`Agent split recipient ${index + 1} is missing a wallet address.`);
     }
-    if (entry.type === "github" && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
-      errors.push(`Agent split recipient ${index + 1} cannot use a Solana address while GitHub is selected.`);
+    if (isSocialRecipientType(entry.type) && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
+      errors.push(
+        `Agent split recipient ${index + 1} cannot use a Solana address while ${recipientTypeLabel(entry.type)} is selected.`,
+      );
     }
-    if (entry.type === "github" && !entry.githubUsername && !entry.githubUserId) {
-      errors.push(`Agent split recipient ${index + 1} is missing a GitHub username or user id.`);
+    if (isSocialRecipientType(entry.type) && !entry.githubUsername && !entry.githubUserId) {
+      errors.push(
+        `Agent split recipient ${index + 1} is missing a ${recipientTypeLabel(entry.type)} ${entry.type === "github" ? "username or user id" : "username"}.`,
+      );
     }
   });
 
@@ -7344,6 +8436,12 @@ function validateFeeSplit() {
   const isBagsMode = mode.startsWith("bags-");
   if (mode !== "regular" && !isBagsMode) return errors;
   if (!isBagsMode && !feeSplitEnabled.checked) return errors;
+  const rows = getFeeSplitRows();
+  const recipientRows = rows.filter((row) => {
+    const value = String(row.querySelector(".recipient-target")?.value || "").trim();
+    const share = String(row.querySelector(".recipient-share")?.value || "").trim();
+    return value || share;
+  });
   const recipients = collectFeeSplitRecipients();
   if (recipients.length > MAX_FEE_SPLIT_RECIPIENTS) {
     errors.push(`Fee split supports at most ${MAX_FEE_SPLIT_RECIPIENTS} recipients.`);
@@ -7353,20 +8451,62 @@ function validateFeeSplit() {
       errors.push(`Fee split recipient ${index + 1} has an invalid %.`);
       return;
     }
+    if (!isRecipientTypeSupportedForLaunchpad(entry.type, getLaunchpad())) {
+      errors.push(
+        `Fee split recipient ${index + 1} uses ${recipientTypeLabel(entry.type)}, which is only supported for Bags launches.`,
+      );
+      return;
+    }
     if (entry.type === "wallet" && !entry.address) {
       errors.push(`Fee split recipient ${index + 1} is missing a wallet address.`);
       return;
     }
-    if (entry.type === "github" && !entry.githubUsername && !entry.githubUserId) {
-      errors.push(`Fee split recipient ${index + 1} is missing a GitHub username or user id.`);
+    if (isSocialRecipientType(entry.type) && !entry.githubUsername && !entry.githubUserId) {
+      errors.push(
+        `Fee split recipient ${index + 1} is missing a ${recipientTypeLabel(entry.type)} ${entry.type === "github" ? "username or user id" : "username"}.`,
+      );
       return;
     }
-    if (entry.type === "github" && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
-      errors.push(`Fee split recipient ${index + 1} cannot use a Solana address while GitHub is selected.`);
+    if (isSocialRecipientType(entry.type) && looksLikeSolanaAddress(entry.githubUsername || entry.githubUserId)) {
+      errors.push(
+        `Fee split recipient ${index + 1} cannot use a Solana address while ${recipientTypeLabel(entry.type)} is selected.`,
+      );
+      return;
+    }
+    if (isSocialRecipientType(entry.type)) {
+      const row = recipientRows[index];
+      const targetValidation = validateFeeSplitSocialTarget(
+        entry.type,
+        row ? String(row.querySelector(".recipient-target")?.value || "").trim() : (entry.githubUsername || entry.githubUserId),
+        { githubUserId: row ? String(row.dataset.githubUserId || "").trim() : String(entry.githubUserId || "").trim() },
+      );
+      if (!targetValidation.valid && targetValidation.error) {
+        errors.push(`Fee split recipient ${index + 1}: ${targetValidation.error}`);
+        return;
+      }
+    }
+    if (isBagsMode && isSocialRecipientType(entry.type)) {
+      const row = recipientRows[index];
+      const descriptor = buildFeeSplitLookupDescriptor(row);
+      const state = getFeeSplitRowState(row);
+      if (!descriptor || !state || state.key !== descriptor.cacheKey) {
+        errors.push(`Fee split recipient ${index + 1} still needs Bags username validation.`);
+        return;
+      }
+      if (state.status === "checking") {
+        errors.push(`Fee split recipient ${index + 1} is still validating with Bags.`);
+        return;
+      }
+      if (state.status !== "valid") {
+        errors.push(state.message || `Fee split recipient ${index + 1} could not be resolved by Bags.`);
+      }
     }
   });
   const total = recipients.reduce((sum, entry) => sum + (Number(entry.shareBps) || 0), 0);
-  if (recipients.length > 0 && total !== 10_000) {
+  const usesImplicitCreatorShare = usesImplicitCreatorShareMode(mode, getLaunchpad());
+  if (usesImplicitCreatorShare && total > 10_000) {
+    errors.push("Fee split cannot exceed 100%.");
+  } else if (!usesImplicitCreatorShare && recipients.length > 0 && total !== 10_000) {
     errors.push("Fee split must total 100%.");
   }
   return errors;
@@ -7446,7 +8586,10 @@ function buildDeployPreviewHTML() {
     const parts = (f.agentSplitRecipients || []).map((entry) => {
       const share = (Number(entry.shareBps || 0) / 100).toFixed(2).replace(/\.00$/, "");
       if (entry.type === "agent") return `Agent ${share}%`;
-      if (entry.type === "github") return `@${entry.githubUsername} ${share}%`;
+      if (isSocialRecipientType(entry.type)) {
+        const provider = recipientTypeLabel(entry.type);
+        return `${provider} @${entry.githubUsername} ${share}%`;
+      }
       return `${shortenAddress(entry.address || "wallet", 4)} ${share}%`;
     });
     feesText = parts.length > 0 ? parts.join(" | ") : "Agent split";
@@ -7764,10 +8907,6 @@ function buildSavedConfigFromForm() {
       sniperDraft: normalizeSniperDraftState(sniperFeature.getState()),
       feeSplitDraft: normalizeFeeSplitDraft(serializeFeeSplitDraft()),
       agentSplitDraft: normalizeAgentSplitDraft(serializeAgentSplitDraft()),
-      bagsIdentity: {
-        mode: getBagsIdentityMode(),
-        agentUsername: bagsIdentityState.agentUsername || "",
-      },
     },
     automaticDevSell: {
       enabled: isNamedChecked("automaticDevSellEnabled"),
@@ -9333,9 +10472,6 @@ function buildLaunchHistorySettingsText(launch) {
     launch.report && launch.report.launchpad ? launch.report.launchpad : "",
     launch.report && launch.report.mode ? launch.report.mode : "",
     launch.quoteAsset || "",
-    launch.bags && launch.bags.identityMode === "linked"
-      ? (launch.bags.agentUsername ? `identity @${launch.bags.agentUsername}` : "identity linked")
-      : "",
     launch.execution && launch.execution.activePresetId ? launch.execution.activePresetId : "",
     launch.selectedWalletKey ? formatWalletHistoryLabel(launch.selectedWalletKey) : "",
     launch.execution && launch.execution.provider ? launch.execution.provider : "",
@@ -10238,28 +11374,9 @@ async function applyLaunchHistoryEntryToForm(id) {
       creatorFee: launch.creatorFee || null,
     },
   });
-  if (launch.report && launch.report.launchpad === "bagsapp" && launch.bags) {
-    setBagsIdentityStateInputs({
-      mode: launch.bags.identityMode === "linked" ? "linked" : "wallet-only",
-      agentUsername: launch.bags.agentUsername || "",
-      verifiedWallet: launch.bags.identityVerifiedWallet || "",
-      verified: launch.bags.identityMode === "linked" && Boolean(launch.bags.identityVerifiedWallet),
-    });
-  } else {
-    setBagsIdentityStateInputs({
-      mode: "wallet-only",
-      agentUsername: "",
-      authToken: "",
-      verifiedWallet: "",
-      verified: false,
-    });
-  }
   syncLaunchpadModeOptions();
   syncBonkQuoteAssetUI();
   syncBagsIdentityUI();
-  if (launch.report && launch.report.launchpad === "bagsapp") {
-    refreshBagsIdentityStatus().catch(() => {});
-  }
 
   if (nameInput) nameInput.value = metadata && metadata.name ? metadata.name : (launch.title || "");
   if (symbolInput) {
@@ -10556,13 +11673,16 @@ form.querySelectorAll('input[name="mode"]').forEach((node) => {
 launchpadInputs.forEach((input) => {
   input.addEventListener("change", () => {
     if (!input.checked) return;
+    const previousLaunchpad = activeFeeSplitDraftLaunchpad;
+    const nextLaunchpad = normalizeLaunchpad(input.value);
+    setStoredFeeSplitDraft(serializeFeeSplitDraft(), { launchpad: previousLaunchpad });
     setStoredLaunchpad(input.value);
-    setLaunchpad(input.value, { resetMode: true, persistMode: true });
+    withSuspendedFeeSplitDraftPersistence(() => {
+      setLaunchpad(nextLaunchpad, { resetMode: true, persistMode: true });
+    });
+    restoreFeeSplitDraftForLaunchpad(nextLaunchpad);
     applyLaunchpadTokenMetadata();
     warmDevBuyQuoteCache();
-    if (input.value === "bagsapp") {
-      refreshBagsIdentityStatus().catch(() => {});
-    }
   });
 });
 if (bonkQuoteAssetToggle) {
@@ -10573,54 +11693,6 @@ if (bonkQuoteAssetToggle) {
     syncBonkQuoteAssetUI();
     warmDevBuyQuoteCache();
     queueQuoteUpdate();
-  });
-}
-if (bagsIdentityButton) {
-  bagsIdentityButton.addEventListener("click", async () => {
-    if (getLaunchpad() !== "bagsapp") return;
-    if (getBagsIdentityMode() === "linked") {
-      try {
-        await fetch("/api/bags/identity/clear", { method: "POST" });
-      } catch (_error) {
-        // Ignore backend clear errors and still reset the frontend state.
-      }
-      setBagsIdentityStateInputs({
-        mode: "wallet-only",
-        verified: false,
-        agentUsername: "",
-        authToken: "",
-        verifiedWallet: "",
-      });
-      syncBagsIdentityUI();
-      return;
-    }
-    showBagsIdentityModal();
-  });
-}
-if (bagsIdentityClose) {
-  bagsIdentityClose.addEventListener("click", () => hideBagsIdentityModal());
-}
-if (bagsIdentityCancel) {
-  bagsIdentityCancel.addEventListener("click", () => hideBagsIdentityModal());
-}
-if (bagsIdentityInitButton) {
-  bagsIdentityInitButton.addEventListener("click", async () => {
-    setBagsIdentityError("");
-    try {
-      await initBagsIdentityVerification();
-    } catch (error) {
-      setBagsIdentityError(error.message || "Failed to initialize Bags identity.");
-    }
-  });
-}
-if (bagsIdentityVerifyButton) {
-  bagsIdentityVerifyButton.addEventListener("click", async () => {
-    setBagsIdentityError("");
-    try {
-      await verifyBagsIdentity();
-    } catch (error) {
-      setBagsIdentityError(error.message || "Failed to verify Bags identity.");
-    }
   });
 }
 if (nameInput) {
@@ -10769,18 +11841,31 @@ if (walletRefreshButton) {
     event.preventDefault();
     event.stopPropagation();
     walletRefreshButton.disabled = true;
+    walletRefreshButton.classList.remove("is-refreshing");
+    void walletRefreshButton.offsetWidth;
+    walletRefreshButton.classList.add("is-refreshing");
+    const refreshAnimationStart = performance.now();
     try {
       await refreshWalletStatus(true, true);
-      if (getLaunchpad() === "bagsapp") {
-        await refreshBagsIdentityStatus().catch(() => {});
+      const remainingAnimationMs = Math.max(0, 600 - (performance.now() - refreshAnimationStart));
+      if (remainingAnimationMs > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, remainingAnimationMs));
       }
     } finally {
+      walletRefreshButton.classList.remove("is-refreshing");
       walletRefreshButton.disabled = false;
     }
   });
 }
 if (walletDropdownList) {
-  walletDropdownList.addEventListener("click", (event) => {
+  walletDropdownList.addEventListener("click", async (event) => {
+    const copyButton = event.target.closest(".wallet-option-copy");
+    if (copyButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      await copyWalletDropdownAddress(copyButton);
+      return;
+    }
     const button = event.target.closest(".wallet-option-button");
     if (!button || !walletSelect) return;
     const nextKey = String(button.dataset.walletKey || "").trim();
@@ -10790,7 +11875,19 @@ if (walletDropdownList) {
     applySelectedWalletLocally(nextKey);
     setWalletDropdownOpen(false);
     refreshWalletStatus(true);
-    if (getLaunchpad() === "bagsapp") refreshBagsIdentityStatus().catch(() => {});
+  });
+  walletDropdownList.addEventListener("keydown", (event) => {
+    const button = event.target.closest(".wallet-option-button");
+    if (!button || !walletSelect) return;
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    const nextKey = String(button.dataset.walletKey || "").trim();
+    if (!nextKey) return;
+    walletSelect.value = nextKey;
+    setStoredSelectedWalletKey(nextKey);
+    applySelectedWalletLocally(nextKey);
+    setWalletDropdownOpen(false);
+    refreshWalletStatus(true);
   });
 }
 walletSelect.addEventListener("change", () => {
@@ -10798,7 +11895,6 @@ walletSelect.addEventListener("change", () => {
   setStoredSelectedWalletKey(nextKey);
   applySelectedWalletLocally(nextKey);
   refreshWalletStatus(true);
-  if (getLaunchpad() === "bagsapp") refreshBagsIdentityStatus().catch(() => {});
 });
 document.addEventListener("click", (event) => {
   if (!walletDropdown || walletDropdown.hidden) return;
@@ -10810,8 +11906,11 @@ document.addEventListener("click", (event) => {
 feeSplitAdd.addEventListener("click", () => {
   clearFeeSplitRestoreState();
   if (getFeeSplitRows().length >= MAX_FEE_SPLIT_RECIPIENTS) return;
-  feeSplitList.appendChild(createFeeSplitRow({ type: "wallet", sharePercent: "" }));
+  const row = createFeeSplitRow({ type: "wallet", sharePercent: "" });
+  feeSplitList.appendChild(row);
+  updateFeeSplitRowValidationUi(row);
   syncFeeSplitTotals();
+  syncFeeSplitModalPresentation();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
   setFeeSplitModalError("");
 });
@@ -10823,6 +11922,7 @@ feeSplitReset.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = "0";
   });
   syncFeeSplitTotals();
+  syncFeeSplitModalPresentation();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
   setFeeSplitModalError("");
 });
@@ -10845,6 +11945,7 @@ feeSplitEven.addEventListener("click", () => {
     row.querySelector(".recipient-slider").value = String(share);
   });
   syncFeeSplitTotals();
+  syncFeeSplitModalPresentation();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
   setFeeSplitModalError("");
 });
@@ -10854,6 +11955,7 @@ if (feeSplitClearAll) {
     if (feeSplitClearAllRestoreSnapshot) {
       applyFeeSplitDraft(feeSplitClearAllRestoreSnapshot, { persist: false });
       syncFeeSplitTotals();
+      syncFeeSplitModalPresentation();
       setStoredFeeSplitDraft(serializeFeeSplitDraft());
       clearFeeSplitRestoreState();
       setFeeSplitModalError("");
@@ -10862,6 +11964,7 @@ if (feeSplitClearAll) {
     feeSplitClearAllRestoreSnapshot = normalizeFeeSplitDraft(serializeFeeSplitDraft());
     applyFeeSplitDraft(feeSplitClearAllDraft(), { persist: false });
     syncFeeSplitTotals();
+    syncFeeSplitModalPresentation();
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
     updateFeeSplitClearAllButton();
     setFeeSplitModalError("");
@@ -10869,11 +11972,17 @@ if (feeSplitClearAll) {
 }
 
 feeSplitList.addEventListener("click", (event) => {
+  const copyButton = event.target.closest(".bags-fee-row-copy");
+  if (copyButton) {
+    void copyBagsResolvedWallet(copyButton);
+    return;
+  }
   const lockToggle = event.target.closest(".recipient-lock-toggle");
   if (lockToggle) {
     clearFeeSplitRestoreState();
     const row = lockToggle.closest(".fee-split-row");
     setRecipientTargetLocked(row, row.dataset.targetLocked !== "true");
+    scheduleFeeSplitLookup(row, { immediate: true });
     syncFeeSplitTotals();
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
     setFeeSplitModalError("");
@@ -10882,7 +11991,9 @@ feeSplitList.addEventListener("click", (event) => {
   const tab = event.target.closest(".recipient-type-tab");
   if (tab) {
     clearFeeSplitRestoreState();
-    updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
+    const row = tab.closest(".fee-split-row");
+    updateFeeSplitRowType(row, tab.dataset.type);
+    scheduleFeeSplitLookup(row, { immediate: true });
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
     setFeeSplitModalError("");
     return;
@@ -10890,9 +12001,12 @@ feeSplitList.addEventListener("click", (event) => {
   const removeButton = event.target.closest(".recipient-remove");
   if (removeButton) {
     clearFeeSplitRestoreState();
-    removeButton.closest(".fee-split-row").remove();
-    ensureFeeSplitDefaultRow();
+    const row = removeButton.closest(".fee-split-row");
+    clearFeeSplitRowState(row);
+    row.remove();
+    if (!usesImplicitCreatorShareMode()) ensureFeeSplitDefaultRow();
     syncFeeSplitTotals();
+    syncFeeSplitModalPresentation();
     setStoredFeeSplitDraft(serializeFeeSplitDraft());
     setFeeSplitModalError("");
   }
@@ -10908,13 +12022,19 @@ feeSplitList.addEventListener("input", (event) => {
   if (event.target.classList.contains("recipient-target") && row.dataset.type === "github") {
     delete row.dataset.githubUserId;
   }
+  if (event.target.classList.contains("recipient-target")) {
+    clearFeeSplitRowState(row);
+    scheduleFeeSplitLookup(row);
+  }
   if (event.target.classList.contains("recipient-slider")) {
     row.querySelector(".recipient-share").value = event.target.value;
   }
   if (event.target.classList.contains("recipient-share")) {
     row.querySelector(".recipient-slider").value = event.target.value || "0";
   }
+  updateFeeSplitRowValidationUi(row);
   syncFeeSplitTotals();
+  syncFeeSplitModalPresentation();
   setStoredFeeSplitDraft(serializeFeeSplitDraft());
   setFeeSplitModalError("");
 });
@@ -10998,7 +12118,9 @@ agentSplitList.addEventListener("click", (event) => {
   const tab = event.target.closest(".recipient-type-tab");
   if (tab && tab.dataset.type) {
     clearAgentSplitRestoreState();
-    updateFeeSplitRowType(tab.closest(".fee-split-row"), tab.dataset.type);
+    const row = tab.closest(".fee-split-row");
+    updateFeeSplitRowType(row, tab.dataset.type);
+    if (row && row.dataset.type !== "github") delete row.dataset.githubUserId;
     syncAgentSplitTotals();
     setStoredAgentSplitDraft(serializeAgentSplitDraft());
     setAgentSplitModalError("");
@@ -11021,6 +12143,7 @@ agentSplitList.addEventListener("input", (event) => {
   clearAgentSplitRestoreState();
   if (event.target.classList.contains("recipient-target")) {
     event.target.setCustomValidity("");
+    if (row.dataset.type === "github") delete row.dataset.githubUserId;
   }
   if (event.target.classList.contains("recipient-slider")) {
     row.querySelector(".recipient-share").value = event.target.value;

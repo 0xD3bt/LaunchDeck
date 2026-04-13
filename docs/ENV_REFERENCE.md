@@ -20,7 +20,7 @@ These are the only variables most operators need on day one.
 | Variable | Effective default when blank | What it does | Normal setup? |
 | --- | --- | --- | --- |
 | `SOLANA_PRIVATE_KEY` | unset | First wallet slot loaded by the UI and engine | Yes |
-| `SOLANA_PRIVATE_KEY2` ... `SOLANA_PRIVATE_KEY10` | unset | Additional wallet slots; optional `<privatekey>,<label>` format is supported | Yes |
+| `SOLANA_PRIVATE_KEY2`, `SOLANA_PRIVATE_KEY3`, ... | unset | Additional wallet slots; optional `<privatekey>,<label>` format is supported | Yes |
 | `SOLANA_RPC_URL` | unset | Main Solana HTTP RPC for reads, confirmations, and general runtime RPC behavior | Yes |
 | `SOLANA_WS_URL` | unset | Main watcher websocket for realtime follow behavior | Yes |
 | `USER_REGION` | provider fallback | Shared default routing profile for region-aware providers | Yes |
@@ -36,7 +36,7 @@ These are the only variables most operators need on day one.
 | Variable | Effective default when blank | What it does | Notes |
 | --- | --- | --- | --- |
 | `SOLANA_PRIVATE_KEY` | unset | Primary wallet slot | Label format: `<privatekey>,<label>` |
-| `SOLANA_PRIVATE_KEY2` ... `SOLANA_PRIVATE_KEY10` | unset | Additional wallet slots | Untagged wallets appear as numbered slots |
+| `SOLANA_PRIVATE_KEY2`, `SOLANA_PRIVATE_KEY3`, ... | unset | Additional wallet slots | Any numeric suffix is accepted; untagged wallets appear as numbered slots |
 | `SOLANA_KEYPAIR_PATH` | unset | Optional filesystem keypair path | Advanced override only |
 
 ## Core RPC, websocket, and routing
@@ -80,6 +80,8 @@ These are override-only in most setups.
 | `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND` | `true` | Suspends warm traffic while idle | Recommended: leave on |
 | `LAUNCHDECK_IDLE_WARM_TIMEOUT_MS` | `75000` | Idle time before warm suspend kicks in | Advanced tuning |
 | `LAUNCHDECK_CONTINUOUS_WARM_INTERVAL_MS` | `50000` | Continuous warm cadence | Advanced tuning |
+| `LAUNCHDECK_CONTINUOUS_WARM_PASS_TIMEOUT_MS` | `120000` | Max wall-clock budget for a continuous warm pass | Advanced tuning |
+| `LAUNCHDECK_WARM_PROBE_TIMEOUT_MS` | `5000` | Timeout for a single warm probe request | Advanced tuning |
 | `LAUNCHDECK_DISABLE_STARTUP_WARM` | disabled unless explicitly true and the positive flag is unset | Legacy negative startup-warm flag | Backward-compat only |
 | `LAUNCHDECK_BLOCK_HEIGHT_CACHE_TTL_MS` | `200` | Shared block-height cache TTL | Advanced tuning |
 | `LAUNCHDECK_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS` | `1000` | Max age of sampled block-height data before forcing refresh | Advanced tuning |
@@ -126,6 +128,16 @@ These are only used when a request does not already set its own compute unit lim
 | `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_COMPILES` | uncapped | Max concurrent follow compiles | Blank or `0` means uncapped |
 | `LAUNCHDECK_FOLLOW_MAX_CONCURRENT_SENDS` | uncapped | Max concurrent follow sends | Blank or `0` means uncapped |
 | `LAUNCHDECK_FOLLOW_CAPACITY_WAIT_MS` | `5000` | Wait time for follow capacity when caps are set | Only matters when a cap is set |
+| `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY` | `true` | Enables the special Pump pre-signed buy rebuild/retry path for `creator_vault` / `Custom 2006` failures | Disable only if you intentionally do not want LaunchDeck to resend that recovery buy |
+| `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY` | `true` | Enables the special Pump dev-auto-sell / sniper-sell rebuild/retry path for `creator_vault` / `Custom 2006` failures | Disable only if you intentionally do not want LaunchDeck to resend that recovery sell |
+
+## Market-cap follow reference
+
+These only matter for market-cap-triggered follow actions.
+
+| Variable | Effective default when blank | What it does | Notes |
+| --- | --- | --- | --- |
+| `LAUNCHDECK_SOL_USD_HTTP_PRICE_URL` | CoinGecko simple-price SOL/USD URL | Fallback HTTP price source for SOL/USD market-cap normalization | Used when Helius SOL pricing is unavailable |
 
 ## Helper runtime
 
@@ -135,6 +147,9 @@ These are only used when a request does not already set its own compute unit lim
 | `LAUNCHDECK_LAUNCHPAD_HELPER_MAX_CONCURRENCY` | `4` | Shared helper concurrency cap | Advanced tuning |
 | `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER` | `true` | Persistent Bags helper worker toggle | Recommended: leave on |
 | `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER` | `true` | Persistent Bonk helper worker toggle | Recommended: leave on |
+| `LAUNCHDECK_LAUNCHPAD_WARM_CONTEXT` | `true` | Builds per-request launchpad warm context such as blockhash priming | Advanced tuning |
+| `LAUNCHDECK_LAUNCHPAD_PARALLEL_WARM_FETCH` | `false` | Opt-in parallel warm fetch mode for launchpad warm context | Disabled by default because the builder does not advertise parallelism unless explicitly enabled |
+| `LAUNCHDECK_LAUNCHPAD_WARM_MAX_PARALLEL_FETCH` | `8` | Upper bound for launchpad warm-context parallel fetches | Only matters when parallel warm fetch is enabled |
 
 ## Local paths
 
@@ -189,14 +204,16 @@ Current behavior:
 | `BAGS_API_KEY` | unset | Bags API key | Needed for Bags usage |
 | `BAGS_API_BASE_URL` | vendor default | Bags API base URL override | Advanced override |
 | `HELLOMOON_API_KEY` | unset | Hello Moon Lunar Lander API key | Needed for Hello Moon execution |
+| `LAUNCHDECK_BAGS_HELPER_BLOCKHASH_FROM_RUST` | `true` | Passes the Rust-cached blockhash into the Bags helper for prepare/build-launch | Recommended: leave on |
 | `LAUNCHDECK_BAGS_SETUP_JITO_TIP_MIN_LAMPORTS` | `1000` | Minimum Bags setup Jito tip | Advanced tuning |
 | `LAUNCHDECK_BAGS_SETUP_JITO_TIP_CAP_LAMPORTS` | `1000000` | Maximum Bags setup Jito tip | Advanced tuning |
+| `LAUNCHDECK_BAGS_SETUP_CONFIRM_TIMEOUT_SECS` | `20` | Wall-clock cap for confirming a Bags setup transaction batch | Advanced tuning |
+| `LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT` | `confirmed` | Commitment required before Bags builds the final launch transaction after setup | Supported: `processed`, `confirmed`, `finalized` |
 
 ## Script and tooling compatibility
 
 | Variable | Effective default when blank | What it does | Notes |
 | --- | --- | --- | --- |
-| `LAUNCHDECK_MATRIX_BASE_URL` | local runtime base URL | Base URL override for browser matrix scripts | Tooling-only |
 | `RPC_URL` | unset | Generic script compatibility alias | Main LaunchDeck runtime does not need this when `SOLANA_RPC_URL` is set |
 
 ## Recommended defaults summary
@@ -210,6 +227,8 @@ If you want the shortest possible checklist, keep these as your baseline:
 - `LAUNCHDECK_ENABLE_CONTINUOUS_WARM=true`
 - `LAUNCHDECK_ENABLE_IDLE_WARM_SUSPEND=true`
 - `LAUNCHDECK_ENABLE_HELIUS_TRANSACTION_SUBSCRIBE=true`
+- `LAUNCHDECK_ENABLE_PUMP_BUY_CREATOR_VAULT_AUTO_RETRY=true`
+- `LAUNCHDECK_ENABLE_PUMP_SELL_CREATOR_VAULT_AUTO_RETRY=true`
 - `LAUNCHDECK_ENABLE_BAGS_HELPER_WORKER=true`
 - `LAUNCHDECK_ENABLE_BONK_HELPER_WORKER=true`
 

@@ -85,7 +85,8 @@ fn sanitize_base_name(value: &str, fallback: &str) -> String {
 fn supported_extension(content_type: &str) -> Option<&'static str> {
     match content_type.trim().to_ascii_lowercase().as_str() {
         "image/png" => Some(".png"),
-        "image/jpeg" => Some(".jpg"),
+        "image/jpeg" | "image/jpg" => Some(".jpg"),
+        "image/avif" => Some(".avif"),
         "image/webp" => Some(".webp"),
         "image/gif" => Some(".gif"),
         _ => None,
@@ -292,7 +293,7 @@ pub fn save_data_url_image(
         return Err("Invalid image payload.".to_string());
     };
     let Some(extension) = supported_extension(content_type) else {
-        return Err("Only png, jpg, webp, and gif images are supported.".to_string());
+        return Err("Only png, jpg/jpeg, avif, webp, and gif images are supported.".to_string());
     };
     let bytes = BASE64
         .decode(encoded.as_bytes())

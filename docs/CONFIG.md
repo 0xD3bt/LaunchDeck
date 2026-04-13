@@ -10,10 +10,17 @@ If you are setting LaunchDeck up for the first time:
 
 If you want the full variable list and defaults, use `docs/ENV_REFERENCE.md`.
 
+If you are provisioning a brand-new server first, use `docs/VPS_SETUP.md` before this page. That guide covers the current Ubuntu/VPS bootstrap flow, required system dependencies, SSH-tunnel access pattern, and the `scripts/vps-bootstrap.sh` installer.
+
 ## Recommended First Setup
 
 For most operators, the current recommended production stack is:
 
+- run LaunchDeck on a VPS rather than on a normal everyday workstation
+- place the VPS near the provider endpoints and RPCs you actually plan to use
+- EU VPS location: Frankfurt or Amsterdam
+- US VPS location: New York / Newark area or Salt Lake City area
+- Asia VPS location: Singapore or Tokyo
 - Helius dev tier for the main stack
 - Helius Gatekeeper HTTP for `SOLANA_RPC_URL`
 - Helius standard websocket for `SOLANA_WS_URL`

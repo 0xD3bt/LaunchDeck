@@ -1,7 +1,4 @@
 node_modules/
-# Legacy local scratch directory
-local/
-# Ephemeral LaunchDeck runtime + benchmark output (see Benchmarking/Benchmark.js)
 .env
 .env.local
 .env.*.local
@@ -20,6 +17,3 @@ Thumbs.db
 .idea/
 .cache/
 target/
-docs/Article.md
-docs/Article_TWITTER.md
-docs/plan/

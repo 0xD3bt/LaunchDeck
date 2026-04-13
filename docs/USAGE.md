@@ -4,6 +4,8 @@ This guide covers the normal operator workflow in LaunchDeck, from first startup
 
 Before using the UI, set up the basics from `.env.example` and `docs/CONFIG.md`.
 
+If you are bringing up a brand-new server first, use `docs/VPS_SETUP.md` before this guide. That page covers the initial VPS instance, dependency install, bootstrap script, and SSH-tunnel workflow.
+
 ## Before you start
 
 Make sure you have:
@@ -17,6 +19,11 @@ Make sure you have:
 Default UI URL:
 
 - `http://127.0.0.1:8789`
+
+Useful setup paths:
+
+- local or existing machine: use `README.md` plus `.env.example`
+- fresh VPS: use `docs/VPS_SETUP.md`, then come back here once the UI is reachable
 
 ## Recommended first session
 
@@ -37,11 +44,44 @@ The normal LaunchDeck workflow is:
 
 1. select a wallet
 2. choose a launchpad and mode
-3. fill token metadata and image
-4. review creation, buy, and sell settings
-5. optionally add snipers or automatic dev sell
-6. run `Build`, `Simulate`, or `Deploy`
-7. review the result and the saved report
+3. fill token metadata or import an existing token with `Vamp`
+4. choose or upload an image through the image library
+5. review creation, buy, and sell settings in the Settings modal
+6. optionally add snipers, fee split, vanity, or automatic sell logic
+7. run `Build`, `Simulate`, or `Deploy`
+8. review the saved result in `Dashboard`
+
+## Runtime indicators
+
+The launchpad row shows runtime status indicators before you send anything.
+
+Current operator meaning:
+
+- `Warm` summarizes startup warm, active endpoint warm, and watcher warm health
+- green usually means the active warm targets are healthy
+- yellow or blue usually means LaunchDeck is still starting, auto-paused, or partially degraded
+- red means at least one active warm target is failing and you should inspect the tooltip or logs before trusting the path
+
+The `Dashboard` button also reflects follow-daemon health and active job count.
+
+## Image library and Vamp
+
+LaunchDeck now treats images and imported metadata as first-class workflow tools.
+
+Use the image panel to:
+
+- upload a new image
+- reuse an existing image from the local image library
+- organize saved images with favorites, categories, and tags
+
+Use `Vamp` when you want to seed the form from an existing token.
+
+Current behavior:
+
+- paste a Solana mint / contract address
+- LaunchDeck imports the token image and metadata into the current form
+- imported values can include the name, symbol, description, and social links
+- the imported image is stored in the local image library so you can reuse it later
 
 ## Wallets
 
@@ -50,7 +90,7 @@ Wallets are loaded from:
 - `SOLANA_PRIVATE_KEY`
 - `SOLANA_PRIVATE_KEY2`
 - `SOLANA_PRIVATE_KEY3`
-- and the other wallet slots up to `SOLANA_PRIVATE_KEY10`
+- and any additional `SOLANA_PRIVATE_KEY<number>` slots you define
 
 Practical notes:
 
@@ -72,7 +112,8 @@ Practical guidance:
 
 - use `Pump` for the most native LaunchDeck path
 - use `Bonk` for the supported helper-backed Bonk path
-- use `Bagsapp` only when you intentionally want the experimental Bags path
+- use `Bagsapp` when you want the supported Bags path and have Bags credentials configured
+- the shipped UI treats Bags identity as `wallet-only` for the normal operator flow
 
 See `docs/LAUNCHPADS.md` for the exact support matrix.
 
@@ -188,7 +229,8 @@ It lets you:
 
 - enable or disable sell behavior for the deployer wallet
 - choose a percent
-- choose delay-based or confirmed-block timing
+- choose time-based or market-cap-based triggers
+- choose delay-based or confirmed-block timing for time-triggered sells
 - use market-cap triggers where supported
 
 This action is daemon-executed and shows separately in reports.
@@ -209,16 +251,27 @@ Use them like this:
 
 The backend still owns final validation and transport shaping even if the UI fields looked valid.
 
-## History and reuse
+## Dashboard and reuse
 
-Open `History` when you want to inspect prior launches and transactions.
+Open `Dashboard` when you want to inspect prior launches, transactions, live jobs, and recent logs.
 
-From History you can:
+Current dashboard views:
+
+- `Transactions`
+- `Launches`
+- `Jobs`
+- `Logs`
+
+From `Launches` you can:
 
 - inspect the report
 - review timings and endpoints
 - reuse a launch into the current form
 - relaunch from saved history
+
+Use `Jobs` when you want to watch active follow launches and cancel them if needed.
+
+Use `Logs` when you want quick browser-side access to recent engine and daemon output before dropping to `journalctl`.
 
 Reporting details live in `docs/REPORTING.md`.
 

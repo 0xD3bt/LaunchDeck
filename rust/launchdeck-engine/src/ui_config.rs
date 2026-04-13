@@ -78,6 +78,13 @@ fn number_value(value: Option<&Value>, fallback: i64) -> i64 {
     }
 }
 
+fn object_value(value: Option<&Value>) -> Value {
+    match value.and_then(Value::as_object) {
+        Some(map) => Value::Object(map.clone()),
+        None => json!({}),
+    }
+}
+
 fn normalize_provider(provider: &str, fallback: &str) -> String {
     let normalized = provider.trim().to_lowercase();
     if normalized.is_empty() {
@@ -96,6 +103,15 @@ fn normalize_decimal_string(value: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         normalized.to_string()
+    }
+}
+
+fn optional_string_field(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
     }
 }
 
@@ -133,6 +149,7 @@ fn normalize_mev_mode(raw: Option<&Value>, fallback: &str) -> String {
 
 fn creation_settings(
     provider: &str,
+    endpoint_profile: &str,
     tip_sol: &str,
     priority_fee_sol: &str,
     auto_fee: bool,
@@ -140,7 +157,7 @@ fn creation_settings(
     dev_buy_sol: &str,
     mev_mode: &str,
 ) -> Value {
-    json!({
+    let mut settings = json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
         "tipSol": normalize_decimal_string(tip_sol, DEFAULT_CREATION_TIP_SOL),
         "priorityFeeSol": normalize_decimal_string(priority_fee_sol, DEFAULT_CREATION_PRIORITY_FEE_SOL),
@@ -148,11 +165,22 @@ fn creation_settings(
         "maxFeeSol": max_fee_sol.trim(),
         "devBuySol": normalize_decimal_string(dev_buy_sol, ""),
         "mevMode": mev_mode,
-    })
+    });
+    if let Some(endpoint_profile) = optional_string_field(endpoint_profile) {
+        settings
+            .as_object_mut()
+            .expect("creation settings object")
+            .insert(
+                "endpointProfile".to_string(),
+                Value::String(endpoint_profile),
+            );
+    }
+    settings
 }
 
 fn trade_settings(
     provider: &str,
+    endpoint_profile: &str,
     priority_fee_sol: &str,
     tip_sol: &str,
     slippage_percent: &str,
@@ -160,7 +188,7 @@ fn trade_settings(
     max_fee_sol: &str,
     mev_mode: &str,
 ) -> Value {
-    json!({
+    let mut settings = json!({
         "provider": normalize_provider(provider, DEFAULT_PROVIDER),
         "priorityFeeSol": normalize_decimal_string(priority_fee_sol, DEFAULT_TRADE_PRIORITY_FEE_SOL),
         "tipSol": normalize_decimal_string(tip_sol, DEFAULT_TRADE_TIP_SOL),
@@ -168,11 +196,21 @@ fn trade_settings(
         "autoFee": auto_fee,
         "maxFeeSol": max_fee_sol.trim(),
         "mevMode": mev_mode,
-    })
+    });
+    if let Some(endpoint_profile) = optional_string_field(endpoint_profile) {
+        settings
+            .as_object_mut()
+            .expect("trade settings object")
+            .insert(
+                "endpointProfile".to_string(),
+                Value::String(endpoint_profile),
+            );
+    }
+    settings
 }
 
 fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
-    let mut buy = trade_settings("", "", "", "", false, "", "off");
+    let mut buy = trade_settings("", "", "", "", "", false, "", "off");
     if let Some(object) = buy.as_object_mut() {
         object.insert(
             "snipeBuyAmountSol".to_string(),
@@ -182,9 +220,9 @@ fn default_preset(id: &str, label: &str, dev_buy_sol: &str) -> Value {
     json!({
         "id": id,
         "label": label,
-        "creationSettings": creation_settings("", "", "", false, "", dev_buy_sol, "off"),
+        "creationSettings": creation_settings("", "", "", "", false, "", dev_buy_sol, "off"),
         "buySettings": buy,
-        "sellSettings": trade_settings("", "", "", "", false, "", "off"),
+        "sellSettings": trade_settings("", "", "", "", "", false, "", "off"),
         "postLaunchStrategy": "none",
     })
 }
@@ -283,6 +321,15 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .unwrap_or(DEFAULT_PROVIDER),
             ),
         creation
+            .and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_creation
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
+        creation
             .and_then(|value| value.get("tipSol"))
             .and_then(Value::as_str)
             .unwrap_or(
@@ -337,6 +384,14 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or(DEFAULT_PROVIDER),
+            ),
+        buy.and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_buy
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
             ),
         buy.and_then(|value| value.get("priorityFeeSol"))
             .and_then(Value::as_str)
@@ -406,6 +461,14 @@ fn normalize_preset_shape(preset: Option<&Value>, fallback_preset: &Value, index
                     .get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or(DEFAULT_PROVIDER),
+            ),
+        sell.and_then(|value| value.get("endpointProfile"))
+            .and_then(Value::as_str)
+            .unwrap_or(
+                fallback_sell
+                    .get("endpointProfile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
             ),
         sell.and_then(|value| value.get("priorityFeeSol"))
             .and_then(Value::as_str)
@@ -519,6 +582,11 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                 "label": first_non_empty(&[string_value(launch_preset.get("label")), string_value(sniper_preset.get("label")), format!("P{}", index + 1)]),
                 "creationSettings": {
                     "provider": normalize_provider(&string_value(launch_execution.get("provider")), string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("provider"))).as_str()),
+                    "endpointProfile": first_non_empty(&[
+                        string_value(launch_execution.get("endpointProfile")),
+                        string_value(launch_defaults.get("endpointProfile")),
+                        string_value(fallback_preset.get("creationSettings").and_then(|v| v.get("endpointProfile"))),
+                    ]),
                     "tipSol": first_non_empty(&[
                         string_value(launch_execution.get("tipSol")),
                         string_value(launch_execution.get("maxTipSol")),
@@ -540,6 +608,13 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                 },
                 "buySettings": {
                     "provider": normalize_provider(&string_value(buy_execution.get("provider")), &string_value(fallback_preset.get("buySettings").and_then(|v| v.get("provider")))),
+                    "endpointProfile": first_non_empty(&[
+                        string_value(buy_execution.get("buyEndpointProfile")),
+                        string_value(buy_execution.get("endpointProfile")),
+                        string_value(buy_defaults.get("buyEndpointProfile")),
+                        string_value(buy_defaults.get("endpointProfile")),
+                        string_value(fallback_preset.get("buySettings").and_then(|v| v.get("endpointProfile"))),
+                    ]),
                     "priorityFeeSol": buy_priority,
                     "tipSol": buy_tip,
                     "slippagePercent": string_value(fallback_preset.get("buySettings").and_then(|v| v.get("slippagePercent"))),
@@ -558,6 +633,15 @@ fn migrate_legacy_config(parsed: &Value) -> Value {
                 },
                 "sellSettings": {
                     "provider": normalize_provider(&string_value(buy_execution.get("provider")), &string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("provider")))),
+                    "endpointProfile": first_non_empty(&[
+                        string_value(buy_execution.get("sellEndpointProfile")),
+                        string_value(buy_execution.get("buyEndpointProfile")),
+                        string_value(buy_execution.get("endpointProfile")),
+                        string_value(buy_defaults.get("sellEndpointProfile")),
+                        string_value(buy_defaults.get("buyEndpointProfile")),
+                        string_value(buy_defaults.get("endpointProfile")),
+                        string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("endpointProfile"))),
+                    ]),
                     "priorityFeeSol": if buy_priority.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("priorityFeeSol"))) } else { buy_priority.clone() },
                     "tipSol": if buy_tip.is_empty() { string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("tipSol"))) } else { buy_tip.clone() },
                     "slippagePercent": string_value(fallback_preset.get("sellSettings").and_then(|v| v.get("slippagePercent"))),
@@ -755,6 +839,41 @@ pub fn normalize_persistent_config(parsed: Value) -> Value {
             "activePresetId": active_preset_id,
             "presetEditing": bool_value(merged_defaults.get("presetEditing"), false),
             "misc": {
+                "sniperDraft": merged_defaults
+                    .get("misc")
+                    .and_then(|value| value.get("sniperDraft"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "feeSplitDraft": merged_defaults
+                    .get("misc")
+                    .and_then(|value| value.get("feeSplitDraft"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "agentSplitDraft": merged_defaults
+                    .get("misc")
+                    .and_then(|value| value.get("agentSplitDraft"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "sniperDraftsByLaunchpad": object_value(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("sniperDraftsByLaunchpad"))
+                ),
+                "feeSplitDraftsByLaunchpad": object_value(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("feeSplitDraftsByLaunchpad"))
+                ),
+                "agentSplitDraftsByLaunchpad": object_value(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("agentSplitDraftsByLaunchpad"))
+                ),
+                "autoSellDraftsByLaunchpad": object_value(
+                    merged_defaults
+                        .get("misc")
+                        .and_then(|value| value.get("autoSellDraftsByLaunchpad"))
+                ),
                 "trackSendBlockHeight": bool_value(
                     merged_defaults.get("misc").and_then(|value| value.get("trackSendBlockHeight")),
                     configured_track_send_block_height_default()
@@ -912,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_new_shape_and_strips_legacy_policy_and_endpoint_profile_fields() {
+    fn normalizes_new_shape_and_preserves_endpoint_profile_while_stripping_policy() {
         let normalized = normalize_persistent_config(json!({
             "defaults": {
                 "launchpad": "pump",
@@ -953,17 +1072,17 @@ mod tests {
         }));
 
         let preset = &normalized["presets"]["items"][0];
-        assert!(preset["creationSettings"].get("endpointProfile").is_none());
+        assert_eq!(preset["creationSettings"]["endpointProfile"], "eu");
         assert!(preset["creationSettings"].get("policy").is_none());
-        assert!(preset["buySettings"].get("endpointProfile").is_none());
+        assert_eq!(preset["buySettings"]["endpointProfile"], "asia");
         assert!(preset["buySettings"].get("policy").is_none());
-        assert!(preset["sellSettings"].get("endpointProfile").is_none());
+        assert_eq!(preset["sellSettings"]["endpointProfile"], "fra");
         assert!(preset["sellSettings"].get("policy").is_none());
         assert_eq!(preset["buySettings"]["snipeBuyAmountSol"], "0.5");
     }
 
     #[test]
-    fn migrates_legacy_shape_without_persisting_endpoint_profile_or_policy() {
+    fn migrates_legacy_shape_preserving_endpoint_profile_while_dropping_policy() {
         let normalized = normalize_persistent_config(json!({
             "defaults": {
                 "launchpad": "pump",
@@ -1006,9 +1125,9 @@ mod tests {
         let preset = &normalized["presets"]["items"][0];
         assert_eq!(preset["creationSettings"]["provider"], "helius-sender");
         assert_eq!(preset["buySettings"]["provider"], "jito-bundle");
-        assert!(preset["creationSettings"].get("endpointProfile").is_none());
-        assert!(preset["buySettings"].get("endpointProfile").is_none());
-        assert!(preset["sellSettings"].get("endpointProfile").is_none());
+        assert_eq!(preset["creationSettings"]["endpointProfile"], "us");
+        assert_eq!(preset["buySettings"]["endpointProfile"], "ams");
+        assert_eq!(preset["sellSettings"]["endpointProfile"], "ams");
         assert!(preset["creationSettings"].get("policy").is_none());
         assert!(preset["buySettings"].get("policy").is_none());
         assert!(preset["sellSettings"].get("policy").is_none());

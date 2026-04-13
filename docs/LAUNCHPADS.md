@@ -1,6 +1,6 @@
 # Launchpads
 
-This page documents the launchpads exposed in LaunchDeck and separates the supported paths from the experimental ones.
+This page documents the launchpads exposed in LaunchDeck and their current support status.
 
 Treat this page as the most explicit public support matrix for launchpad behavior. Other pages such as `README.md` and `ARCHITECTURE.md` summarize the same surface more briefly.
 
@@ -10,9 +10,6 @@ Treat this page as the most explicit public support matrix for launchpad behavio
 
 - `pump`
 - `bonk`
-
-### Experimental
-
 - `bagsapp` when Bags credentials are configured
 
 If you want the most predictable path, start with Pump or Bonk before trying Bagsapp.
@@ -130,13 +127,13 @@ Current Bonk characteristics:
 - Pump-only modes such as `cashback`, `agent-custom`, `agent-unlocked`, and `agent-locked` are rejected
 - fee-sharing setup is rejected
 - `mayhem` is rejected
-- per-sniper `postBuySell` chaining is not supported yet
+- per-sniper `postBuySell` chaining is supported; slot offsets are measured after the matching buy confirms
 
 ## Bagsapp
 
-Status: `experimental` (`configured-required` until Bags credentials are present; `unverified` once enabled)
+Status: `supported` (`configured-required` until Bags credentials are present)
 
-Bagsapp is available when Bags credentials are configured, but it is still experimental in this repo.
+Bagsapp is a supported launchpad path when Bags credentials are configured.
 
 Current Bags behavior includes:
 
@@ -145,7 +142,6 @@ Current Bags behavior includes:
 - `bags-1-025`
 - quote asset `sol`
 - wallet-only identity
-- linked identity when the selected LaunchDeck wallet belongs to the authenticated Bags account
 - immediate dev buy
 - same-time sniper buys
 - delayed sniper buys
@@ -156,7 +152,7 @@ Current Bags behavior includes:
 Current Bags characteristics:
 
 - launch assembly uses the hosted Bags API or SDK bridge
-- linked identity is validated against the selected LaunchDeck wallet
+- the shipped UI uses wallet-only identity for the normal operator flow
 - same-time buy compilation is deferred until after launch submission so the trade route can resolve against the live mint
 - history persists the identity mode and display name, but not sensitive auth material
 
@@ -173,4 +169,4 @@ Choose `pump` if you want the most native LaunchDeck path.
 
 Choose `bonk` if you want the supported Bonk and Bonkers path, including `usd1` and follow automation.
 
-Choose `bagsapp` only if you are comfortable using an experimental path and have Bags credentials configured.
+Choose `bagsapp` when you want the supported Bags path and have Bags credentials configured.

@@ -222,11 +222,11 @@ pub fn configured_standard_rpc_submit_endpoints() -> Vec<String> {
         "LAUNCHDECK_EXTRA_STANDARD_RPC_SEND_URLS",
         "LAUNCHDECK_STANDARD_RPC_SEND_URLS",
     ])
-        .split(',')
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
+    .split(',')
+    .map(|value| value.trim())
+    .filter(|value| !value.is_empty())
+    .map(str::to_string)
+    .collect()
 }
 
 pub fn helius_sender_endpoint_override_active() -> bool {
@@ -395,9 +395,32 @@ pub fn configured_helius_ws_url_trimmed() -> Option<String> {
     }
 }
 
+fn derived_solana_ws_url_from_rpc_url() -> Option<String> {
+    let rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_default();
+    let rpc_url = rpc_url.trim();
+    if rpc_url.is_empty() {
+        return None;
+    }
+    if let Some(rest) = rpc_url.strip_prefix("https://") {
+        return Some(format!("wss://{rest}"));
+    }
+    if let Some(rest) = rpc_url.strip_prefix("http://") {
+        if let Some(host) = rest.strip_suffix(":8899") {
+            return Some(format!("ws://{host}:8900"));
+        }
+        return Some(format!("ws://{rest}"));
+    }
+    if rpc_url.starts_with("wss://") || rpc_url.starts_with("ws://") {
+        return Some(rpc_url.to_string());
+    }
+    None
+}
+
 /// WebSocket URL for Helius `transactionSubscribe`. Prefers `HELIUS_WS_URL` when set; otherwise a
 /// `SOLANA_WS_URL` / transport watch endpoint that looks Helius-hosted.
-pub fn resolved_helius_transaction_subscribe_ws_url(base_watch_endpoint: Option<&str>) -> Option<String> {
+pub fn resolved_helius_transaction_subscribe_ws_url(
+    base_watch_endpoint: Option<&str>,
+) -> Option<String> {
     if let Some(url) = configured_helius_ws_url_trimmed() {
         return Some(url);
     }
@@ -440,6 +463,9 @@ pub fn configured_watch_endpoints_for_provider(
         return vec![explicit_ws.trim().to_string()];
     }
     if let Some(url) = configured_helius_ws_url_trimmed() {
+        return vec![url];
+    }
+    if let Some(url) = derived_solana_ws_url_from_rpc_url() {
         return vec![url];
     }
     vec![]
@@ -683,9 +709,7 @@ pub fn build_transport_plan(
     }
     if resolved == "hellomoon" {
         if !hellomoon_api_key_configured() {
-            warnings.push(
-                "Hello Moon QUIC requires HELLOMOON_API_KEY.".to_string(),
-            );
+            warnings.push("Hello Moon QUIC requires HELLOMOON_API_KEY.".to_string());
         }
         if let Some(override_endpoint) = configured_hellomoon_quic_override() {
             warnings.push(format!(
@@ -1076,7 +1100,10 @@ mod tests {
         config.execution.endpointProfile = "asia".to_string();
         let plan = build_transport_plan(&config.execution, 2);
         assert_eq!(plan.resolvedEndpointProfile, "asia");
-        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
+        assert_eq!(
+            plan.helloMoonQuicEndpoints,
+            vec!["tyo.lunar-lander.hellomoon.io:16888"]
+        );
     }
 
     #[test]
@@ -1085,7 +1112,10 @@ mod tests {
         config.execution.endpointProfile = "sg".to_string();
         let plan = build_transport_plan(&config.execution, 2);
         assert_eq!(plan.resolvedEndpointProfile, "sg");
-        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
+        assert_eq!(
+            plan.helloMoonQuicEndpoints,
+            vec!["tyo.lunar-lander.hellomoon.io:16888"]
+        );
     }
 
     #[test]
@@ -1094,7 +1124,10 @@ mod tests {
         config.execution.endpointProfile = "tyo".to_string();
         let plan = build_transport_plan(&config.execution, 2);
         assert_eq!(plan.resolvedEndpointProfile, "tyo");
-        assert_eq!(plan.helloMoonQuicEndpoints, vec!["tyo.lunar-lander.hellomoon.io:16888"]);
+        assert_eq!(
+            plan.helloMoonQuicEndpoints,
+            vec!["tyo.lunar-lander.hellomoon.io:16888"]
+        );
     }
 
     #[test]
@@ -1166,7 +1199,9 @@ mod tests {
                 .as_deref(),
             Some("wss://mainnet.helius-rpc.com/?k=1")
         );
-        assert!(resolved_helius_transaction_subscribe_ws_url(Some("wss://rpc.shyft.to/ws")).is_none());
+        assert!(
+            resolved_helius_transaction_subscribe_ws_url(Some("wss://rpc.shyft.to/ws")).is_none()
+        );
         assert!(resolved_helius_transaction_subscribe_ws_url(None).is_none());
     }
 

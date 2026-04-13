@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solana_sdk::transaction::VersionedTransaction;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,9 +15,16 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use crate::transport::{JitoBundleEndpoint, TransportPlan, configured_hellomoon_api_key};
+use crate::transport::{
+    JitoBundleEndpoint, TransportPlan, configured_enable_helius_transaction_subscribe,
+    configured_hellomoon_api_key, configured_watch_endpoints_for_provider,
+    prefers_helius_transaction_subscribe_path, resolved_helius_transaction_subscribe_ws_url,
+};
 
 const SIGNATURE_CONFIRMATION_RPC_POLL_INTERVAL_MS: u64 = 400;
+const HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS: u64 = 550;
+const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
+pub const COMPILE_BLOCKHASH_MIN_REMAINING_BLOCKS: u64 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledTransaction {
@@ -67,8 +74,10 @@ pub struct SentResult {
     pub firstObservedSlot: Option<u64>,
     pub firstObservedAtMs: Option<u128>,
     pub confirmedAtMs: Option<u128>,
-    pub sendObservedBlockHeight: Option<u64>,
-    pub confirmedObservedBlockHeight: Option<u64>,
+    #[serde(default, alias = "sendObservedBlockHeight")]
+    pub sendObservedSlot: Option<u64>,
+    #[serde(default, alias = "confirmedObservedBlockHeight")]
+    pub confirmedObservedSlot: Option<u64>,
     pub confirmedSlot: Option<u64>,
     pub computeUnitLimit: Option<u64>,
     pub computeUnitPriceMicroLamports: Option<u64>,
@@ -76,6 +85,26 @@ pub struct SentResult {
     pub inlineTipAccount: Option<String>,
     pub bundleId: Option<String>,
     pub attemptedBundleIds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transactionSubscribeAccountRequired: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub postTokenBalances: Vec<TransactionTokenBalance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmedTokenBalanceRaw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balanceWatchAccount: Option<String>,
+    #[serde(skip)]
+    pub capturePostTokenBalances: bool,
+    #[serde(skip)]
+    pub requestFullTransactionDetails: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransactionTokenBalance {
+    pub mint: String,
+    pub amount: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -86,19 +115,76 @@ pub struct SendTimingBreakdown {
 
 struct ConfirmationDetails {
     status: Value,
-    confirmed_observed_block_height: Option<u64>,
+    confirmed_observed_slot: Option<u64>,
     confirmed_slot: Option<u64>,
     confirmation_source: &'static str,
     first_observed_status: Option<String>,
     first_observed_slot: Option<u64>,
     first_observed_at_ms: Option<u128>,
     confirmed_at_ms: Option<u128>,
+    post_token_balances: Vec<TransactionTokenBalance>,
+    confirmed_token_balance_raw: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HeliusTransactionSubscribeRequest {
+    index: usize,
+    signature: String,
+    account_required: Vec<String>,
+    capture_post_token_balances: bool,
+    request_full_transaction_details: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StandardTokenAccountWatchRequest {
+    index: usize,
+    account: String,
+}
+
+fn build_standard_token_account_watches(
+    submitted: &[SentResult],
+) -> (Vec<StandardTokenAccountWatchRequest>, Vec<String>) {
+    let mut grouped = HashMap::<String, Vec<(usize, String)>>::new();
+    for (index, result) in submitted.iter().enumerate() {
+        if let Some(account) = result.balanceWatchAccount.as_ref() {
+            grouped
+                .entry(account.clone())
+                .or_default()
+                .push((index, result.label.clone()));
+        }
+    }
+
+    let mut requests = Vec::new();
+    let mut warnings = Vec::new();
+    for (account, entries) in grouped {
+        if entries.len() == 1 {
+            requests.push(StandardTokenAccountWatchRequest {
+                index: entries[0].0,
+                account,
+            });
+            continue;
+        }
+        let labels = entries
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "Standard websocket ATA-first confirmation was disabled for {} transaction(s) sharing token account {}: {}. Falling back to exact signature confirmation for those transactions.",
+            entries.len(),
+            account,
+            labels
+        ));
+    }
+    requests.sort_by_key(|request| request.index);
+    (requests, warnings)
 }
 
 const BLOCKHASH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const BLOCKHASH_MAX_AGE: Duration = Duration::from_secs(20);
 const DEFAULT_BLOCK_HEIGHT_CACHE_TTL_MS: u64 = 200;
 const DEFAULT_BLOCK_HEIGHT_SAMPLE_MAX_AGE_MS: u64 = 1_000;
+const HELIUS_TRANSACTION_SUBSCRIBE_ACCOUNT_REQUIRED_LIMIT: usize = 3;
 
 #[derive(Clone)]
 struct CachedBlockhash {
@@ -113,6 +199,12 @@ struct CachedBlockHeight {
     fetched_at: Instant,
 }
 
+#[derive(Clone)]
+struct CachedSlot {
+    value: u64,
+    fetched_at: Instant,
+}
+
 fn blockhash_cache() -> &'static Mutex<HashMap<String, CachedBlockhash>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedBlockhash>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -123,7 +215,17 @@ fn block_height_cache() -> &'static AsyncMutex<HashMap<String, CachedBlockHeight
     CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
+fn slot_cache() -> &'static AsyncMutex<HashMap<String, CachedSlot>> {
+    static CACHE: OnceLock<AsyncMutex<HashMap<String, CachedSlot>>> = OnceLock::new();
+    CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
 fn block_height_refresh_inflight() -> &'static AsyncMutex<HashSet<String>> {
+    static INFLIGHT: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| AsyncMutex::new(HashSet::new()))
+}
+
+fn slot_refresh_inflight() -> &'static AsyncMutex<HashSet<String>> {
     static INFLIGHT: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
     INFLIGHT.get_or_init(|| AsyncMutex::new(HashSet::new()))
 }
@@ -212,6 +314,10 @@ fn block_height_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
     blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
 }
 
+fn slot_cache_lookup_key(rpc_url: &str, commitment: &str) -> String {
+    blockhash_cache_key(&configured_warm_rpc_url(rpc_url), commitment)
+}
+
 async fn refresh_block_height_sample(rpc_url: &str, commitment: &str) -> Result<u64, String> {
     let block_height_rpc_url = configured_warm_rpc_url(rpc_url);
     let cache_key = blockhash_cache_key(&block_height_rpc_url, commitment);
@@ -239,6 +345,33 @@ async fn refresh_block_height_sample(rpc_url: &str, commitment: &str) -> Result<
     Ok(value)
 }
 
+async fn refresh_slot_sample(rpc_url: &str, commitment: &str) -> Result<u64, String> {
+    let slot_rpc_url = configured_warm_rpc_url(rpc_url);
+    let cache_key = blockhash_cache_key(&slot_rpc_url, commitment);
+    let result = rpc_request(
+        &slot_rpc_url,
+        "getSlot",
+        json!([
+            {
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    let value = result
+        .as_u64()
+        .ok_or_else(|| "RPC getSlot did not return a slot.".to_string())?;
+    let mut cache = slot_cache().lock().await;
+    cache.insert(
+        cache_key,
+        CachedSlot {
+            value,
+            fetched_at: Instant::now(),
+        },
+    );
+    Ok(value)
+}
+
 async fn spawn_block_height_sample_refresh_if_needed(rpc_url: &str, commitment: &str) {
     let cache_key = block_height_cache_lookup_key(rpc_url, commitment);
     {
@@ -253,6 +386,24 @@ async fn spawn_block_height_sample_refresh_if_needed(rpc_url: &str, commitment: 
     tokio::spawn(async move {
         let _ = refresh_block_height_sample(&task_rpc_url, &task_commitment).await;
         let mut inflight = block_height_refresh_inflight().lock().await;
+        inflight.remove(&cache_key);
+    });
+}
+
+async fn spawn_slot_sample_refresh_if_needed(rpc_url: &str, commitment: &str) {
+    let cache_key = slot_cache_lookup_key(rpc_url, commitment);
+    {
+        let mut inflight = slot_refresh_inflight().lock().await;
+        if inflight.contains(&cache_key) {
+            return;
+        }
+        inflight.insert(cache_key.clone());
+    }
+    let task_rpc_url = rpc_url.to_string();
+    let task_commitment = commitment.to_string();
+    tokio::spawn(async move {
+        let _ = refresh_slot_sample(&task_rpc_url, &task_commitment).await;
+        let mut inflight = slot_refresh_inflight().lock().await;
         inflight.remove(&cache_key);
     });
 }
@@ -280,6 +431,28 @@ async fn fetch_sampled_block_height_snapshot(
         }
     }
     refresh_block_height_sample(rpc_url, commitment).await
+}
+
+async fn fetch_sampled_slot_snapshot(rpc_url: &str, commitment: &str) -> Result<u64, String> {
+    let cache_key = slot_cache_lookup_key(rpc_url, commitment);
+    let ttl = configured_block_height_cache_ttl();
+    let sample_max_age = configured_block_height_sample_max_age();
+    let cached = {
+        let cache = slot_cache().lock().await;
+        cache
+            .get(&cache_key)
+            .map(|entry| (entry.value, entry.fetched_at.elapsed()))
+    };
+    if let Some((value, age)) = cached {
+        if age <= ttl {
+            return Ok(value);
+        }
+        if age <= sample_max_age {
+            spawn_slot_sample_refresh_if_needed(rpc_url, commitment).await;
+            return Ok(value);
+        }
+    }
+    refresh_slot_sample(rpc_url, commitment).await
 }
 
 fn get_cached_blockhash(rpc_url: &str, commitment: &str) -> Option<(String, u64)> {
@@ -403,6 +576,23 @@ pub async fn fetch_current_block_height_fresh(
     refresh_block_height_sample(rpc_url, commitment).await
 }
 
+pub async fn fetch_current_slot(rpc_url: &str, commitment: &str) -> Result<u64, String> {
+    let cache_key = slot_cache_lookup_key(rpc_url, commitment);
+    let ttl = configured_block_height_cache_ttl();
+    let cache = slot_cache().lock().await;
+    if let Some(entry) = cache.get(&cache_key)
+        && entry.fetched_at.elapsed() <= ttl
+    {
+        return Ok(entry.value);
+    }
+    drop(cache);
+    refresh_slot_sample(rpc_url, commitment).await
+}
+
+pub async fn fetch_current_slot_fresh(rpc_url: &str, commitment: &str) -> Result<u64, String> {
+    refresh_slot_sample(rpc_url, commitment).await
+}
+
 pub async fn fetch_latest_blockhash(
     rpc_url: &str,
     commitment: &str,
@@ -433,6 +623,33 @@ pub async fn fetch_latest_blockhash(
     Ok((blockhash, last_valid_block_height))
 }
 
+pub async fn is_blockhash_valid(
+    rpc_url: &str,
+    blockhash: &str,
+    commitment: &str,
+) -> Result<bool, String> {
+    let trimmed = blockhash.trim();
+    if trimmed.is_empty() {
+        return Err("Blockhash was empty.".to_string());
+    }
+    let result = rpc_request(
+        rpc_url,
+        "isBlockhashValid",
+        json!([
+            trimmed,
+            {
+                "commitment": commitment,
+            }
+        ]),
+    )
+    .await?;
+    result
+        .get("value")
+        .and_then(Value::as_bool)
+        .or_else(|| result.as_bool())
+        .ok_or_else(|| "RPC isBlockhashValid did not return a boolean value.".to_string())
+}
+
 pub async fn fetch_latest_blockhash_cached(
     rpc_url: &str,
     commitment: &str,
@@ -448,6 +665,64 @@ pub async fn fetch_latest_blockhash_cached(
         last_valid_block_height,
     );
     Ok((blockhash, last_valid_block_height))
+}
+
+pub async fn fetch_latest_blockhash_fresh_or_recent(
+    rpc_url: &str,
+    commitment: &str,
+    min_remaining_block_heights: u64,
+) -> Result<(String, u64), String> {
+    if let Some((blockhash, last_valid_block_height)) = get_cached_blockhash(rpc_url, commitment) {
+        match fetch_sampled_block_height_snapshot(rpc_url, commitment).await {
+            Ok(current_block_height)
+                if last_valid_block_height.saturating_sub(current_block_height)
+                    >= min_remaining_block_heights =>
+            {
+                return Ok((blockhash, last_valid_block_height));
+            }
+            Err(_) if min_remaining_block_heights == 0 => {
+                return Ok((blockhash, last_valid_block_height));
+            }
+            _ => {}
+        }
+    }
+    let (blockhash, last_valid_block_height) = fetch_latest_blockhash(rpc_url, commitment).await?;
+    cache_blockhash(
+        rpc_url,
+        commitment,
+        blockhash.clone(),
+        last_valid_block_height,
+    );
+    Ok((blockhash, last_valid_block_height))
+}
+
+/// Returns `prime` when it carries a non-empty blockhash for the same `rpc_url`/`commitment`
+/// the caller would otherwise fetch (e.g. [`crate::launchpad_warm::build_launchpad_warm_context`]),
+/// avoiding a redundant cache lookup and RPC when absent from cache.
+pub async fn fetch_latest_blockhash_cached_with_prime(
+    rpc_url: &str,
+    commitment: &str,
+    prime: Option<(String, u64)>,
+    min_remaining_block_heights: u64,
+) -> Result<(String, u64), String> {
+    if let Some((blockhash, last_valid_block_height)) = prime {
+        let trimmed = blockhash.trim();
+        if !trimmed.is_empty() {
+            match fetch_sampled_block_height_snapshot(rpc_url, commitment).await {
+                Ok(current_block_height)
+                    if last_valid_block_height.saturating_sub(current_block_height)
+                        >= min_remaining_block_heights =>
+                {
+                    return Ok((trimmed.to_string(), last_valid_block_height));
+                }
+                Err(_) if min_remaining_block_heights == 0 => {
+                    return Ok((trimmed.to_string(), last_valid_block_height));
+                }
+                _ => {}
+            }
+        }
+    }
+    fetch_latest_blockhash_fresh_or_recent(rpc_url, commitment, min_remaining_block_heights).await
 }
 
 pub async fn refresh_latest_blockhash_cache(rpc_url: &str, commitment: &str) -> Result<(), String> {
@@ -711,6 +986,12 @@ fn commitment_satisfied(actual: &str, required: &str) -> bool {
     commitment_rank(actual) >= commitment_rank(required)
 }
 
+const WEBSOCKET_CONFIRMATION_TIMEOUT_SECS: u64 = 60;
+const BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS: u32 = 60;
+const BATCH_CONFIRMATION_POLL_INTERVAL_MS: u64 = 1_000;
+const TOKEN_ACCOUNT_RECONCILE_MAX_ATTEMPTS: u32 = 4;
+const TOKEN_ACCOUNT_RECONCILE_INTERVAL_MS: u64 = 20;
+
 fn signature_from_serialized_base64(serialized_base64: &str) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     let bytes = BASE64.decode(serialized_base64).ok()?;
@@ -725,18 +1006,190 @@ pub(crate) fn precompute_transaction_signature(serialized_base64: &str) -> Optio
     signature_from_serialized_base64(serialized_base64)
 }
 
+pub fn derive_helius_transaction_subscribe_account_required(
+    serialized_base64: &str,
+) -> Vec<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+    let bytes = match BASE64.decode(serialized_base64) {
+        Ok(bytes) => bytes,
+        Err(_) => return vec![],
+    };
+    let transaction: VersionedTransaction = match bincode::deserialize(&bytes) {
+        Ok(transaction) => transaction,
+        Err(_) => return vec![],
+    };
+    let static_keys = transaction.message.static_account_keys();
+    let mut account_required = static_keys
+        .iter()
+        .map(|key| key.to_string())
+        .filter(|key| !key.trim().is_empty() && key != SYSTEM_PROGRAM_ID_STR)
+        .take(HELIUS_TRANSACTION_SUBSCRIBE_ACCOUNT_REQUIRED_LIMIT)
+        .collect::<Vec<_>>();
+    if account_required.is_empty() {
+        account_required = static_keys
+            .iter()
+            .map(|key| key.to_string())
+            .filter(|key| !key.trim().is_empty())
+            .take(1)
+            .collect::<Vec<_>>();
+    }
+    account_required
+}
+
 fn shared_http_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(Client::new)
 }
 
+fn missing_helius_account_required_warning(targets: &[String]) -> String {
+    format!(
+        "UNEXPECTED: Helius transactionSubscribe is enabled but derived accountRequired filters are missing for {}. This should not happen for a valid compiled transaction. Falling back to standard websocket.",
+        targets.join(", ")
+    )
+}
+
+fn terminal_confirmation_error(signature: &str, err: Value) -> String {
+    format!("Transaction {signature} failed on-chain: {err}")
+}
+
+fn is_terminal_confirmation_error(error: &str) -> bool {
+    error.contains("failed on-chain:") || error.contains("notification reported error:")
+}
+
+async fn reconcile_signature_statuses_once(
+    rpc_url: &str,
+    requests: &[(usize, String, bool)],
+    commitment: &str,
+) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
+    if requests.is_empty() {
+        return Ok(vec![]);
+    }
+    let result = rpc_request(
+        rpc_url,
+        "getSignatureStatuses",
+        json!([
+            requests
+                .iter()
+                .map(|(_, signature, _)| Value::String(signature.clone()))
+                .collect::<Vec<_>>(),
+            { "searchTransactionHistory": true }
+        ]),
+    )
+    .await?;
+    let values = result
+        .get("value")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let observed_at_ms = current_time_ms();
+    let mut reconciled = Vec::new();
+    for (position, (index, signature, capture_post_token_balances)) in requests.iter().enumerate() {
+        let status = values.get(position).cloned().unwrap_or(Value::Null);
+        if status.is_null() {
+            continue;
+        }
+        let err = status.get("err").cloned().unwrap_or(Value::Null);
+        if !err.is_null() {
+            return Err(terminal_confirmation_error(signature, err));
+        }
+        let actual_commitment = status
+            .get("confirmationStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("processed")
+            .to_string();
+        if !commitment_satisfied(&actual_commitment, commitment) || *capture_post_token_balances {
+            continue;
+        }
+        let slot = status.get("slot").and_then(Value::as_u64);
+        reconciled.push((
+            *index,
+            ConfirmationDetails {
+                status,
+                confirmed_observed_slot: slot,
+                confirmed_slot: slot,
+                confirmation_source: "rpc-status-reconcile",
+                first_observed_status: Some(actual_commitment),
+                first_observed_slot: slot,
+                first_observed_at_ms: Some(observed_at_ms),
+                confirmed_at_ms: Some(observed_at_ms),
+                post_token_balances: vec![],
+                confirmed_token_balance_raw: None,
+            },
+        ));
+    }
+    Ok(reconciled)
+}
+
 async fn wait_for_confirmation(
     rpc_url: &str,
     signature: &str,
+    account_required: &[String],
+    capture_post_token_balances: bool,
+    request_full_transaction_details: bool,
     commitment: &str,
     max_attempts: u32,
     track_confirmed_block_height: bool,
 ) -> Result<ConfirmationDetails, String> {
+    if let Some(endpoint) = preferred_confirmation_websocket_endpoint(None) {
+        let standard_endpoint = default_confirmation_watch_endpoint();
+        let prefer_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
+            configured_enable_helius_transaction_subscribe(),
+            standard_endpoint.as_deref(),
+        );
+        if prefer_helius_transaction_subscribe && !account_required.is_empty() {
+            match wait_for_confirmation_helius_transaction_subscribe(
+                &endpoint,
+                rpc_url,
+                signature,
+                account_required,
+                capture_post_token_balances,
+                request_full_transaction_details,
+                commitment,
+                track_confirmed_block_height,
+            )
+            .await
+            {
+                Ok(confirmation) => return Ok(confirmation),
+                Err(error) => {
+                    if is_terminal_confirmation_error(&error) {
+                        return Err(error);
+                    }
+                    if let Some(standard_endpoint) = standard_endpoint.as_deref() {
+                        if let Ok(confirmation) = wait_for_confirmation_websocket(
+                            standard_endpoint,
+                            rpc_url,
+                            signature,
+                            &[],
+                            commitment,
+                            track_confirmed_block_height,
+                        )
+                        .await
+                        {
+                            return Ok(confirmation);
+                        }
+                    }
+                }
+            }
+        } else if prefer_helius_transaction_subscribe {
+            let warning = missing_helius_account_required_warning(&[format!(
+                "transaction {}",
+                signature
+            )]);
+            eprintln!("{warning}");
+        } else if let Ok(confirmation) = wait_for_confirmation_websocket(
+            &endpoint,
+            rpc_url,
+            signature,
+            &[],
+            commitment,
+            track_confirmed_block_height,
+        )
+        .await
+        {
+            return Ok(confirmation);
+        }
+    }
     wait_for_confirmation_polling(
         rpc_url,
         signature,
@@ -746,6 +1199,33 @@ async fn wait_for_confirmation(
         track_confirmed_block_height,
     )
     .await
+}
+
+fn helius_transaction_subscribe_signature_params(
+    signature: &str,
+    commitment: &str,
+    account_required: &[String],
+    capture_post_token_balances: bool,
+    request_full_transaction_details: bool,
+) -> Value {
+    json!([
+        {
+            "signature": signature,
+            "accountRequired": account_required,
+            "vote": false
+        },
+        {
+            "commitment": commitment,
+            "encoding": "jsonParsed",
+            "transactionDetails": if capture_post_token_balances || request_full_transaction_details {
+                "full"
+            } else {
+                "none"
+            },
+            "showRewards": false,
+            "maxSupportedTransactionVersion": 0
+        }
+    ])
 }
 
 async fn wait_for_confirmation_polling(
@@ -760,21 +1240,7 @@ async fn wait_for_confirmation_polling(
     let mut first_observed_slot = None;
     let mut first_observed_at_ms = None;
     for _ in 0..max_attempts {
-        let result = rpc_request(
-            rpc_url,
-            "getSignatureStatuses",
-            json!([
-                [signature],
-                { "searchTransactionHistory": true }
-            ]),
-        )
-        .await?;
-        if let Some(status) = result
-            .get("value")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .cloned()
-        {
+        if let Some(status) = fetch_signature_status_once(rpc_url, signature).await? {
             if status.is_null() {
                 sleep(Duration::from_millis(poll_interval_ms)).await;
                 continue;
@@ -796,8 +1262,8 @@ async fn wait_for_confirmation_polling(
                 ));
             }
             if commitment_satisfied(actual_commitment, commitment) {
-                let confirmed_observed_block_height = if track_confirmed_block_height {
-                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                let sampled_confirmed_slot = if track_confirmed_block_height {
+                    fetch_sampled_slot_snapshot(rpc_url, commitment)
                         .await
                         .ok()
                 } else {
@@ -806,13 +1272,15 @@ async fn wait_for_confirmation_polling(
                 let confirmed_slot = status.get("slot").and_then(Value::as_u64);
                 return Ok(ConfirmationDetails {
                     status,
-                    confirmed_observed_block_height,
+                    confirmed_observed_slot: confirmed_slot.or(sampled_confirmed_slot),
                     confirmed_slot,
                     confirmation_source: "rpc-polling",
                     first_observed_status,
                     first_observed_slot,
                     first_observed_at_ms,
                     confirmed_at_ms: Some(current_time_ms()),
+                    post_token_balances: vec![],
+                    confirmed_token_balance_raw: None,
                 });
             }
         }
@@ -822,6 +1290,23 @@ async fn wait_for_confirmation_polling(
         "Timed out waiting for transaction {} to reach {}.",
         signature, commitment
     ))
+}
+
+async fn fetch_signature_status_once(rpc_url: &str, signature: &str) -> Result<Option<Value>, String> {
+    let result = rpc_request(
+        rpc_url,
+        "getSignatureStatuses",
+        json!([
+            [signature],
+            { "searchTransactionHistory": true }
+        ]),
+    )
+    .await?;
+    Ok(result
+        .get("value")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .cloned())
 }
 
 type WsStream =
@@ -865,7 +1350,9 @@ async fn send_jsonrpc_request(
 }
 
 async fn subscribe(ws: &mut WsStream, method: &str, params: Value) -> Result<(), String> {
-    send_jsonrpc_request(ws, 1, method, params).await.map(|_| ())
+    send_jsonrpc_request(ws, 1, method, params)
+        .await
+        .map(|_| ())
 }
 
 fn jsonrpc_subscription_id(payload: &Value, method: &str) -> Result<i64, String> {
@@ -880,8 +1367,8 @@ pub async fn prewarm_watch_websocket_endpoint(endpoint: &str) -> Result<(), Stri
     let subscribe_payload =
         send_jsonrpc_request(&mut ws, 70_001, "slotSubscribe", json!([])).await?;
     let subscription_id = jsonrpc_subscription_id(&subscribe_payload, "slotSubscribe")?;
-    let _ = send_jsonrpc_request(&mut ws, 70_002, "slotUnsubscribe", json!([subscription_id]))
-        .await;
+    let _ =
+        send_jsonrpc_request(&mut ws, 70_002, "slotUnsubscribe", json!([subscription_id])).await;
     Ok(())
 }
 
@@ -893,7 +1380,7 @@ pub async fn prewarm_helius_transaction_subscribe_endpoint(endpoint: &str) -> Re
         "transactionSubscribe",
         json!([
             {
-                "failed": false,
+                "accountRequired": [SYSTEM_PROGRAM_ID_STR],
                 "vote": false
             },
             {
@@ -946,13 +1433,357 @@ async fn next_json_message(ws: &mut WsStream) -> Result<Value, String> {
     }
 }
 
-async fn wait_for_confirmation_websocket(
-    endpoint: &str,
+fn extract_signature_notification(payload: &Value) -> Option<(u64, Option<u64>, Value)> {
+    if payload.get("method").and_then(Value::as_str) != Some("signatureNotification") {
+        return None;
+    }
+    let params = payload.get("params")?;
+    let subscription_id = params.get("subscription").and_then(Value::as_u64)?;
+    let context_slot = params
+        .get("result")
+        .and_then(|result| result.get("context"))
+        .and_then(|context| context.get("slot"))
+        .and_then(Value::as_u64);
+    let value = params
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()?;
+    if !value.is_object() || value.get("err").is_none() {
+        return None;
+    }
+    Some((subscription_id, context_slot, value))
+}
+
+fn extract_account_notification(payload: &Value) -> Option<(u64, Option<u64>, Value)> {
+    let params = payload.get("params")?;
+    let subscription_id = params.get("subscription").and_then(Value::as_u64)?;
+    let context_slot = params
+        .get("result")
+        .and_then(|result| result.get("context"))
+        .and_then(|context| context.get("slot"))
+        .and_then(Value::as_u64);
+    let value = params
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Some((subscription_id, context_slot, value))
+}
+
+fn extract_transaction_notification(payload: &Value) -> Option<(u64, Option<u64>, Value)> {
+    let params = payload.get("params")?;
+    let subscription_id = params.get("subscription").and_then(Value::as_u64)?;
+    let result = params.get("result")?.clone();
+    let slot = [
+        result.get("slot"),
+        result.pointer("/transaction/slot"),
+        result.pointer("/transaction/transaction/slot"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_u64);
+    Some((subscription_id, slot, result))
+}
+
+fn extract_transaction_notification_error(result: &Value) -> Option<Value> {
+    [
+        result.get("err"),
+        result.pointer("/status/Err"),
+        result.pointer("/meta/err"),
+        result.pointer("/meta/status/Err"),
+        result.pointer("/transaction/meta/err"),
+        result.pointer("/transaction/meta/status/Err"),
+        result.pointer("/transaction/transaction/meta/err"),
+        result.pointer("/transaction/transaction/meta/status/Err"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_null())
+    .cloned()
+    .or_else(|| extract_transaction_notification_log_error(result))
+}
+
+fn extract_transaction_notification_log_error(result: &Value) -> Option<Value> {
+    let logs = [
+        result.get("logMessages"),
+        result.pointer("/meta/logMessages"),
+        result.pointer("/transaction/meta/logMessages"),
+        result.pointer("/transaction/transaction/meta/logMessages"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_array)?
+    .iter()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .filter(|entry| !entry.is_empty())
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if logs.is_empty() {
+        return None;
+    }
+
+    let normalized = logs.join("\n").to_ascii_lowercase();
+    let looks_like_pump_creator_vault_seed_mismatch =
+        normalized.contains("creator_vault")
+            && normalized.contains("constraintseeds")
+            && (normalized.contains("error number: 2006")
+                || normalized.contains("custom program error: 0x7d6"));
+    if !looks_like_pump_creator_vault_seed_mismatch {
+        return None;
+    }
+
+    Some(json!({
+        "InstructionError": [2, { "Custom": 2006 }],
+        "detectedFromLogs": true,
+        "reason": "pump_creator_vault_constraint_seeds",
+        "matchedLogs": logs,
+    }))
+}
+
+fn read_spl_token_account_amount(data: &[u8]) -> Result<u64, String> {
+    if data.len() < 72 {
+        return Err("Token account data was shorter than expected.".to_string());
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&data[64..72]);
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn extract_account_notification_token_balance_raw(value: &Value) -> Result<Option<String>, String> {
+    let Some(data) = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    let decoded = BASE64
+        .decode(data)
+        .map_err(|error| format!("Failed to decode token account notification data: {error}"))?;
+    Ok(Some(read_spl_token_account_amount(&decoded)?.to_string()))
+}
+
+async fn fetch_token_account_balance_raw(
+    rpc_url: &str,
+    account: &str,
+    commitment: &str,
+) -> Result<Option<String>, String> {
+    let data = match fetch_account_data(rpc_url, account, commitment).await {
+        Ok(data) => data,
+        Err(error) if error.contains("was not found.") => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(read_spl_token_account_amount(&data)?.to_string()))
+}
+
+async fn reconcile_token_account_balance_raw(
+    rpc_url: &str,
+    account: &str,
+) -> Result<Option<String>, String> {
+    for attempt in 0..TOKEN_ACCOUNT_RECONCILE_MAX_ATTEMPTS {
+        let amount = fetch_token_account_balance_raw(rpc_url, account, "processed").await?;
+        if amount.is_some() {
+            return Ok(amount);
+        }
+        if attempt + 1 < TOKEN_ACCOUNT_RECONCILE_MAX_ATTEMPTS {
+            sleep(Duration::from_millis(TOKEN_ACCOUNT_RECONCILE_INTERVAL_MS)).await;
+        }
+    }
+    Ok(None)
+}
+
+fn extract_transaction_notification_post_token_balances(
+    result: &Value,
+) -> Vec<TransactionTokenBalance> {
+    let entries = [
+        result.get("postTokenBalances"),
+        result.pointer("/meta/postTokenBalances"),
+        result.pointer("/transaction/meta/postTokenBalances"),
+        result.pointer("/transaction/transaction/meta/postTokenBalances"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_array);
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let mint = entry.get("mint").and_then(Value::as_str)?.trim().to_string();
+            if mint.is_empty() {
+                return None;
+            }
+            let amount = entry
+                .pointer("/uiTokenAmount/amount")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("amount").and_then(Value::as_str))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if amount.is_empty() {
+                return None;
+            }
+            Some(TransactionTokenBalance {
+                mint,
+                amount,
+                owner: entry
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+async fn confirmation_details_from_signature_notification(
+    rpc_url: &str,
+    commitment: &str,
+    track_confirmed_block_height: bool,
+    context_slot: Option<u64>,
+    value: Value,
+) -> Result<ConfirmationDetails, String> {
+    let err = value.get("err").cloned().unwrap_or(Value::Null);
+    if !err.is_null() {
+        return Err(format!(
+            "Launch signature notification reported error: {err}"
+        ));
+    }
+    let sampled_confirmed_slot = if track_confirmed_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let observed_at_ms = current_time_ms();
+    Ok(ConfirmationDetails {
+        status: json!({
+            "confirmationStatus": commitment,
+            "slot": context_slot,
+        }),
+        confirmed_observed_slot: context_slot.or(sampled_confirmed_slot),
+        confirmed_slot: context_slot,
+        confirmation_source: "websocket",
+        first_observed_status: Some(commitment.to_string()),
+        first_observed_slot: context_slot,
+        first_observed_at_ms: Some(observed_at_ms),
+        confirmed_at_ms: Some(observed_at_ms),
+        post_token_balances: vec![],
+        confirmed_token_balance_raw: None,
+    })
+}
+
+async fn confirmation_details_from_account_notification(
+    rpc_url: &str,
+    track_confirmed_block_height: bool,
+    context_slot: Option<u64>,
+    amount_raw: String,
+) -> Result<ConfirmationDetails, String> {
+    let sampled_confirmed_slot = if track_confirmed_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, "processed").await.ok()
+    } else {
+        None
+    };
+    let observed_at_ms = current_time_ms();
+    Ok(ConfirmationDetails {
+        status: json!({
+            "confirmationStatus": "processed",
+            "slot": context_slot,
+        }),
+        confirmed_observed_slot: context_slot.or(sampled_confirmed_slot),
+        confirmed_slot: context_slot,
+        confirmation_source: "websocket-account-balance",
+        first_observed_status: Some("processed".to_string()),
+        first_observed_slot: context_slot,
+        first_observed_at_ms: Some(observed_at_ms),
+        confirmed_at_ms: Some(observed_at_ms),
+        post_token_balances: vec![],
+        confirmed_token_balance_raw: Some(amount_raw),
+    })
+}
+
+async fn confirmation_details_from_transaction_notification(
     rpc_url: &str,
     signature: &str,
     commitment: &str,
     track_confirmed_block_height: bool,
+    slot: Option<u64>,
+    result: Value,
 ) -> Result<ConfirmationDetails, String> {
+    if let Some(err) = extract_transaction_notification_error(&result) {
+        return Err(format!(
+            "Launch transaction notification reported error: {err}"
+        ));
+    }
+    if let Some(status) = fetch_signature_status_once(rpc_url, signature).await? {
+        let err = status.get("err").cloned().unwrap_or(Value::Null);
+        if !err.is_null() {
+            return Err(terminal_confirmation_error(signature, err));
+        }
+        let actual_commitment = status
+            .get("confirmationStatus")
+            .and_then(Value::as_str)
+            .unwrap_or(commitment)
+            .to_string();
+        let confirmed_slot = status
+            .get("slot")
+            .and_then(Value::as_u64)
+            .or(slot);
+        let sampled_confirmed_slot = if track_confirmed_block_height {
+            fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
+        } else {
+            None
+        };
+        let observed_at_ms = current_time_ms();
+        return Ok(ConfirmationDetails {
+            status,
+            confirmed_observed_slot: confirmed_slot.or(sampled_confirmed_slot),
+            confirmed_slot,
+            confirmation_source: "helius-transaction-subscribe",
+            first_observed_status: Some(actual_commitment),
+            first_observed_slot: confirmed_slot,
+            first_observed_at_ms: Some(observed_at_ms),
+            confirmed_at_ms: Some(observed_at_ms),
+            post_token_balances: extract_transaction_notification_post_token_balances(&result),
+            confirmed_token_balance_raw: None,
+        });
+    }
+    let sampled_confirmed_slot = if track_confirmed_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment).await.ok()
+    } else {
+        None
+    };
+    let observed_at_ms = current_time_ms();
+    Ok(ConfirmationDetails {
+        status: json!({
+            "confirmationStatus": commitment,
+            "slot": slot,
+        }),
+        confirmed_observed_slot: slot.or(sampled_confirmed_slot),
+        confirmed_slot: slot,
+        confirmation_source: "helius-transaction-subscribe",
+        first_observed_status: Some(commitment.to_string()),
+        first_observed_slot: slot,
+        first_observed_at_ms: Some(observed_at_ms),
+        confirmed_at_ms: Some(observed_at_ms),
+        post_token_balances: extract_transaction_notification_post_token_balances(&result),
+        confirmed_token_balance_raw: None,
+    })
+}
+
+async fn wait_for_confirmation_websocket(
+    endpoint: &str,
+    rpc_url: &str,
+    signature: &str,
+    account_required: &[String],
+    commitment: &str,
+    track_confirmed_block_height: bool,
+) -> Result<ConfirmationDetails, String> {
+    let _ = account_required;
     let session = async {
         let mut ws = open_subscription_socket(endpoint).await?;
         subscribe(
@@ -968,55 +1799,96 @@ async fn wait_for_confirmation_websocket(
         .await?;
         loop {
             let message = next_json_message(&mut ws).await?;
-            if let Some(params) = message.get("params") {
-                let context_slot = params
-                    .get("result")
-                    .and_then(|result| result.get("context"))
-                    .and_then(|context| context.get("slot"))
-                    .and_then(Value::as_u64);
-                let value = params
-                    .get("result")
-                    .and_then(|result| result.get("value"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let err = value.get("err").cloned().unwrap_or(Value::Null);
-                if !err.is_null() {
-                    return Err(format!(
-                        "Launch signature notification reported error: {err}"
-                    ));
-                }
-                let confirmed_observed_block_height = if track_confirmed_block_height {
-                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
-                        .await
-                        .ok()
-                } else {
-                    None
-                };
-                let observed_at_ms = current_time_ms();
-                return Ok(ConfirmationDetails {
-                    status: json!({
-                        "confirmationStatus": commitment,
-                        "slot": context_slot,
-                    }),
-                    confirmed_observed_block_height,
-                    confirmed_slot: context_slot,
-                    confirmation_source: "websocket",
-                    first_observed_status: Some(commitment.to_string()),
-                    first_observed_slot: context_slot,
-                    first_observed_at_ms: Some(observed_at_ms),
-                    confirmed_at_ms: Some(observed_at_ms),
-                });
+            if let Some((_, context_slot, value)) = extract_signature_notification(&message) {
+                return confirmation_details_from_signature_notification(
+                    rpc_url,
+                    commitment,
+                    track_confirmed_block_height,
+                    context_slot,
+                    value,
+                )
+                .await;
             }
         }
     };
-    timeout(Duration::from_secs(35), session)
-        .await
-        .map_err(|_| {
-            format!(
-                "Timed out waiting for websocket confirmation for transaction {}.",
-                signature
+    timeout(
+        Duration::from_secs(WEBSOCKET_CONFIRMATION_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for websocket confirmation for transaction {}.",
+            signature
+        )
+    })?
+}
+
+async fn wait_for_confirmation_helius_transaction_subscribe(
+    endpoint: &str,
+    rpc_url: &str,
+    signature: &str,
+    account_required: &[String],
+    capture_post_token_balances: bool,
+    request_full_transaction_details: bool,
+    commitment: &str,
+    track_confirmed_block_height: bool,
+) -> Result<ConfirmationDetails, String> {
+    let session = async {
+        let mut ws = open_subscription_socket(endpoint).await?;
+        subscribe(
+            &mut ws,
+            "transactionSubscribe",
+            helius_transaction_subscribe_signature_params(
+                signature,
+                commitment,
+                account_required,
+                capture_post_token_balances,
+                request_full_transaction_details,
+            ),
+        )
+        .await?;
+        loop {
+            match timeout(
+                Duration::from_millis(HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS),
+                next_json_message(&mut ws),
             )
-        })?
+            .await
+            {
+                Ok(message) => {
+                    let message = message?;
+                    let Some((_, slot, result)) = extract_transaction_notification(&message) else {
+                        continue;
+                    };
+                    return confirmation_details_from_transaction_notification(
+                        rpc_url,
+                        signature,
+                        commitment,
+                        track_confirmed_block_height,
+                        slot,
+                        result,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    let reconciled = reconcile_signature_statuses_once(
+                        rpc_url,
+                        &[(
+                            0usize,
+                            signature.to_string(),
+                            capture_post_token_balances,
+                        )],
+                        commitment,
+                    )
+                    .await?;
+                    if let Some((_, confirmation)) = reconciled.into_iter().next() {
+                        return Ok(confirmation);
+                    }
+                }
+            }
+        }
+    };
+    session.await
 }
 
 async fn wait_for_confirmations_polling_batch(
@@ -1032,11 +1904,10 @@ async fn wait_for_confirmations_polling_batch(
     let mut first_observed_slot: HashMap<usize, u64> = HashMap::new();
     let mut first_observed_at_ms: HashMap<usize, u128> = HashMap::new();
 
-    for attempt in 0..max_attempts {
+    for _attempt in 0..max_attempts {
         if pending.is_empty() {
             return Ok(completed);
         }
-        let search_transaction_history = attempt + 1 >= std::cmp::max(2, max_attempts / 2);
         let signature_batch = pending
             .iter()
             .map(|(_, signature)| Value::String(signature.clone()))
@@ -1046,7 +1917,7 @@ async fn wait_for_confirmations_polling_batch(
             "getSignatureStatuses",
             json!([
                 signature_batch,
-                { "searchTransactionHistory": search_transaction_history }
+                { "searchTransactionHistory": true }
             ]),
         )
         .await?;
@@ -1088,13 +1959,15 @@ async fn wait_for_confirmations_polling_batch(
                     index,
                     ConfirmationDetails {
                         status,
-                        confirmed_observed_block_height: None,
+                        confirmed_observed_slot: first_observed_slot.get(&index).copied(),
                         confirmed_slot: first_observed_slot.get(&index).copied(),
                         confirmation_source: "rpc-polling-batch",
                         first_observed_status: first_observed_status.get(&index).cloned(),
                         first_observed_slot: first_observed_slot.get(&index).copied(),
                         first_observed_at_ms: first_observed_at_ms.get(&index).copied(),
                         confirmed_at_ms: Some(current_time_ms()),
+                        post_token_balances: vec![],
+                        confirmed_token_balance_raw: None,
                     },
                 ));
             } else {
@@ -1124,8 +1997,9 @@ async fn subscribe_signature_batch(
     ws: &mut WsStream,
     signatures: &[(usize, String)],
     commitment: &str,
-) -> Result<HashMap<u64, usize>, String> {
+) -> Result<(HashMap<u64, usize>, VecDeque<Value>), String> {
     let mut subscription_map = HashMap::new();
+    let mut buffered_notifications = VecDeque::new();
     for (request_offset, (index, signature)) in signatures.iter().enumerate() {
         let request_id = request_offset as u64 + 1;
         ws.send(Message::Text(
@@ -1158,32 +2032,182 @@ async fn subscribe_signature_batch(
                 subscription_map.insert(subscription_id, *index);
                 break;
             }
+            if payload.get("params").is_some() {
+                buffered_notifications.push_back(payload);
+            }
         }
     }
-    Ok(subscription_map)
+    Ok((subscription_map, buffered_notifications))
+}
+
+async fn subscribe_helius_transaction_batch(
+    ws: &mut WsStream,
+    requests: &[HeliusTransactionSubscribeRequest],
+    commitment: &str,
+) -> Result<(HashMap<u64, usize>, VecDeque<Value>), String> {
+    let mut subscription_map = HashMap::new();
+    let mut buffered_notifications = VecDeque::new();
+    for (request_offset, request) in requests.iter().enumerate() {
+        let request_id = request_offset as u64 + 1;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "transactionSubscribe",
+                "params": helius_transaction_subscribe_signature_params(
+                    &request.signature,
+                    commitment,
+                    &request.account_required,
+                    request.capture_post_token_balances,
+                    request.request_full_transaction_details,
+                ),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        loop {
+            let payload = next_json_message(ws).await?;
+            if payload.get("id").and_then(Value::as_u64) == Some(request_id) {
+                if payload.get("error").is_some() {
+                    return Err(format!("Subscription failed: {payload}"));
+                }
+                let subscription_id = payload
+                    .get("result")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("Subscription ack missing id: {payload}"))?;
+                subscription_map.insert(subscription_id, request.index);
+                break;
+            }
+            if payload.get("params").is_some() {
+                buffered_notifications.push_back(payload);
+            }
+        }
+    }
+    Ok((subscription_map, buffered_notifications))
+}
+
+async fn subscribe_account_batch(
+    ws: &mut WsStream,
+    requests: &[StandardTokenAccountWatchRequest],
+) -> Result<(HashMap<u64, usize>, VecDeque<Value>), String> {
+    let mut subscription_map = HashMap::new();
+    let mut buffered_notifications = VecDeque::new();
+    for (request_offset, request) in requests.iter().enumerate() {
+        let request_id = request_offset as u64 + 10_001;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "accountSubscribe",
+                "params": [
+                    request.account,
+                    {
+                        "encoding": "base64",
+                        "commitment": "processed"
+                    }
+                ],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
+        loop {
+            let payload = next_json_message(ws).await?;
+            if payload.get("id").and_then(Value::as_u64) == Some(request_id) {
+                if payload.get("error").is_some() {
+                    return Err(format!("Subscription failed: {payload}"));
+                }
+                let subscription_id = payload
+                    .get("result")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("Subscription ack missing id: {payload}"))?;
+                subscription_map.insert(subscription_id, request.index);
+                break;
+            }
+            if payload.get("params").is_some() {
+                buffered_notifications.push_back(payload);
+            }
+        }
+    }
+    Ok((subscription_map, buffered_notifications))
 }
 
 async fn wait_for_confirmations_websocket_batch(
     endpoint: &str,
     rpc_url: &str,
     signatures: &[(usize, String)],
+    token_account_watches: &[StandardTokenAccountWatchRequest],
     commitment: &str,
     track_confirmed_block_height: bool,
-) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
+) -> Result<(Vec<(usize, ConfirmationDetails)>, Vec<String>), String> {
     let session = async {
         let mut ws = open_subscription_socket(endpoint).await?;
-        let subscription_map = subscribe_signature_batch(&mut ws, signatures, commitment).await?;
+        let (subscription_map, mut buffered_notifications) =
+            subscribe_signature_batch(&mut ws, signatures, commitment).await?;
+        let mut warnings = Vec::new();
+        let (account_subscription_map, account_buffered_notifications) = if token_account_watches.is_empty() {
+            (HashMap::new(), VecDeque::new())
+        } else {
+            match subscribe_account_batch(&mut ws, token_account_watches).await {
+                Ok(result) => result,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Standard websocket token-account watcher setup failed via {} for {} account(s): {}. Continuing with exact signature confirmation only.",
+                        endpoint,
+                        token_account_watches.len(),
+                        error
+                    ));
+                    (HashMap::new(), VecDeque::new())
+                }
+            }
+        };
+        buffered_notifications.extend(account_buffered_notifications);
+        let account_watch_by_index = token_account_watches
+            .iter()
+            .map(|request| (request.index, request.account.as_str()))
+            .collect::<HashMap<_, _>>();
+        let mut watched_account_balances = HashMap::<usize, (String, Option<u64>)>::new();
         let mut pending = signatures
             .iter()
             .map(|(index, _)| *index)
             .collect::<HashSet<_>>();
         let mut confirmations = Vec::with_capacity(signatures.len());
         while !pending.is_empty() {
-            let message = next_json_message(&mut ws).await?;
-            let Some(params) = message.get("params") else {
-                continue;
+            let message = if let Some(message) = buffered_notifications.pop_front() {
+                message
+            } else {
+                next_json_message(&mut ws).await?
             };
-            let Some(subscription_id) = params.get("subscription").and_then(Value::as_u64) else {
+            if let Some((subscription_id, context_slot, value)) = extract_account_notification(&message)
+            {
+                if let Some(index) = account_subscription_map.get(&subscription_id).copied()
+                {
+                    let Some(amount) = extract_account_notification_token_balance_raw(&value)? else {
+                        continue;
+                    };
+                    let parsed_amount = amount.parse::<u64>().unwrap_or_default();
+                    watched_account_balances.insert(index, (amount.clone(), context_slot));
+                    if parsed_amount > 0 && pending.remove(&index) {
+                        confirmations.push((
+                            index,
+                            confirmation_details_from_account_notification(
+                                rpc_url,
+                                track_confirmed_block_height,
+                                context_slot,
+                                amount,
+                            )
+                            .await?,
+                        ));
+                    }
+                }
+                continue;
+            }
+            let Some((subscription_id, context_slot, value)) =
+                extract_signature_notification(&message)
+            else {
                 continue;
             };
             let Some(index) = subscription_map.get(&subscription_id).copied() else {
@@ -1192,57 +2216,157 @@ async fn wait_for_confirmations_websocket_batch(
             if !pending.remove(&index) {
                 continue;
             }
-            let context_slot = params
-                .get("result")
-                .and_then(|result| result.get("context"))
-                .and_then(|context| context.get("slot"))
-                .and_then(Value::as_u64);
-            let value = params
-                .get("result")
-                .and_then(|result| result.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let err = value.get("err").cloned().unwrap_or(Value::Null);
-            if !err.is_null() {
-                return Err(format!(
-                    "Launch signature notification reported error: {err}"
-                ));
-            }
-            let confirmed_observed_block_height = if track_confirmed_block_height {
-                fetch_sampled_block_height_snapshot(rpc_url, commitment)
-                    .await
-                    .ok()
+            let mut confirmation = confirmation_details_from_signature_notification(
+                rpc_url,
+                commitment,
+                track_confirmed_block_height,
+                context_slot,
+                value,
+            )
+            .await?;
+            if let Some((amount, observed_slot)) = watched_account_balances.get(&index).cloned() {
+                confirmation.confirmed_token_balance_raw = Some(amount);
+                confirmation.confirmed_slot = observed_slot.or(confirmation.confirmed_slot);
+                confirmation.confirmed_observed_slot = observed_slot
+                    .or(confirmation.confirmed_observed_slot)
+                    .or(confirmation.confirmed_slot);
+                confirmation.first_observed_slot =
+                    observed_slot.or(confirmation.first_observed_slot);
             } else {
-                None
-            };
-            let observed_at_ms = current_time_ms();
+                confirmation.confirmed_token_balance_raw =
+                    if let Some(account) = account_watch_by_index.get(&index).copied() {
+                        reconcile_token_account_balance_raw(rpc_url, account).await?
+                    } else {
+                        None
+                    };
+            }
             confirmations.push((
                 index,
-                ConfirmationDetails {
-                    status: json!({
-                        "confirmationStatus": commitment,
-                        "slot": context_slot,
-                    }),
-                    confirmed_observed_block_height,
-                    confirmed_slot: context_slot,
-                    confirmation_source: "websocket",
-                    first_observed_status: Some(commitment.to_string()),
-                    first_observed_slot: context_slot,
-                    first_observed_at_ms: Some(observed_at_ms),
-                    confirmed_at_ms: Some(observed_at_ms),
-                },
+                confirmation,
+            ));
+        }
+        Ok((confirmations, warnings))
+    };
+    timeout(
+        Duration::from_secs(WEBSOCKET_CONFIRMATION_TIMEOUT_SECS),
+        session,
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for websocket confirmation for {} transaction(s).",
+            signatures.len()
+        )
+    })?
+}
+
+async fn wait_for_confirmations_helius_transaction_subscribe_batch(
+    endpoint: &str,
+    rpc_url: &str,
+    requests: &[HeliusTransactionSubscribeRequest],
+    commitment: &str,
+    track_confirmed_block_height: bool,
+) -> Result<Vec<(usize, ConfirmationDetails)>, String> {
+    let session = async {
+        let mut ws = open_subscription_socket(endpoint).await?;
+        let (subscription_map, mut buffered_notifications) =
+            subscribe_helius_transaction_batch(&mut ws, requests, commitment).await?;
+        let mut pending = requests
+            .iter()
+            .map(|request| request.index)
+            .collect::<HashSet<_>>();
+        let mut confirmations = Vec::with_capacity(requests.len());
+        while !pending.is_empty() {
+            let message = if let Some(message) = buffered_notifications.pop_front() {
+                message
+            } else {
+                match timeout(
+                    Duration::from_millis(HELIUS_SIGNATURE_STATUS_RECONCILE_INTERVAL_MS),
+                    next_json_message(&mut ws),
+                )
+                .await
+                {
+                    Ok(message) => message?,
+                    Err(_) => {
+                        let reconcile_requests = requests
+                            .iter()
+                            .filter(|request| pending.contains(&request.index))
+                            .map(|request| {
+                                (
+                                    request.index,
+                                    request.signature.clone(),
+                                    request.capture_post_token_balances,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let reconciled = reconcile_signature_statuses_once(
+                            rpc_url,
+                            &reconcile_requests,
+                            commitment,
+                        )
+                        .await?;
+                        for (index, confirmation) in reconciled {
+                            if pending.remove(&index) {
+                                confirmations.push((index, confirmation));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            };
+            let Some((subscription_id, slot, result)) = extract_transaction_notification(&message)
+            else {
+                continue;
+            };
+            let Some(index) = subscription_map.get(&subscription_id).copied() else {
+                continue;
+            };
+            if !pending.remove(&index) {
+                continue;
+            }
+            let request_signature = requests
+                .iter()
+                .find(|request| request.index == index)
+                .map(|request| request.signature.as_str())
+                .ok_or_else(|| format!("Missing Helius request for index {index}"))?;
+            confirmations.push((
+                index,
+                confirmation_details_from_transaction_notification(
+                    rpc_url,
+                    request_signature,
+                    commitment,
+                    track_confirmed_block_height,
+                    slot,
+                    result,
+                )
+                .await?,
             ));
         }
         Ok(confirmations)
     };
-    timeout(Duration::from_secs(35), session)
-        .await
-        .map_err(|_| {
-            format!(
-                "Timed out waiting for websocket confirmation for {} transaction(s).",
-                signatures.len()
-            )
-        })?
+    session.await
+}
+
+fn default_confirmation_watch_endpoint() -> Option<String> {
+    configured_watch_endpoints_for_provider("standard-rpc", "")
+        .into_iter()
+        .find(|endpoint| !endpoint.trim().is_empty())
+}
+
+fn preferred_confirmation_websocket_endpoint(watch_endpoint: Option<&str>) -> Option<String> {
+    let base_endpoint = watch_endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string)
+        .or_else(default_confirmation_watch_endpoint);
+    if prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        base_endpoint.as_deref(),
+    ) {
+        resolved_helius_transaction_subscribe_ws_url(base_endpoint.as_deref()).or(base_endpoint)
+    } else {
+        base_endpoint
+    }
 }
 
 fn transport_watch_endpoint(transport_plan: &TransportPlan) -> Option<&str> {
@@ -1278,31 +2402,177 @@ pub async fn confirm_transactions_with_websocket_fallback(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut warnings = Vec::new();
-    let confirmations = if let Some(endpoint) = watch_endpoint {
-        match wait_for_confirmations_websocket_batch(
-            endpoint,
-            rpc_url,
-            &signatures,
-            commitment,
-            false,
-        )
-        .await
-        {
-            Ok(confirmations) => confirmations,
-            Err(error) => {
-                warnings.push(format!(
-                    "Websocket batch confirmation failed: {}. Falling back to batched RPC polling.",
-                    error
-                ));
-                wait_for_confirmations_polling_batch(
+    let helius_requests = submitted
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let signature = result.signature.clone().ok_or_else(|| {
+                format!(
+                    "Submitted transaction {} is missing a signature.",
+                    result.label
+                )
+            })?;
+            Ok(HeliusTransactionSubscribeRequest {
+                index,
+                signature,
+                account_required: result.transactionSubscribeAccountRequired.clone(),
+                capture_post_token_balances: result.capturePostTokenBalances,
+                request_full_transaction_details: result.requestFullTransactionDetails,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (token_account_watches, mut warnings) = build_standard_token_account_watches(submitted);
+    let base_watch_endpoint = watch_endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string)
+        .or_else(default_confirmation_watch_endpoint);
+    let preferred_watch_endpoint = preferred_confirmation_websocket_endpoint(watch_endpoint);
+    let prefer_helius_transaction_subscribe = prefers_helius_transaction_subscribe_path(
+        configured_enable_helius_transaction_subscribe(),
+        base_watch_endpoint.as_deref(),
+    );
+    let helius_requests_ready = helius_requests
+        .iter()
+        .all(|request| !request.account_required.is_empty());
+    let confirmations = if let Some(endpoint) = preferred_watch_endpoint.as_deref() {
+        if prefer_helius_transaction_subscribe {
+            let standard_endpoint = base_watch_endpoint.as_deref().unwrap_or(endpoint);
+            if helius_requests_ready {
+                match wait_for_confirmations_helius_transaction_subscribe_batch(
+                    endpoint,
+                    rpc_url,
+                    &helius_requests,
+                    commitment,
+                    false,
+                )
+                .await
+                {
+                    Ok(confirmations) => confirmations,
+                    Err(helius_error) => {
+                        if is_terminal_confirmation_error(&helius_error) {
+                            return Err(helius_error);
+                        }
+                        warnings.push(format!(
+                            "Helius transactionSubscribe batch confirmation failed via {} for {} transaction(s): {}. Falling back to standard websocket.",
+                            endpoint,
+                            signatures.len(),
+                            helius_error
+                        ));
+                        match wait_for_confirmations_websocket_batch(
+                            standard_endpoint,
+                            rpc_url,
+                            &signatures,
+                            &token_account_watches,
+                            commitment,
+                            false,
+                        )
+                        .await
+                        {
+                            Ok((confirmations, websocket_warnings)) => {
+                                warnings.extend(websocket_warnings);
+                                confirmations
+                            }
+                            Err(websocket_error) => {
+                                if is_terminal_confirmation_error(&websocket_error) {
+                                    return Err(websocket_error);
+                                }
+                                warnings.push(format!(
+                                    "Standard websocket batch confirmation failed via {} for {} transaction(s): {}. Falling back to batched RPC polling.",
+                                    standard_endpoint,
+                                    signatures.len(),
+                                    websocket_error
+                                ));
+                                wait_for_confirmations_polling_batch(
+                                    rpc_url,
+                                    &signatures,
+                                    commitment,
+                                    poll_max_attempts,
+                                    poll_interval_ms,
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                }
+            } else {
+                let missing_targets = submitted
+                    .iter()
+                    .filter(|result| result.transactionSubscribeAccountRequired.is_empty())
+                    .map(|result| {
+                        let signature = result.signature.as_deref().unwrap_or("missing-signature");
+                        format!("{} ({signature})", result.label)
+                    })
+                    .collect::<Vec<_>>();
+                let warning = missing_helius_account_required_warning(&missing_targets);
+                eprintln!("{warning}");
+                warnings.push(warning);
+                match wait_for_confirmations_websocket_batch(
+                    standard_endpoint,
                     rpc_url,
                     &signatures,
+                    &token_account_watches,
                     commitment,
-                    poll_max_attempts,
-                    poll_interval_ms,
+                    false,
                 )
-                .await?
+                .await
+                {
+                    Ok((confirmations, websocket_warnings)) => {
+                        warnings.extend(websocket_warnings);
+                        confirmations
+                    }
+                    Err(websocket_error) => {
+                        if is_terminal_confirmation_error(&websocket_error) {
+                            return Err(websocket_error);
+                        }
+                        warnings.push(format!(
+                            "Standard websocket batch confirmation failed via {} for {} transaction(s): {}. Falling back to batched RPC polling.",
+                            standard_endpoint,
+                            signatures.len(),
+                            websocket_error
+                        ));
+                        wait_for_confirmations_polling_batch(
+                            rpc_url,
+                            &signatures,
+                            commitment,
+                            poll_max_attempts,
+                            poll_interval_ms,
+                        )
+                        .await?
+                    }
+                }
+            }
+        } else {
+            match wait_for_confirmations_websocket_batch(
+                endpoint,
+                rpc_url,
+                &signatures,
+                &token_account_watches,
+                commitment,
+                false,
+            )
+            .await
+            {
+                Ok((confirmations, websocket_warnings)) => {
+                    warnings.extend(websocket_warnings);
+                    confirmations
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Websocket batch confirmation failed via {} for {} transaction(s): {}. Falling back to batched RPC polling.",
+                        endpoint,
+                        signatures.len(),
+                        error
+                    ));
+                    wait_for_confirmations_polling_batch(
+                        rpc_url,
+                        &signatures,
+                        commitment,
+                        poll_max_attempts,
+                        poll_interval_ms,
+                    )
+                    .await?
+                }
             }
         }
     } else {
@@ -1315,8 +2585,8 @@ pub async fn confirm_transactions_with_websocket_fallback(
         )
         .await?
     };
-    let confirmed_observed_block_height = if track_send_block_height {
-        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+    let sampled_confirmed_slot = if track_send_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok()
     } else {
@@ -1334,8 +2604,12 @@ pub async fn confirm_transactions_with_websocket_fallback(
         result.firstObservedSlot = confirmation.first_observed_slot;
         result.firstObservedAtMs = confirmation.first_observed_at_ms;
         result.confirmedAtMs = confirmation.confirmed_at_ms;
-        result.confirmedObservedBlockHeight =
-            confirmed_observed_block_height.or(confirmation.confirmed_observed_block_height);
+        result.postTokenBalances = confirmation.post_token_balances;
+        result.confirmedTokenBalanceRaw = confirmation.confirmed_token_balance_raw;
+        result.confirmedObservedSlot = confirmation
+            .confirmed_slot
+            .or(confirmation.confirmed_observed_slot)
+            .or(sampled_confirmed_slot);
         result.confirmedSlot = confirmation.confirmed_slot;
     }
     Ok((warnings, confirm_started.elapsed().as_millis()))
@@ -1372,8 +2646,8 @@ pub async fn submit_transactions_sequential(
         .or_else(|| transaction.signature.clone())
         .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
         .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
-        let send_observed_block_height = if track_send_block_height {
-            fetch_sampled_block_height_snapshot(rpc_url, commitment)
+        let send_observed_slot = if track_send_block_height {
+            fetch_sampled_slot_snapshot(rpc_url, commitment)
                 .await
                 .ok()
         } else {
@@ -1396,8 +2670,8 @@ pub async fn submit_transactions_sequential(
             firstObservedSlot: None,
             firstObservedAtMs: None,
             confirmedAtMs: None,
-            sendObservedBlockHeight: send_observed_block_height,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: send_observed_slot,
+            confirmedObservedSlot: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -1405,6 +2679,13 @@ pub async fn submit_transactions_sequential(
             inlineTipAccount: transaction.inlineTipAccount.clone(),
             bundleId: None,
             attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired:
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
         });
     }
     Ok((results, warnings, submit_started.elapsed().as_millis()))
@@ -1437,8 +2718,8 @@ async fn submit_single_transaction_rpc(
     .or_else(|| transaction.signature.clone())
     .or_else(|| signature_from_serialized_base64(&transaction.serializedBase64))
     .ok_or_else(|| "RPC sendTransaction did not return a signature.".to_string())?;
-    let send_observed_block_height = if track_send_block_height {
-        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+    let send_observed_slot = if track_send_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok()
     } else {
@@ -1461,8 +2742,8 @@ async fn submit_single_transaction_rpc(
         firstObservedSlot: None,
         firstObservedAtMs: None,
         confirmedAtMs: None,
-        sendObservedBlockHeight: send_observed_block_height,
-        confirmedObservedBlockHeight: None,
+        sendObservedSlot: send_observed_slot,
+        confirmedObservedSlot: None,
         confirmedSlot: None,
         computeUnitLimit: transaction.computeUnitLimit,
         computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -1470,6 +2751,13 @@ async fn submit_single_transaction_rpc(
         inlineTipAccount: transaction.inlineTipAccount.clone(),
         bundleId: None,
         attemptedBundleIds: vec![],
+        transactionSubscribeAccountRequired:
+            derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+        postTokenBalances: vec![],
+        confirmedTokenBalanceRaw: None,
+        balanceWatchAccount: None,
+        capturePostTokenBalances: false,
+        requestFullTransactionDetails: false,
     })
 }
 
@@ -1610,8 +2898,8 @@ async fn submit_single_transaction_standard_rpc_fanout(
             firstObservedSlot: None,
             firstObservedAtMs: None,
             confirmedAtMs: None,
-            sendObservedBlockHeight: None,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -1619,6 +2907,13 @@ async fn submit_single_transaction_standard_rpc_fanout(
             inlineTipAccount: transaction.inlineTipAccount.clone(),
             bundleId: None,
             attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired:
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
         },
         warnings,
     ))
@@ -1672,12 +2967,11 @@ pub async fn submit_transactions_standard_rpc_fanout(
         sent
     };
     if track_send_block_height {
-        let send_observed_block_height =
-            fetch_sampled_block_height_snapshot(primary_rpc_url, commitment)
+        let send_observed_slot = fetch_sampled_slot_snapshot(primary_rpc_url, commitment)
                 .await
                 .ok();
         for result in &mut results {
-            result.sendObservedBlockHeight = send_observed_block_height;
+            result.sendObservedSlot = send_observed_slot;
         }
     }
     Ok((results, warnings, submit_started.elapsed().as_millis()))
@@ -1717,6 +3011,9 @@ pub async fn confirm_transactions_sequential_with_attempts(
         let confirmation = wait_for_confirmation(
             rpc_url,
             &signature,
+            &result.transactionSubscribeAccountRequired,
+            result.capturePostTokenBalances,
+            result.requestFullTransactionDetails,
             commitment,
             max_attempts,
             track_send_block_height,
@@ -1732,7 +3029,11 @@ pub async fn confirm_transactions_sequential_with_attempts(
         result.firstObservedSlot = confirmation.first_observed_slot;
         result.firstObservedAtMs = confirmation.first_observed_at_ms;
         result.confirmedAtMs = confirmation.confirmed_at_ms;
-        result.confirmedObservedBlockHeight = confirmation.confirmed_observed_block_height;
+        result.postTokenBalances = confirmation.post_token_balances;
+        result.confirmedTokenBalanceRaw = confirmation.confirmed_token_balance_raw;
+        result.confirmedObservedSlot = confirmation
+            .confirmed_slot
+            .or(confirmation.confirmed_observed_slot);
         result.confirmedSlot = confirmation.confirmed_slot;
     }
     Ok(confirm_started.elapsed().as_millis())
@@ -1758,11 +3059,11 @@ pub async fn submit_transactions_helius_sender(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok();
         for result in &mut results {
-            result.sendObservedBlockHeight = send_observed_block_height;
+            result.sendObservedSlot = send_observed_slot;
         }
     }
     Ok((results, warnings, submit_started.elapsed().as_millis()))
@@ -1861,8 +3162,8 @@ async fn submit_single_transaction_helius_sender(
             firstObservedSlot: None,
             firstObservedAtMs: None,
             confirmedAtMs: None,
-            sendObservedBlockHeight: None,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -1870,6 +3171,13 @@ async fn submit_single_transaction_helius_sender(
             inlineTipAccount: transaction.inlineTipAccount.clone(),
             bundleId: None,
             attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired:
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
         },
         warnings,
     ))
@@ -1900,11 +3208,11 @@ pub async fn submit_transactions_helius_sender_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok();
         for result in &mut sent {
-            result.sendObservedBlockHeight = send_observed_block_height;
+            result.sendObservedSlot = send_observed_slot;
         }
     }
     Ok((sent, warnings, submit_started.elapsed().as_millis()))
@@ -1992,8 +3300,8 @@ pub async fn submit_transactions_bundle(
         .iter()
         .map(|(_, attempt_bundle_id)| attempt_bundle_id.clone())
         .collect::<Vec<_>>();
-    let send_observed_block_height = if track_send_block_height {
-        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+    let send_observed_slot = if track_send_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok()
     } else {
@@ -2022,8 +3330,8 @@ pub async fn submit_transactions_bundle(
             firstObservedSlot: None,
             firstObservedAtMs: None,
             confirmedAtMs: None,
-            sendObservedBlockHeight: send_observed_block_height,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: send_observed_slot,
+            confirmedObservedSlot: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -2031,6 +3339,13 @@ pub async fn submit_transactions_bundle(
             inlineTipAccount: transaction.inlineTipAccount.clone(),
             bundleId: attempts.first().map(|(_, bundle_id)| bundle_id.clone()),
             attemptedBundleIds: attempted_bundle_ids.clone(),
+            transactionSubscribeAccountRequired:
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
         })
         .collect::<Vec<_>>();
     Ok((results, warnings, submit_started.elapsed().as_millis()))
@@ -2124,8 +3439,8 @@ pub async fn confirm_transactions_bundle(
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let confirmed_observed_block_height = if track_send_block_height {
-                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                let sampled_confirmed_slot = if track_send_block_height {
+                    fetch_sampled_slot_snapshot(rpc_url, commitment)
                         .await
                         .ok()
                 } else {
@@ -2148,7 +3463,7 @@ pub async fn confirm_transactions_bundle(
                     result.firstObservedSlot = confirmed_slot;
                     result.firstObservedAtMs = Some(current_time_ms());
                     result.confirmedAtMs = result.firstObservedAtMs;
-                    result.confirmedObservedBlockHeight = confirmed_observed_block_height;
+                    result.confirmedObservedSlot = confirmed_slot.or(sampled_confirmed_slot);
                     result.confirmedSlot = confirmed_slot;
                     result.bundleId = Some(bundle_id.clone());
                     result.endpoint = Some(endpoint.send.clone());
@@ -2381,9 +3696,7 @@ pub async fn submit_transactions_hellomoon_bundle(
     validate_hellomoon_bundle_transactions(transactions)?;
     let api_key = configured_hellomoon_api_key();
     if api_key.trim().is_empty() {
-        return Err(
-            "Hello Moon bundle transport requires HELLOMOON_API_KEY.".to_string(),
-        );
+        return Err("Hello Moon bundle transport requires HELLOMOON_API_KEY.".to_string());
     }
     let encoded = transactions
         .iter()
@@ -2442,8 +3755,8 @@ pub async fn submit_transactions_hellomoon_bundle(
             errors.join(" | ")
         ));
     }
-    let send_observed_block_height = if track_send_block_height {
-        fetch_sampled_block_height_snapshot(rpc_url, commitment)
+    let send_observed_slot = if track_send_block_height {
+        fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok()
     } else {
@@ -2477,8 +3790,8 @@ pub async fn submit_transactions_hellomoon_bundle(
                 firstObservedSlot: None,
                 firstObservedAtMs: None,
                 confirmedAtMs: None,
-                sendObservedBlockHeight: send_observed_block_height,
-                confirmedObservedBlockHeight: None,
+                sendObservedSlot: send_observed_slot,
+                confirmedObservedSlot: None,
                 confirmedSlot: None,
                 computeUnitLimit: transaction.computeUnitLimit,
                 computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -2486,6 +3799,13 @@ pub async fn submit_transactions_hellomoon_bundle(
                 inlineTipAccount: transaction.inlineTipAccount.clone(),
                 bundleId: None,
                 attemptedBundleIds: vec![],
+                transactionSubscribeAccountRequired:
+                    derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+                postTokenBalances: vec![],
+                confirmedTokenBalanceRaw: None,
+                balanceWatchAccount: None,
+                capturePostTokenBalances: false,
+                requestFullTransactionDetails: false,
             }
         })
         .collect::<Vec<_>>();
@@ -2498,9 +3818,7 @@ pub async fn prewarm_hellomoon_quic_endpoint(
 ) -> Result<(), String> {
     let api_key = configured_hellomoon_api_key();
     if api_key.trim().is_empty() {
-        return Err(
-            "Hello Moon QUIC prewarm requires HELLOMOON_API_KEY.".to_string(),
-        );
+        return Err("Hello Moon QUIC prewarm requires HELLOMOON_API_KEY.".to_string());
     }
     cached_hellomoon_quic_client(endpoint, &api_key, mev_protect)
         .await
@@ -2562,9 +3880,7 @@ async fn submit_single_transaction_hellomoon_quic(
     validate_hellomoon_transaction(transaction)?;
     let api_key = configured_hellomoon_api_key();
     if api_key.trim().is_empty() {
-        return Err(
-            "Hello Moon QUIC requires HELLOMOON_API_KEY.".to_string(),
-        );
+        return Err("Hello Moon QUIC requires HELLOMOON_API_KEY.".to_string());
     }
     let payload = BASE64
         .decode(&transaction.serializedBase64)
@@ -2651,8 +3967,8 @@ async fn submit_single_transaction_hellomoon_quic(
             firstObservedSlot: None,
             firstObservedAtMs: None,
             confirmedAtMs: None,
-            sendObservedBlockHeight: None,
-            confirmedObservedBlockHeight: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
             confirmedSlot: None,
             computeUnitLimit: transaction.computeUnitLimit,
             computeUnitPriceMicroLamports: transaction.computeUnitPriceMicroLamports,
@@ -2660,6 +3976,13 @@ async fn submit_single_transaction_hellomoon_quic(
             inlineTipAccount: transaction.inlineTipAccount.clone(),
             bundleId: None,
             attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired:
+                derive_helius_transaction_subscribe_account_required(&transaction.serializedBase64),
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: None,
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
         },
         warnings,
     ))
@@ -2686,11 +4009,11 @@ pub async fn submit_transactions_hellomoon_quic(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok();
         for result in &mut results {
-            result.sendObservedBlockHeight = send_observed_block_height;
+            result.sendObservedSlot = send_observed_slot;
         }
     }
     Ok((results, warnings, submit_started.elapsed().as_millis()))
@@ -2720,11 +4043,11 @@ pub async fn submit_transactions_hellomoon_quic_parallel(
         warnings.extend(entry_warnings);
     }
     if track_send_block_height {
-        let send_observed_block_height = fetch_sampled_block_height_snapshot(rpc_url, commitment)
+        let send_observed_slot = fetch_sampled_slot_snapshot(rpc_url, commitment)
             .await
             .ok();
         for result in &mut sent {
-            result.sendObservedBlockHeight = send_observed_block_height;
+            result.sendObservedSlot = send_observed_slot;
         }
     }
     Ok((sent, warnings, submit_started.elapsed().as_millis()))
@@ -2750,8 +4073,8 @@ pub async fn send_transactions_hellomoon_quic(
                 submit_single_transaction_hellomoon_quic(endpoints, transaction, mev_protect)
                     .await?;
             if track_send_block_height {
-                sent.sendObservedBlockHeight =
-                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                sent.sendObservedSlot =
+                    fetch_sampled_slot_snapshot(rpc_url, commitment)
                         .await
                         .ok();
             }
@@ -2765,8 +4088,8 @@ pub async fn send_transactions_hellomoon_quic(
                 &mut submitted,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await?;
             confirm_ms += confirm_started.elapsed().as_millis();
@@ -2834,8 +4157,8 @@ pub async fn send_transactions_helius_sender(
             let (mut sent, entry_warnings) =
                 submit_single_transaction_helius_sender(endpoints, transaction).await?;
             if track_send_block_height {
-                sent.sendObservedBlockHeight =
-                    fetch_sampled_block_height_snapshot(rpc_url, commitment)
+                sent.sendObservedSlot =
+                    fetch_sampled_slot_snapshot(rpc_url, commitment)
                         .await
                         .ok();
             }
@@ -3090,8 +4413,8 @@ pub async fn send_transactions_for_transport(
                 &mut results,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await?;
             warnings.extend(confirm_warnings);
@@ -3120,8 +4443,8 @@ pub async fn send_transactions_for_transport(
                 &mut results,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await?;
             warnings.extend(confirm_warnings);
@@ -3149,8 +4472,8 @@ pub async fn send_transactions_for_transport(
                 &mut results,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await?;
             warnings.extend(confirm_warnings);
@@ -3181,8 +4504,8 @@ pub async fn send_transactions_for_transport(
                 &mut results,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await?;
             let mut combined_warnings = warnings;
@@ -3356,8 +4679,8 @@ pub async fn confirm_submitted_transactions_for_transport(
                 submitted,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await
         }
@@ -3368,8 +4691,8 @@ pub async fn confirm_submitted_transactions_for_transport(
                 submitted,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await
         }
@@ -3380,8 +4703,8 @@ pub async fn confirm_submitted_transactions_for_transport(
                 submitted,
                 commitment,
                 track_send_block_height,
-                75,
-                400,
+                BATCH_CONFIRMATION_POLL_MAX_ATTEMPTS,
+                BATCH_CONFIRMATION_POLL_INTERVAL_MS,
             )
             .await
         }
@@ -3424,14 +4747,58 @@ mod tests {
         }
     }
 
-    async fn start_jsonrpc_server() -> SocketAddr {
-        async fn handler(Json(payload): Json<Value>) -> Json<Value> {
+    fn sample_sent_result(label: &str, balance_watch_account: Option<&str>) -> SentResult {
+        SentResult {
+            label: label.to_string(),
+            format: "legacy".to_string(),
+            signature: Some(format!("sig-{label}")),
+            explorerUrl: None,
+            transportType: "standard-rpc".to_string(),
+            endpoint: None,
+            attemptedEndpoints: vec![],
+            skipPreflight: false,
+            maxRetries: 0,
+            confirmationStatus: None,
+            confirmationSource: None,
+            submittedAtMs: None,
+            firstObservedStatus: None,
+            firstObservedSlot: None,
+            firstObservedAtMs: None,
+            confirmedAtMs: None,
+            sendObservedSlot: None,
+            confirmedObservedSlot: None,
+            confirmedSlot: None,
+            computeUnitLimit: None,
+            computeUnitPriceMicroLamports: None,
+            inlineTipLamports: None,
+            inlineTipAccount: None,
+            bundleId: None,
+            attemptedBundleIds: vec![],
+            transactionSubscribeAccountRequired: vec![],
+            postTokenBalances: vec![],
+            confirmedTokenBalanceRaw: None,
+            balanceWatchAccount: balance_watch_account.map(str::to_string),
+            capturePostTokenBalances: false,
+            requestFullTransactionDetails: false,
+        }
+    }
+
+    async fn start_jsonrpc_server_with_signature_status(signature_status: Value) -> SocketAddr {
+        async fn handler(
+            State(signature_status): State<Arc<Value>>,
+            Json(payload): Json<Value>,
+        ) -> Json<Value> {
             let method = payload
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let response = match method {
                 "getBlockHeight" => json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": 345678
+                }),
+                "getSlot" => json!({
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": 345678
@@ -3456,11 +4823,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "value": [{
-                            "confirmationStatus": "confirmed",
-                            "err": null,
-                            "slot": 456789
-                        }]
+                        "value": [(*signature_status).clone()]
                     }
                 }),
                 _ => json!({
@@ -3472,7 +4835,9 @@ mod tests {
             Json(response)
         }
 
-        let app = Router::new().route("/", post(handler));
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(Arc::new(signature_status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test rpc listener");
@@ -3483,6 +4848,15 @@ mod tests {
                 .expect("serve rpc test app");
         });
         addr
+    }
+
+    async fn start_jsonrpc_server() -> SocketAddr {
+        start_jsonrpc_server_with_signature_status(json!({
+            "confirmationStatus": "confirmed",
+            "err": null,
+            "slot": 456789
+        }))
+        .await
     }
 
     async fn start_jito_server(
@@ -3663,8 +5037,8 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].signature.as_deref(), Some("sig-test-123"));
-        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
-        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].sendObservedSlot, Some(345678));
+        assert_eq!(results[0].confirmedObservedSlot, Some(456789));
         assert_eq!(results[0].confirmedSlot, Some(456789));
         assert_eq!(
             results[0].explorerUrl.as_deref(),
@@ -3716,8 +5090,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].signature.as_deref(), Some("sig-1"));
         assert_eq!(results[1].signature.as_deref(), Some("sig-2"));
-        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
-        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].sendObservedSlot, Some(345678));
+        assert_eq!(results[0].confirmedObservedSlot, Some(567890));
         assert_eq!(results[0].confirmedSlot, Some(567890));
         assert!(
             warnings
@@ -3763,8 +5137,8 @@ mod tests {
         .expect("sender send should succeed");
         assert!(warnings.is_empty());
         assert_eq!(results[0].signature.as_deref(), Some("sender-sig-123"));
-        assert_eq!(results[0].sendObservedBlockHeight, Some(345678));
-        assert_eq!(results[0].confirmedObservedBlockHeight, Some(345678));
+        assert_eq!(results[0].sendObservedSlot, Some(345678));
+        assert_eq!(results[0].confirmedObservedSlot, Some(456789));
         assert_eq!(results[0].confirmedSlot, Some(456789));
         assert_eq!(results[0].attemptedEndpoints.len(), 2);
         assert_eq!(
@@ -3782,6 +5156,361 @@ mod tests {
         assert_eq!(options.get("skipPreflight"), Some(&Value::Bool(true)));
         assert_eq!(options.get("maxRetries"), Some(&Value::from(0)));
         assert_eq!(calls_two.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_signature_params_use_signature_filter() {
+        let params = helius_transaction_subscribe_signature_params(
+            "sig-test-123",
+            "confirmed",
+            &["payer-key".to_string(), "mint-key".to_string()],
+            false,
+            false,
+        );
+        let [filter, options] = params
+            .as_array()
+            .expect("transaction subscribe params")
+            .as_slice()
+        else {
+            panic!("expected transactionSubscribe params array");
+        };
+        assert_eq!(filter.get("signature"), Some(&Value::from("sig-test-123")));
+        assert_eq!(
+            filter.get("accountRequired"),
+            Some(&json!(["payer-key", "mint-key"]))
+        );
+        assert!(filter.get("failed").is_none());
+        assert_eq!(filter.get("vote"), Some(&Value::Bool(false)));
+        assert_eq!(
+            options.get("transactionDetails"),
+            Some(&Value::from("none"))
+        );
+        assert_eq!(options.get("commitment"), Some(&Value::from("confirmed")));
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_signature_params_can_request_full_transaction() {
+        let params = helius_transaction_subscribe_signature_params(
+            "sig-test-456",
+            "confirmed",
+            &["payer-key".to_string()],
+            true,
+            false,
+        );
+        let [_, options] = params
+            .as_array()
+            .expect("transaction subscribe params")
+            .as_slice()
+        else {
+            panic!("expected transactionSubscribe params array");
+        };
+        assert_eq!(
+            options.get("transactionDetails"),
+            Some(&Value::from("full"))
+        );
+        assert_eq!(options.get("encoding"), Some(&Value::from("jsonParsed")));
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_signature_params_can_request_full_transaction_for_errors() {
+        let params = helius_transaction_subscribe_signature_params(
+            "sig-test-789",
+            "confirmed",
+            &["payer-key".to_string()],
+            false,
+            true,
+        );
+        let [_, options] = params
+            .as_array()
+            .expect("transaction subscribe params")
+            .as_slice()
+        else {
+            panic!("expected transactionSubscribe params array");
+        };
+        assert_eq!(
+            options.get("transactionDetails"),
+            Some(&Value::from("full"))
+        );
+    }
+
+    #[test]
+    fn helius_transaction_subscribe_signature_params_buy_error_mode_requests_full_transaction() {
+        let params = helius_transaction_subscribe_signature_params(
+            "sig-buy-123",
+            "confirmed",
+            &["buyer-key".to_string(), "mint-key".to_string()],
+            false,
+            true,
+        );
+        let [filter, options] = params
+            .as_array()
+            .expect("transaction subscribe params")
+            .as_slice()
+        else {
+            panic!("expected transactionSubscribe params array");
+        };
+        assert_eq!(filter.get("signature"), Some(&Value::from("sig-buy-123")));
+        assert_eq!(
+            filter.get("accountRequired"),
+            Some(&json!(["buyer-key", "mint-key"]))
+        );
+        assert_eq!(
+            options.get("transactionDetails"),
+            Some(&Value::from("full"))
+        );
+    }
+
+    #[test]
+    fn extract_signature_notification_requires_explicit_err_field() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "signatureNotification",
+            "params": {
+                "subscription": 77,
+                "result": {
+                    "context": { "slot": 123 },
+                    "value": "receivedSignature"
+                }
+            }
+        });
+        assert!(extract_signature_notification(&payload).is_none());
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "signatureNotification",
+            "params": {
+                "subscription": 77,
+                "result": {
+                    "context": { "slot": 123 },
+                    "value": { "err": null }
+                }
+            }
+        });
+        let extracted =
+            extract_signature_notification(&payload).expect("notification should parse");
+        assert_eq!(extracted.0, 77);
+        assert_eq!(extracted.1, Some(123));
+        assert_eq!(extracted.2.get("err"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn extract_transaction_notification_accepts_none_payload_shape() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "transactionNotification",
+            "params": {
+                "subscription": 7743406,
+                "result": {
+                    "slot": 412669822,
+                    "transactionIndex": 883
+                }
+            }
+        });
+        let extracted =
+            extract_transaction_notification(&payload).expect("notification should parse");
+        assert_eq!(extracted.0, 7_743_406);
+        assert_eq!(extracted.1, Some(412_669_822));
+        assert_eq!(extracted.2.get("transactionIndex"), Some(&Value::from(883)));
+    }
+
+    #[test]
+    fn extract_transaction_notification_post_token_balances_reads_json_parsed_meta() {
+        let result = json!({
+            "transaction": {
+                "meta": {
+                    "postTokenBalances": [
+                        {
+                            "mint": "mint-a",
+                            "owner": "wallet-a",
+                            "uiTokenAmount": {
+                                "amount": "12345"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            extract_transaction_notification_post_token_balances(&result),
+            vec![TransactionTokenBalance {
+                mint: "mint-a".to_string(),
+                amount: "12345".to_string(),
+                owner: Some("wallet-a".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_transaction_notification_error_reads_status_err_shapes() {
+        let result = json!({
+            "transaction": {
+                "meta": {
+                    "status": {
+                        "Err": {
+                            "InstructionError": [2, { "Custom": 2006 }]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_transaction_notification_error(&result),
+            Some(json!({
+                "InstructionError": [2, { "Custom": 2006 }]
+            }))
+        );
+    }
+
+    #[test]
+    fn extract_transaction_notification_error_detects_creator_vault_seed_logs() {
+        let result = json!({
+            "transaction": {
+                "meta": {
+                    "logMessages": [
+                        "Program log: Instruction: Sell",
+                        "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006. Error Message: A seeds constraint was violated.",
+                        "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P failed: custom program error: 0x7d6"
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_transaction_notification_error(&result),
+            Some(json!({
+                "InstructionError": [2, { "Custom": 2006 }],
+                "detectedFromLogs": true,
+                "reason": "pump_creator_vault_constraint_seeds",
+                "matchedLogs": [
+                    "Program log: Instruction: Sell",
+                    "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006. Error Message: A seeds constraint was violated.",
+                    "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P failed: custom program error: 0x7d6"
+                ]
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn helius_transaction_notification_verifies_signature_status_failure() {
+        let rpc_addr = start_jsonrpc_server_with_signature_status(json!({
+            "confirmationStatus": "confirmed",
+            "err": {
+                "InstructionError": [6, { "Custom": 1 }]
+            },
+            "slot": 456789
+        }))
+        .await;
+        let rpc_url = format!("http://{rpc_addr}/");
+        let error = confirmation_details_from_transaction_notification(
+            &rpc_url,
+            "sig-test-123",
+            "confirmed",
+            false,
+            Some(456789),
+            json!({
+                "transactionIndex": 12
+            }),
+        )
+        .await
+        .err()
+        .expect("failed on-chain status should win over bare helius notification");
+        assert!(error.contains("sig-test-123 failed on-chain"));
+        assert!(error.contains("\"Custom\":1"));
+    }
+
+    #[tokio::test]
+    async fn helius_transaction_notification_rejects_creator_vault_failure_from_logs() {
+        let error = confirmation_details_from_transaction_notification(
+            "http://127.0.0.1:1/",
+            "sig-test-creator-vault",
+            "confirmed",
+            false,
+            Some(412871570),
+            json!({
+                "transaction": {
+                    "meta": {
+                        "logMessages": [
+                            "Program log: Instruction: Sell",
+                            "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006. Error Message: A seeds constraint was violated.",
+                            "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P failed: custom program error: 0x7d6"
+                        ]
+                    }
+                }
+            }),
+        )
+        .await
+        .err()
+        .expect("log-only creator_vault failure should be terminal");
+        assert!(error.contains("Launch transaction notification reported error"));
+        assert!(error.contains("\"Custom\":2006"));
+        assert!(error.contains("creator_vault"));
+    }
+
+    #[test]
+    fn extract_account_notification_reads_subscription_and_slot() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "accountNotification",
+            "params": {
+                "subscription": 42,
+                "result": {
+                    "context": {
+                        "slot": 123
+                    },
+                    "value": {
+                        "data": ["", "base64"]
+                    }
+                }
+            }
+        });
+        let extracted = extract_account_notification(&payload).expect("account notification");
+        assert_eq!(extracted.0, 42);
+        assert_eq!(extracted.1, Some(123));
+    }
+
+    #[test]
+    fn extract_account_notification_token_balance_raw_reads_base64_amount() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let mut data = vec![0u8; 72];
+        data[64..72].copy_from_slice(&12345u64.to_le_bytes());
+        let value = json!({
+            "data": [BASE64.encode(data), "base64"]
+        });
+        assert_eq!(
+            extract_account_notification_token_balance_raw(&value).expect("token amount"),
+            Some("12345".to_string())
+        );
+    }
+
+    #[test]
+    fn duplicate_standard_token_account_watches_are_disabled_with_warning() {
+        let submitted = vec![
+            sample_sent_result("buy-a", Some("ata-shared")),
+            sample_sent_result("buy-b", Some("ata-shared")),
+            sample_sent_result("buy-c", Some("ata-unique")),
+        ];
+        let (watches, warnings) = build_standard_token_account_watches(&submitted);
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].index, 2);
+        assert_eq!(watches[0].account, "ata-unique");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ATA-first confirmation was disabled"));
+        assert!(warnings[0].contains("ata-shared"));
+        assert!(warnings[0].contains("buy-a"));
+        assert!(warnings[0].contains("buy-b"));
+    }
+
+    #[test]
+    fn terminal_confirmation_errors_are_classified() {
+        assert!(is_terminal_confirmation_error(
+            "Transaction abc failed on-chain: {\"InstructionError\":[8,\"ProgramFailedToComplete\"]}"
+        ));
+        assert!(is_terminal_confirmation_error(
+            "Launch transaction notification reported error: {\"InstructionError\":[8,\"ProgramFailedToComplete\"]}"
+        ));
+        assert!(!is_terminal_confirmation_error("Subscription failed: nope"));
     }
 
     #[test]

@@ -26,3 +26,6 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"]
 futures-util = "0.3.32"
 lunar-lander-quic-client = { git = "https://github.com/hellomoon-io/lunar-lander-quic-client-rs" }
 rustls = { version = "0.23", features = ["ring"] }
+num-bigint = "0.4.6"
+num-traits = "0.2.19"
+spl-token = "9.0.0"

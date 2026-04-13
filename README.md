@@ -18,18 +18,56 @@ LaunchDeck is open-source tooling provided as-is. Running it, configuring it, mo
 
 ![LaunchDeck product screenshot](docs/images/product-dashboard.png)
 
+## Start Here
+
+Choose the path that matches how you plan to run LaunchDeck:
+
+- local Windows machine: go to `Quick Start` and expand `Windows Local Setup`
+- local Linux machine: go to `Quick Start` and expand `Linux Local Setup`
+- fresh VPS: use `docs/VPS_SETUP.md`
+
+Practical recommendation:
+
+- even for testing, a VPS is the recommended path because it is cheap, usually more secure, and gives you the latency profile you actually care about
+- local machine setup is still supported when you intentionally want to experiment or edit from your own workstation
+- if you want a straightforward VPS provider, [Vultr](https://www.vultr.com/?ref=9589308) is the worked example used in `docs/VPS_SETUP.md`
+- Vultr is recommended here because it is easy to deploy quickly across a very wide range of regions, supports normal card/fiat-style payments as well as crypto, and has been reliable in long-term use
+- if you use Vultr, please use [my referral link](https://www.vultr.com/?ref=9589308)
+- any other VPS provider is also completely fine as long as you place it close to the provider endpoints and RPCs you actually plan to use
+
+Personal note:
+
+- I have used Vultr for 5+ years and have not had issues with it
+
+AI setup help:
+
+- if you use Cursor or Codex, you can have it help walk you through the setup steps, install commands, `.env` editing, and VPS bootstrapping
+
 ## Recommended Stack
 
-For most operators today, the best-supported production setup is:
+For most operators today, the best-supported testing and production setup is:
 
+- run LaunchDeck on a VPS rather than on your everyday local workstation
+- place the VPS close to the provider endpoints and RPCs you actually plan to use
+- EU VPS location: Frankfurt or Amsterdam
+- US VPS location: New York / Newark area or Salt Lake City area
+- Asia VPS location: Singapore or Tokyo
 - [Helius dev tier](https://www.helius.dev/pricing) for your main infrastructure
 - `Helius Gatekeeper HTTP` for `SOLANA_RPC_URL`
 - `Helius standard websocket` for `SOLANA_WS_URL`
 - a separate [Shyft](https://shyft.to/) free-tier RPC for `LAUNCHDECK_WARM_RPC_URL`
 - `Helius Sender` or `Hello Moon` as the execution provider
 
+Practical routing note:
+
+- for EU, the default `eu` routing profile is already centered on Amsterdam + Frankfurt
+- for US, the practical target is New York / Newark area or Salt Lake City area; if you want to stay pinned to a Helius metro, use `ewr` or `slc`
+- for Asia, keep the VPS close to the Asian endpoints you actually plan to use, which usually means Singapore or Tokyo
+- if you are provisioning a fresh VPS, start with `docs/VPS_SETUP.md`
+
 Why this is the default recommendation:
 
+- a nearby VPS usually matters more than workstation convenience once you care about live execution quality
 - Helius Gatekeeper HTTP benchmarked best for the main HTTP RPC path
 - Helius standard websocket benchmarked best for the watcher websocket path
 - [Helius dev tier](https://www.helius.dev/pricing) gives a noticeable improvement in watcher quality and execution consistency, especially when you run multiple snipes or watcher-heavy follow automation
@@ -84,42 +122,23 @@ Hello Moon note:
 
 ## Easiest First Setup
 
-For most users, the easiest setup is:
+If you intentionally want to run LaunchDeck on your own machine, the local setup path is:
 
-1. copy `.env.example` to `.env`
-2. fill only the values already listed in `.env.example`
-3. start LaunchDeck with `npm start`
-4. leave the advanced defaults alone until you actually need them
+1. choose one local setup section below: `Windows` or `Linux`
+2. install the prerequisites for your platform and run `npm install`
+3. copy `.env.example` to `.env`
+4. fill only the values already listed in `.env.example`
+5. start LaunchDeck with `npm start`
+6. leave the advanced defaults alone until you actually need them
 
-The starter template is meant to be enough for a normal first production setup. If you want every variable, use `.env.advanced` and `docs/ENV_REFERENCE.md`.
+The starter template is meant to be enough for a normal first setup. If you want every variable, use `.env.advanced` and `docs/ENV_REFERENCE.md`.
 
-### Recommended `.env` values
+Choose the setup path that matches how you actually run LaunchDeck:
 
-If you do not want to fetch the exact Helius URLs from the dashboard yourself, you can copy these exactly and replace only the API key:
+- local workstation or existing machine: follow the quick-start steps in this README
+- fresh VPS instance: use `docs/VPS_SETUP.md` first; this is still the recommended path even for testing because it is cheap, private by default, and closer to the latency profile you actually want
 
-```bash
-SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
-SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
-LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
-```
-
-Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
-
-At minimum, most operators should set:
-
-- `SOLANA_PRIVATE_KEY` or the `SOLANA_PRIVATE_KEY*` wallet slots they want to use
-- `SOLANA_RPC_URL`
-- `SOLANA_WS_URL`
-- `USER_REGION`
-- `LAUNCHDECK_WARM_RPC_URL`
-
-Optional but common:
-
-- `HELLOMOON_API_KEY`
-- `BAGS_API_KEY`
-- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
-- `PINATA_JWT`
-- `LAUNCHDECK_BENCHMARK_MODE`
+For the exact starter `.env` values, use the `Recommended .env values` section in `Quick Start` below.
 
 ## What Is Already Enabled By Default
 
@@ -219,14 +238,85 @@ Important behavior:
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Choose Your Local Platform
 
 LaunchDeck uses:
 
 - Rust for the engine and follow daemon
 - Node.js for runtime helpers and launchpad helper scripts
 
-From the repo root:
+If you are running LaunchDeck on your own machine, expand one section below and follow only that section.
+
+If you are starting from a blank VPS instead, use `docs/VPS_SETUP.md` rather than the local-machine steps here.
+
+<details>
+<summary>Windows Local Setup</summary>
+
+Use PowerShell for the local setup flow.
+
+Install first:
+
+- [`Git`](https://git-scm.com/downloads)
+- [`Node.js 20`](https://nodejs.org/en/download)
+- Rust stable with the normal Windows MSVC toolchain from [`rustup`](https://rustup.rs/)
+- [`Visual Studio Build Tools`](https://visualstudio.microsoft.com/downloads/) with the C++ toolchain if your Rust build complains about missing linker or compiler tools
+
+Recommended flow from the repo root:
+
+```powershell
+npm install
+Copy-Item .env.example .env
+```
+
+Practical notes:
+
+- after installing Rust for the first time, reopen PowerShell before running `npm install`
+- `npm start`, `npm stop`, and `npm restart` use the repo's PowerShell runtime scripts on Windows
+- if startup fails, check `.local\launchdeck\engine-error.log` and `.local\launchdeck\follow-daemon-error.log`
+
+</details>
+
+<details>
+<summary>Linux Local Setup</summary>
+
+These commands assume a Debian or Ubuntu style machine. On other distros, install the equivalent packages first.
+
+Install first:
+
+- [`Git`](https://git-scm.com/downloads)
+- [`Node.js 20`](https://nodejs.org/en/download)
+- Rust stable via [`rustup`](https://rustup.rs/)
+- build tools such as [`build-essential`](https://packages.ubuntu.com/search?keywords=build-essential), [`pkg-config`](https://packages.ubuntu.com/search?keywords=pkg-config), and [`libssl-dev`](https://packages.ubuntu.com/search?keywords=libssl-dev)
+
+Example flow:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git curl build-essential pkg-config libssl-dev
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source "$HOME/.cargo/env"
+npm install
+cp .env.example .env
+```
+
+Practical notes:
+
+- if you install Node.js through your package manager, make sure you end up on `Node.js 20`
+- after a first-time Rust install, either `source "$HOME/.cargo/env"` or open a new shell before running LaunchDeck commands
+- if startup fails, check `.local/launchdeck/engine-error.log` and `.local/launchdeck/follow-daemon-error.log`
+
+</details>
+
+Manual/local install baseline:
+
+- Node.js `20`
+- Rust stable via `rustup`
+- Git
+- build tools such as `build-essential`, `pkg-config`, and `libssl-dev` on Ubuntu
+
+If you are starting from a blank VPS, do not hand-roll that first pass unless you want to. `docs/VPS_SETUP.md` walks through the current bootstrap path and the `scripts/vps-bootstrap.sh` installer handles the common system packages plus Rust, Node.js, repo clone, `npm install`, and the `systemd` service setup.
+
+From the repo root, once your dependencies are installed:
 
 ```bash
 npm install
@@ -235,6 +325,8 @@ npm install
 ### 2. Configure `.env`
 
 Copy `.env.example` to `.env`, then fill the starter values.
+
+If you used one of the platform sections above, you may already have created `.env`. In that case, just edit it now.
 
 If you want the full list, use:
 
@@ -251,6 +343,21 @@ Primary commands:
 
 `npm start` launches both the main host and the follow daemon together, waits for health, and opens the UI when supported.
 
+First-run note:
+
+- the first startup can take several minutes because Rust may still need to build the binaries
+
+What success looks like:
+
+- the main host becomes available at `http://127.0.0.1:8789`
+- the follow daemon becomes available at `http://127.0.0.1:8790`
+- the UI opens automatically when your platform supports that behavior
+
+If startup fails, check these logs first:
+
+- Windows: `.local\launchdeck\engine-error.log` and `.local\launchdeck\follow-daemon-error.log`
+- Linux: `.local/launchdeck/engine-error.log` and `.local/launchdeck/follow-daemon-error.log`
+
 ### 4. Open the UI
 
 Default local URL:
@@ -262,6 +369,54 @@ Basic run flow:
 - confirm your wallets are loaded from `SOLANA_PRIVATE_KEY*`
 - set your normal preset defaults in the Settings modal
 - you are ready to launch
+
+### First Live Run Checklist
+
+For the first live launch, keep it simple:
+
+1. load one wallet
+2. set `SOLANA_RPC_URL`, `SOLANA_WS_URL`, `USER_REGION`, and `LAUNCHDECK_WARM_RPC_URL`
+3. leave the provider on `Helius Sender`
+4. run `Build`
+5. run `Simulate`
+6. only then run `Deploy`
+
+### Recommended `.env` values
+
+If you do not want to fetch the exact Helius URLs from the dashboard yourself, you can copy these exactly and replace only the API key:
+
+```bash
+SOLANA_RPC_URL=https://beta.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY
+LAUNCHDECK_WARM_RPC_URL=https://rpc.fra.shyft.to?api_key=YOUR_SHYFT_API_KEY
+```
+
+Put your Helius key immediately after `api-key=`. Put your Shyft key immediately after `api_key=`.
+
+At minimum, most operators should set:
+
+- `SOLANA_PRIVATE_KEY` or the `SOLANA_PRIVATE_KEY*` wallet slots they want to use
+- `SOLANA_RPC_URL`
+- `SOLANA_WS_URL`
+- `USER_REGION`
+- `LAUNCHDECK_WARM_RPC_URL`
+
+Optional but common:
+
+- `HELLOMOON_API_KEY`
+- `BAGS_API_KEY`
+- `LAUNCHDECK_METADATA_UPLOAD_PROVIDER=pinata`
+- `PINATA_JWT`
+- `LAUNCHDECK_BENCHMARK_MODE`
+
+## Security Note
+
+Keep the runtime private by default:
+
+- do not expose the raw LaunchDeck UI publicly unless you intentionally add your own access controls
+- do not share your `.env`
+- keep private keys only on the machine or VPS that is actually running LaunchDeck
+- for production, prefer the SSH-tunnel VPS pattern documented in `docs/VPS_SETUP.md`
 
 ## Provider Summary
 
@@ -297,7 +452,7 @@ High-level support today:
 
 - Pump: verified primary path
 - Bonk: verified helper-backed path
-- Bagsapp: available, but still experimental
+- Bagsapp: supported when Bags credentials are configured
 
 See `docs/LAUNCHPADS.md` for the detailed launchpad and mode matrix.
 
@@ -306,7 +461,7 @@ See `docs/LAUNCHPADS.md` for the detailed launchpad and mode matrix.
 Start here:
 
 - `README.md`
-  First production setup path and docs map
+  First setup path and docs map
 - `docs/CONFIG.md`
   Recommended setup, runtime behavior, warm/watch explanation, and operator-facing config guidance
 - `docs/ENV_REFERENCE.md`

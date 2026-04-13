@@ -1350,6 +1350,8 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "lunar-lander-quic-client",
+ "num-bigint",
+ "num-traits",
  "reqwest",
  "rustls",
  "serde",
@@ -1359,6 +1361,7 @@ dependencies = [
  "solana-sdk",
  "solana-system-interface 3.1.0",
  "spl-associated-token-account",
+ "spl-token",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -2965,6 +2968,8 @@ version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e860d5499a705369778647e97d760f7670adfb6fc8419dd3d568deccd46d5487"
 dependencies = [
+ "serde",
+ "serde_derive",
  "solana-sdk-ids",
  "solana-sdk-macro",
  "solana-sysvar-id",
@@ -3239,7 +3244,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6690d3dd88f15c21edff68eb391ef8800df7a1f5cec84ee3e8d1abf05affdf74"
 dependencies = [
  "base64",
+ "bincode",
  "lazy_static",
+ "serde",
+ "serde_derive",
  "solana-account-info",
  "solana-clock",
  "solana-define-syscall 4.0.1",
@@ -3497,6 +3505,34 @@ dependencies = [
  "solana-program-option",
  "solana-pubkey 3.0.0",
  "solana-zk-sdk",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "spl-token"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878b0183d51fcd8a53e1604f4c13321894cf53227e6773c529b0d03d499a8dfd"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "num_enum",
+ "solana-account-info",
+ "solana-cpi",
+ "solana-instruction",
+ "solana-msg",
+ "solana-program-entrypoint",
+ "solana-program-error",
+ "solana-program-memory",
+ "solana-program-option",
+ "solana-program-pack",
+ "solana-pubkey 3.0.0",
+ "solana-rent 3.1.0",
+ "solana-sdk-ids",
+ "solana-sysvar 3.1.1",
+ "spl-token-interface",
  "thiserror 2.0.18",
 ]
 

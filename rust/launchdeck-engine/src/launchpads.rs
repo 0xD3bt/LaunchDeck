@@ -3,7 +3,7 @@
 use serde::Serialize;
 use std::{collections::BTreeMap, env, fs};
 
-use crate::paths;
+use crate::{launchpad_dispatch::launchpad_runtime_capabilities, paths};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadataLimits {
@@ -27,6 +27,7 @@ pub struct LaunchpadAvailability {
     pub label: String,
     pub available: bool,
     pub supportState: String,
+    pub runtimeCapabilities: crate::launchpad_dispatch::LaunchpadRuntimeCapabilities,
     pub tokenMetadata: TokenMetadataLimits,
     pub supportsStrategies: StrategySupport,
     pub reason: String,
@@ -54,6 +55,8 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                 label: "Pump".to_string(),
                 available: true,
                 supportState: "verified".to_string(),
+                runtimeCapabilities: launchpad_runtime_capabilities("pump")
+                    .expect("pump runtime capabilities"),
                 tokenMetadata: TokenMetadataLimits {
                     nameMaxLength: 32,
                     symbolMaxLength: 10,
@@ -74,6 +77,8 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                 label: "Bonk".to_string(),
                 available: true,
                 supportState: "verified".to_string(),
+                runtimeCapabilities: launchpad_runtime_capabilities("bonk")
+                    .expect("bonk runtime capabilities"),
                 tokenMetadata: TokenMetadataLimits {
                     nameMaxLength: 32,
                     symbolMaxLength: 10,
@@ -96,10 +101,12 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                 label: "Bagsapp".to_string(),
                 available: bags_configured,
                 supportState: if bags_configured {
-                    "unverified".to_string()
+                    "supported".to_string()
                 } else {
                     "configured-required".to_string()
                 },
+                runtimeCapabilities: launchpad_runtime_capabilities("bagsapp")
+                    .expect("bagsapp runtime capabilities"),
                 tokenMetadata: TokenMetadataLimits {
                     nameMaxLength: 32,
                     symbolMaxLength: 10,
@@ -110,7 +117,7 @@ pub fn launchpad_registry() -> BTreeMap<String, LaunchpadAvailability> {
                     dev_buy: true,
                 },
                 reason: if bags_configured {
-                    "Bags hosted launch flow is enabled with fee-share modes, wallet-only or linked identity, dev-buy, same-time snipers, snipe buy/sell automation, and market-triggered auto-sell.".to_string()
+                    "Bags hosted launch flow is enabled with fee-share modes, wallet-only identity, dev-buy, same-time snipers, snipe buy/sell automation, and market-triggered auto-sell.".to_string()
                 } else {
                     "Missing BAGS_API_KEY.".to_string()
                 },

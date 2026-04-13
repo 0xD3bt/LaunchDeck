@@ -16,6 +16,13 @@ const DEFAULT_SNIPER_BUY_COMPUTE_UNIT_LIMIT: u64 = 120_000;
 const DEFAULT_DEV_AUTO_SELL_COMPUTE_UNIT_LIMIT: u64 = 145_000;
 const DEFAULT_LAUNCH_USD1_TOPUP_COMPUTE_UNIT_LIMIT: u64 = 90_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchpadActionBackendMode {
+    Auto,
+    Helper,
+    Rust,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("{0}")]
@@ -730,6 +737,14 @@ pub struct NormalizedRecipient {
     pub shareBps: i64,
 }
 
+fn is_supported_social_recipient_type(value: &str) -> bool {
+    matches!(value, "github" | "twitter" | "x" | "kick" | "tiktok")
+}
+
+fn launchpad_supports_extended_social_recipients(launchpad: &str) -> bool {
+    launchpad.trim().eq_ignore_ascii_case("bagsapp")
+}
+
 fn is_blank(value: &str) -> bool {
     value.trim().is_empty()
 }
@@ -1060,7 +1075,9 @@ fn validate_manual_provider_fee_fields(
         return Ok(());
     }
     if priority_fee_sol.trim().is_empty() && tip_sol.trim().is_empty() {
-        return Ok(());
+        return Err(ConfigError::Message(format!(
+            "{label_prefix}PriorityFeeSol and {label_prefix}TipSol are required when {label_prefix}Provider is {provider} and {label_prefix}AutoGas is false."
+        )));
     }
     let priority_lamports =
         parse_sol_decimal_to_lamports(priority_fee_sol, &format!("{label_prefix}PriorityFeeSol"))?;
@@ -1119,6 +1136,7 @@ fn normalize_recipients(
     entries: &[RawRecipient],
     label_prefix: &str,
     allow_agent: bool,
+    allow_extended_social: bool,
 ) -> Result<Vec<NormalizedRecipient>, ConfigError> {
     if entries.len() > MAX_FEE_SPLIT_RECIPIENTS {
         return Err(ConfigError::Message(format!(
@@ -1159,9 +1177,59 @@ fn normalize_recipients(
             continue;
         }
 
-        if address.is_empty() && github_user_id.is_empty() {
+        if entry_type == "wallet" && address.is_empty() {
             return Err(ConfigError::Message(format!(
-                "{label_prefix} at index {index} must provide either address or githubUserId."
+                "{label_prefix} at index {index} must provide a wallet address."
+            )));
+        }
+        if entry_type == "github" && github_user_id.is_empty() && github_username.is_empty() {
+            let provider_label = if entry_type == "x" {
+                "X"
+            } else if entry_type == "tiktok" {
+                "TikTok"
+            } else if entry_type == "kick" {
+                "Kick"
+            } else {
+                "GitHub"
+            };
+            return Err(ConfigError::Message(format!(
+                "{label_prefix} at index {index} must provide a {provider_label} username{}.",
+                if entry_type == "github" {
+                    " or user id"
+                } else {
+                    ""
+                }
+            )));
+        }
+        if matches!(entry_type.as_str(), "twitter" | "x" | "kick" | "tiktok")
+            && github_username.is_empty()
+        {
+            let provider_label = if entry_type == "x" {
+                "X"
+            } else if entry_type == "tiktok" {
+                "TikTok"
+            } else if entry_type == "kick" {
+                "Kick"
+            } else {
+                "Twitter"
+            };
+            return Err(ConfigError::Message(format!(
+                "{label_prefix} at index {index} must provide a {provider_label} username."
+            )));
+        }
+        if entry_type != "wallet"
+            && entry_type != "agent"
+            && !is_supported_social_recipient_type(&entry_type)
+        {
+            return Err(ConfigError::Message(format!(
+                "{label_prefix} at index {index} has unsupported recipient type: {entry_type}."
+            )));
+        }
+        if matches!(entry_type.as_str(), "twitter" | "x" | "kick" | "tiktok")
+            && !allow_extended_social
+        {
+            return Err(ConfigError::Message(format!(
+                "{label_prefix} at index {index} uses {entry_type}, which is only supported for Bags launches."
             )));
         }
 
@@ -1331,14 +1399,30 @@ fn normalize_dev_buy(raw: &RawConfig) -> Result<Option<NormalizedDevBuy>, Config
     Ok(None)
 }
 
+const DEV_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET: i64 = 23;
+const SNIPER_BUY_MAX_TARGET_BLOCK_OFFSET: i64 = 37;
+const SNIPER_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET: i64 = 23;
+
 fn normalize_follow_sell(
     raw: &RawFollowLaunchSell,
     fallback_wallet_env_key: &str,
     fallback_action_id: &str,
+    max_target_block_offset: i64,
 ) -> Result<Option<NormalizedFollowLaunchSell>, ConfigError> {
     let enabled = parse_bool(&raw.enabled, false);
-    let market_cap_enabled =
-        parse_bool(&raw.marketCap.enabled, false) && !raw.marketCap.threshold.trim().is_empty();
+    let market_cap_requested = parse_bool(&raw.marketCap.enabled, false);
+    if market_cap_requested && raw.marketCap.threshold.trim().is_empty() {
+        return Err(ConfigError::Message(format!(
+            "{fallback_action_id}.marketCap.threshold is required when marketCap.enabled is true."
+        )));
+    }
+    let market_cap_direction = raw.marketCap.direction.trim().to_lowercase();
+    if !market_cap_direction.is_empty() && market_cap_direction != "gte" {
+        return Err(ConfigError::Message(format!(
+            "{fallback_action_id}.marketCap.direction must be gte. Legacy lte is no longer supported."
+        )));
+    }
+    let market_cap_enabled = market_cap_requested && !raw.marketCap.threshold.trim().is_empty();
     let has_payload = enabled
         || raw.percent.is_some()
         || raw.delayMs.is_some()
@@ -1368,7 +1452,7 @@ fn normalize_follow_sell(
         &raw.targetBlockOffset,
         &format!("{fallback_action_id}.targetBlockOffset"),
         Some(0),
-        Some(23),
+        Some(max_target_block_offset),
         None,
     )?
     .map(|value| value as u8);
@@ -1419,15 +1503,6 @@ fn normalize_follow_sell(
         precheckRequired: parse_bool(&raw.precheckRequired, false),
         requireConfirmation: parse_bool(&raw.requireConfirmation, true),
     }))
-}
-
-fn follow_sell_has_payload(raw: &RawFollowLaunchSell) -> bool {
-    parse_bool(&raw.enabled, false)
-        || raw.percent.is_some()
-        || raw.delayMs.is_some()
-        || raw.targetBlockOffset.is_some()
-        || (parse_bool(&raw.marketCap.enabled, false) && !raw.marketCap.threshold.trim().is_empty())
-        || !raw.walletEnvKey.trim().is_empty()
 }
 
 fn legacy_follow_launch(
@@ -1534,7 +1609,7 @@ fn normalize_follow_launch(
             &entry.targetBlockOffset,
             &format!("followLaunch.snipes[{index}].targetBlockOffset"),
             Some(0),
-            Some(23),
+            Some(SNIPER_BUY_MAX_TARGET_BLOCK_OFFSET),
             None,
         )?
         .map(|value| value as u8);
@@ -1552,16 +1627,38 @@ fn normalize_follow_launch(
                 "followLaunch.snipes[{index}] cannot use submitWithLaunch together with submitDelayMs or targetBlockOffset."
             )));
         }
-        if let Some(sell) = &entry.postBuySell {
-            if follow_sell_has_payload(sell) {
-                return Err(ConfigError::Message(format!(
-                    "followLaunch.snipes[{index}].postBuySell is not shipped yet. Phase 1 supports multi-sniper buys plus dev auto-sell only."
-                )));
-            }
-        }
         let post_buy_sell = match &entry.postBuySell {
             Some(sell) => {
-                normalize_follow_sell(sell, &wallet_env_key, &format!("snipe-{}-sell", index + 1))?
+                let normalized_sell =
+                    normalize_follow_sell(
+                        sell,
+                        &wallet_env_key,
+                        &format!("snipe-{}-sell", index + 1),
+                        SNIPER_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET,
+                    )?;
+                if let Some(sell) = &normalized_sell {
+                    if sell.delayMs.is_some() {
+                        return Err(ConfigError::Message(format!(
+                            "followLaunch.snipes[{index}].postBuySell.delayMs is not supported. Use targetBlockOffset or marketCap trigger."
+                        )));
+                    }
+                    if sell.targetBlockOffset.is_some() && sell.marketCap.is_some() {
+                        return Err(ConfigError::Message(format!(
+                            "followLaunch.snipes[{index}].postBuySell must choose either targetBlockOffset or marketCap, not both."
+                        )));
+                    }
+                    if sell.targetBlockOffset.is_none() && sell.marketCap.is_none() {
+                        return Err(ConfigError::Message(format!(
+                            "followLaunch.snipes[{index}].postBuySell requires targetBlockOffset or marketCap trigger."
+                        )));
+                    }
+                    if sell.percent == 0 {
+                        return Err(ConfigError::Message(format!(
+                            "followLaunch.snipes[{index}].postBuySell.percent must be between 1 and 100."
+                        )));
+                    }
+                }
+                normalized_sell
             }
             None => None,
         };
@@ -1599,7 +1696,12 @@ fn normalize_follow_launch(
         });
     }
     let dev_auto_sell = match &follow.devAutoSell {
-        Some(sell) => normalize_follow_sell(sell, raw.selectedWalletKey.trim(), "dev-auto-sell")?,
+        Some(sell) => normalize_follow_sell(
+            sell,
+            raw.selectedWalletKey.trim(),
+            "dev-auto-sell",
+            DEV_AUTO_SELL_MAX_TARGET_BLOCK_OFFSET,
+        )?,
         None => None,
     };
     let explicit_enabled = parse_bool(&follow.enabled, false);
@@ -1684,10 +1786,18 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         "none",
     )?;
 
-    let fee_recipients =
-        normalize_recipients(&raw.feeSharing.recipients, "feeSharing recipient", false)?;
-    let mut agent_fee_recipients =
-        normalize_recipients(&raw.agent.feeRecipients, "agent recipient", true)?;
+    let fee_recipients = normalize_recipients(
+        &raw.feeSharing.recipients,
+        "feeSharing recipient",
+        false,
+        launchpad_supports_extended_social_recipients(&launchpad),
+    )?;
+    let mut agent_fee_recipients = normalize_recipients(
+        &raw.agent.feeRecipients,
+        "agent recipient",
+        true,
+        launchpad_supports_extended_social_recipients(&launchpad),
+    )?;
     let default_mev_mode = configured_hellomoon_mev_mode_default();
     let creation_mev_mode = parse_mev_mode(
         if raw.execution.mevMode.is_some() {
@@ -1808,14 +1918,10 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         creatorFee: normalize_creator_fee(&raw.creatorFee, &mode)?,
         bags: NormalizedBags {
             configType: bags_config_type_for_mode(&mode).to_string(),
-            identityMode: if raw.bags.identityMode.trim().eq_ignore_ascii_case("linked") {
-                "linked".to_string()
-            } else {
-                "wallet-only".to_string()
-            },
-            agentUsername: raw.bags.agentUsername.trim().to_string(),
-            authToken: raw.bags.authToken.trim().to_string(),
-            identityVerifiedWallet: raw.bags.identityVerifiedWallet.trim().to_string(),
+            identityMode: "wallet-only".to_string(),
+            agentUsername: String::new(),
+            authToken: String::new(),
+            identityVerifiedWallet: String::new(),
         },
         execution: NormalizedExecution {
             simulate: parse_bool(&raw.execution.simulate, false),
@@ -1964,21 +2070,8 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
         vanityPrivateKey: raw.vanityPrivateKey.trim().to_string(),
     };
 
-    if normalized.token.uri.is_empty() {
+    if normalized.token.uri.is_empty() && normalized.launchpad != "bagsapp" {
         return Err(ConfigError::Message("token.uri is required.".to_string()));
-    }
-
-    if normalized.launchpad == "bagsapp" && normalized.bags.identityMode == "linked" {
-        if normalized.bags.authToken.is_empty() {
-            return Err(ConfigError::Message(
-                "Bags linked identity requires a valid auth token.".to_string(),
-            ));
-        }
-        if normalized.bags.identityVerifiedWallet.is_empty() {
-            return Err(ConfigError::Message(
-                "Bags linked identity requires a verified linked wallet.".to_string(),
-            ));
-        }
     }
 
     if mode == "regular" || mode == "cashback" {
@@ -2094,10 +2187,127 @@ pub fn normalize_raw_config(raw: RawConfig) -> Result<NormalizedConfig, ConfigEr
     Ok(normalized)
 }
 
+/// When unset or non-false: build `LaunchpadWarmContext` once per launch request (blockhash prime).
+#[allow(dead_code)] // Server `main` uses via `launchpad_warm`; other binaries link `config` only.
+pub fn configured_launchpad_warm_context_enabled() -> bool {
+    match env::var("LAUNCHDECK_LAUNCHPAD_WARM_CONTEXT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Opt-in: set `1` or `true` to enable parallel independent warm fetches once implemented.
+/// Defaults to **false** so telemetry does not claim parallelism that the builder does not perform yet.
+#[allow(dead_code)]
+pub fn configured_warm_parallel_fetch_enabled() -> bool {
+    match env::var("LAUNCHDECK_LAUNCHPAD_PARALLEL_WARM_FETCH") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Upper bound for concurrent warm RPC operations in the warm-context builder.
+#[allow(dead_code)]
+pub fn launchpad_warm_max_parallel_fetches() -> usize {
+    env::var("LAUNCHDECK_LAUNCHPAD_WARM_MAX_PARALLEL_FETCH")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8)
+}
+
+/// When unset or non-false: pass Rust-cached blockhash into the Bags helper for prepare/build-launch.
+pub fn configured_bags_rust_blockhash_for_helper() -> bool {
+    match env::var("LAUNCHDECK_BAGS_HELPER_BLOCKHASH_FROM_RUST") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Wall-clock cap for confirming a Bags setup transaction batch after submit (websocket + polling).
+/// Default 20 seconds; Bags setup should land quickly or fail so shared blockhashes do not expire mid-flight.
+#[allow(dead_code)]
+pub fn configured_bags_setup_confirm_timeout_secs() -> u64 {
+    env::var("LAUNCHDECK_BAGS_SETUP_CONFIRM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(20)
+}
+
+/// Commitment required before Bags builds the final launch transaction after setup.
+/// Defaults to `confirmed`; set `LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT=processed` to opt into the faster gate.
+pub fn configured_bags_setup_gate_commitment() -> String {
+    match env::var("LAUNCHDECK_BAGS_SETUP_GATE_COMMITMENT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "processed" | "confirmed" | "finalized" => value.trim().to_ascii_lowercase(),
+            _ => "confirmed".to_string(),
+        },
+        Err(_) => "confirmed".to_string(),
+    }
+}
+
+pub fn configured_launchpad_action_backend_mode(
+    launchpad: &str,
+    action: &str,
+) -> LaunchpadActionBackendMode {
+    if launchpad.trim().eq_ignore_ascii_case("bonk")
+        || launchpad.trim().eq_ignore_ascii_case("bagsapp")
+    {
+        return LaunchpadActionBackendMode::Rust;
+    }
+    let launchpad_key = launchpad
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let action_key = action
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let env_key = format!("LAUNCHDECK_{launchpad_key}_{action_key}_BACKEND");
+    match env::var(env_key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "helper" | "helper-backed" => LaunchpadActionBackendMode::Helper,
+            "rust" | "rust-native" | "rust-only" => LaunchpadActionBackendMode::Rust,
+            _ => LaunchpadActionBackendMode::Auto,
+        },
+        Err(_) => LaunchpadActionBackendMode::Auto,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn sample_raw_config() -> RawConfig {
         serde_json::from_value(json!({
@@ -2160,6 +2370,44 @@ mod tests {
             "presets": {}
         }))
         .expect("sample config should deserialize")
+    }
+
+    #[test]
+    fn launchpad_action_backend_mode_defaults_bonk_and_bags_to_rust() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::remove_var("LAUNCHDECK_BONK_STARTUP_WARM_BACKEND");
+            env::remove_var("LAUNCHDECK_BAGSAPP_STARTUP_WARM_BACKEND");
+        }
+        assert_eq!(
+            configured_launchpad_action_backend_mode("bonk", "startup-warm"),
+            LaunchpadActionBackendMode::Rust
+        );
+        assert_eq!(
+            configured_launchpad_action_backend_mode("bagsapp", "startup-warm"),
+            LaunchpadActionBackendMode::Rust
+        );
+    }
+
+    #[test]
+    fn launchpad_action_backend_mode_keeps_bonk_and_bags_rust_only() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            env::set_var("LAUNCHDECK_BONK_STARTUP_WARM_BACKEND", "helper");
+            env::set_var("LAUNCHDECK_BAGSAPP_STARTUP_WARM_BACKEND", "helper");
+        }
+        assert_eq!(
+            configured_launchpad_action_backend_mode("bonk", "startup-warm"),
+            LaunchpadActionBackendMode::Rust
+        );
+        assert_eq!(
+            configured_launchpad_action_backend_mode("bagsapp", "startup-warm"),
+            LaunchpadActionBackendMode::Rust
+        );
+        unsafe {
+            env::remove_var("LAUNCHDECK_BONK_STARTUP_WARM_BACKEND");
+            env::remove_var("LAUNCHDECK_BAGSAPP_STARTUP_WARM_BACKEND");
+        }
     }
 
     #[test]
@@ -2410,6 +2658,51 @@ mod tests {
     }
 
     #[test]
+    fn manual_helius_follow_fees_require_explicit_buy_values() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch.enabled = Some(json!(true));
+        raw.followLaunch.snipes = vec![RawFollowLaunchSnipe {
+            enabled: Some(json!(true)),
+            walletEnvKey: "SOLANA_PRIVATE_KEY".to_string(),
+            buyAmountSol: "0.1".to_string(),
+            ..RawFollowLaunchSnipe::default()
+        }];
+        raw.execution.buyProvider = "helius-sender".to_string();
+        raw.execution.buyAutoGas = Some(json!(false));
+        raw.execution.buyPriorityFeeSol = String::new();
+        raw.execution.buyTipSol = String::new();
+
+        let error =
+            normalize_raw_config(raw).expect_err("manual helius buy fees should be required");
+
+        assert_eq!(
+            error.to_string(),
+            "execution.buyPriorityFeeSol and execution.buyTipSol are required when execution.buyProvider is helius-sender and execution.buyAutoGas is false."
+        );
+    }
+
+    #[test]
+    fn manual_helius_follow_fees_require_explicit_sell_values() {
+        let mut raw = sample_raw_config();
+        raw.postLaunch.strategy = "automatic-dev-sell".to_string();
+        raw.postLaunch.automaticDevSell.enabled = Some(json!(true));
+        raw.postLaunch.automaticDevSell.percent = Some(json!(75));
+        raw.postLaunch.automaticDevSell.delaySeconds = Some(json!(0));
+        raw.execution.sellProvider = "helius-sender".to_string();
+        raw.execution.sellAutoGas = Some(json!(false));
+        raw.execution.sellPriorityFeeSol = String::new();
+        raw.execution.sellTipSol = String::new();
+
+        let error =
+            normalize_raw_config(raw).expect_err("manual helius sell fees should be required");
+
+        assert_eq!(
+            error.to_string(),
+            "execution.sellPriorityFeeSol and execution.sellTipSol are required when execution.sellProvider is helius-sender and execution.sellAutoGas is false."
+        );
+    }
+
+    #[test]
     fn rejects_removed_auto_provider_values() {
         let mut raw = sample_raw_config();
         raw.execution.provider = "auto".to_string();
@@ -2453,6 +2746,83 @@ mod tests {
     }
 
     #[test]
+    fn bagsapp_accepts_supported_social_fee_recipients() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bagsapp".to_string();
+        raw.feeSharing.recipients = vec![
+            RawRecipient {
+                r#type: "twitter".to_string(),
+                address: String::new(),
+                githubUsername: "launchdeck".to_string(),
+                githubUserId: String::new(),
+                shareBps: Some(json!(5_000)),
+            },
+            RawRecipient {
+                r#type: "wallet".to_string(),
+                address: "11111111111111111111111111111111".to_string(),
+                githubUsername: String::new(),
+                githubUserId: String::new(),
+                shareBps: Some(json!(5_000)),
+            },
+        ];
+
+        let normalized =
+            normalize_raw_config(raw).expect("bagsapp social recipients should normalize");
+        assert_eq!(normalized.feeSharing.recipients.len(), 2);
+        assert_eq!(
+            normalized.feeSharing.recipients[0].r#type.as_deref(),
+            Some("twitter")
+        );
+        assert_eq!(
+            normalized.feeSharing.recipients[0].githubUsername,
+            "launchdeck"
+        );
+    }
+
+    #[test]
+    fn bagsapp_allows_helper_managed_metadata_uri() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "bagsapp".to_string();
+        raw.token.uri = String::new();
+
+        let normalized =
+            normalize_raw_config(raw).expect("bagsapp should allow helper-managed metadata uri");
+        assert!(normalized.token.uri.is_empty());
+        assert_eq!(normalized.launchpad, "bagsapp");
+    }
+
+    #[test]
+    fn pump_rejects_extended_social_fee_recipients() {
+        let mut raw = sample_raw_config();
+        raw.launchpad = "pump".to_string();
+        raw.feeSharing.recipients = vec![
+            RawRecipient {
+                r#type: "twitter".to_string(),
+                address: String::new(),
+                githubUsername: "launchdeck".to_string(),
+                githubUserId: String::new(),
+                shareBps: Some(json!(5_000)),
+            },
+            RawRecipient {
+                r#type: "wallet".to_string(),
+                address: "11111111111111111111111111111111".to_string(),
+                githubUsername: String::new(),
+                githubUserId: String::new(),
+                shareBps: Some(json!(5_000)),
+            },
+        ];
+
+        let error =
+            normalize_raw_config(raw).expect_err("pump should reject extended social recipients");
+        assert!(
+            error
+                .to_string()
+                .contains("only supported for Bags launches"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn bonk_allows_bonkers_mode() {
         let mut raw = sample_raw_config();
         raw.launchpad = "bonk".to_string();
@@ -2485,6 +2855,8 @@ mod tests {
         raw.postLaunch.automaticDevSell.enabled = Some(json!(true));
         raw.postLaunch.automaticDevSell.percent = Some(json!(75));
         raw.postLaunch.automaticDevSell.delaySeconds = Some(json!(2));
+        raw.execution.sellPriorityFeeSol = "0.000001".to_string();
+        raw.execution.sellTipSol = "0.0002".to_string();
         let normalized = normalize_raw_config(raw).expect("legacy postLaunch should migrate");
         assert!(normalized.followLaunch.enabled);
         let dev_auto_sell = normalized
@@ -2507,7 +2879,7 @@ mod tests {
                     "walletEnvKey": "SOLANA_PRIVATE_KEY2",
                     "buyAmountSol": "0.25",
                     "submitDelayMs": 30,
-                    "targetBlockOffset": 1,
+                    "targetBlockOffset": 37,
                     "jitterMs": 5,
                     "feeJitterBps": 250
                 }
@@ -2521,13 +2893,36 @@ mod tests {
         assert_eq!(snipe.walletEnvKey, "SOLANA_PRIVATE_KEY2");
         assert_eq!(snipe.buyAmountSol, "0.25");
         assert_eq!(snipe.submitDelayMs, 30);
-        assert_eq!(snipe.targetBlockOffset, Some(1));
+        assert_eq!(snipe.targetBlockOffset, Some(37));
         assert_eq!(snipe.jitterMs, 5);
         assert_eq!(snipe.feeJitterBps, 250);
     }
 
     #[test]
-    fn rejects_phase_two_post_buy_sell_in_follow_launch() {
+    fn rejects_sniper_post_buy_sell_delay_mode() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "snipes": [
+                {
+                    "walletEnvKey": "SOLANA_PRIVATE_KEY2",
+                    "buyAmountSol": "0.25",
+                    "postBuySell": { "enabled": true, "percent": 100, "delayMs": 2500 }
+                }
+            ]
+        }))
+        .expect("follow launch raw");
+        let error = normalize_raw_config(raw).expect_err("sniper sell delay should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("postBuySell.delayMs is not supported")
+        );
+    }
+
+    #[test]
+    fn normalizes_sniper_post_buy_sell_block_offset_trigger() {
         let mut raw = sample_raw_config();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
@@ -2538,20 +2933,22 @@ mod tests {
                     "buyAmountSol": "0.25",
                     "postBuySell": {
                         "enabled": true,
-                        "percent": 100,
-                        "delayMs": 2500
+                        "percent": 50,
+                        "targetBlockOffset": 23
                     }
                 }
             ]
         }))
         .expect("follow launch raw");
-        let error =
-            normalize_raw_config(raw).expect_err("phase two post buy sell should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("followLaunch.snipes[0].postBuySell is not shipped yet")
-        );
+        let normalized = normalize_raw_config(raw).expect("sniper post buy sell should normalize");
+        let snipe = &normalized.followLaunch.snipes[0];
+        let sell = snipe
+            .postBuySell
+            .clone()
+            .expect("post buy sell should be present");
+        assert_eq!(sell.percent, 50);
+        assert_eq!(sell.targetBlockOffset, Some(23));
+        assert!(sell.marketCap.is_none());
     }
 
     #[test]
@@ -2586,6 +2983,8 @@ mod tests {
     #[test]
     fn normalizes_market_cap_scan_timeout_for_follow_sell() {
         let mut raw = sample_raw_config();
+        raw.execution.sellPriorityFeeSol = "0.000001".to_string();
+        raw.execution.sellTipSol = "0.0002".to_string();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
             "schemaVersion": 1,
@@ -2623,6 +3022,8 @@ mod tests {
     #[test]
     fn normalizes_market_cap_shorthand_threshold_for_follow_sell() {
         let mut raw = sample_raw_config();
+        raw.execution.sellPriorityFeeSol = "0.000001".to_string();
+        raw.execution.sellTipSol = "0.0002".to_string();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
             "schemaVersion": 1,
@@ -2657,6 +3058,8 @@ mod tests {
     #[test]
     fn defaults_market_cap_follow_sell_timeout_to_thirty_seconds() {
         let mut raw = sample_raw_config();
+        raw.execution.sellPriorityFeeSol = "0.000001".to_string();
+        raw.execution.sellTipSol = "0.0002".to_string();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
             "schemaVersion": 1,
@@ -2673,7 +3076,8 @@ mod tests {
         }))
         .expect("follow launch raw");
 
-        let normalized = normalize_raw_config(raw).expect("market-cap default timeout should normalize");
+        let normalized =
+            normalize_raw_config(raw).expect("market-cap default timeout should normalize");
         let dev_auto_sell = normalized
             .followLaunch
             .devAutoSell
@@ -2686,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_follow_sell_market_cap_direction_to_reached_only() {
+    fn rejects_legacy_follow_sell_market_cap_direction() {
         let mut raw = sample_raw_config();
         raw.followLaunch = serde_json::from_value(json!({
             "enabled": true,
@@ -2706,16 +3110,31 @@ mod tests {
         }))
         .expect("follow launch raw");
 
-        let normalized =
-            normalize_raw_config(raw).expect("market-cap follow sell should normalize");
-        let dev_auto_sell = normalized
-            .followLaunch
-            .devAutoSell
-            .expect("dev auto sell should be present");
-        let trigger = dev_auto_sell
-            .marketCap
-            .expect("market-cap trigger should be present");
-        assert_eq!(trigger.direction, "gte");
+        let error = normalize_raw_config(raw).expect_err("legacy lte should be rejected");
+        assert!(error.to_string().contains("marketCap.direction must be gte"));
+    }
+
+    #[test]
+    fn rejects_market_cap_follow_sell_without_threshold_when_enabled() {
+        let mut raw = sample_raw_config();
+        raw.followLaunch = serde_json::from_value(json!({
+            "enabled": true,
+            "schemaVersion": 1,
+            "devAutoSell": {
+                "enabled": true,
+                "walletEnvKey": "SOLANA_PRIVATE_KEY",
+                "percent": 100,
+                "marketCap": {
+                    "enabled": true,
+                    "threshold": ""
+                }
+            }
+        }))
+        .expect("follow launch raw");
+
+        let error =
+            normalize_raw_config(raw).expect_err("blank threshold should be rejected when enabled");
+        assert!(error.to_string().contains("marketCap.threshold is required"));
     }
 
     #[test]

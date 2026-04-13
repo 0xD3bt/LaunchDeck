@@ -21,7 +21,7 @@ Behavior depends on the launchpad:
 
 - Pump can include the buy directly in the launch transaction shape
 - Bonk supports immediate dev buy on the supported path
-- Bagsapp supports immediate dev buy on the experimental path
+- Bagsapp supports immediate dev buy on the supported Bags path
 
 This is not the same as a delayed sniper buy. It is part of the core launch execution flow.
 
@@ -97,11 +97,13 @@ Use it when you want:
 
 - `On Submit + Delay`
 - `On Confirmed Block`
+- `Market Cap`
 
 How it works:
 
 - `On Submit + Delay` supports `0ms`
 - `On Confirmed Block` is watcher-driven
+- `Market Cap` watches for the configured USD market-cap threshold and can stop or sell on timeout
 - automatic dev sell state is persisted in UI settings
 - agent-custom and agent-locked flows prefer the post-setup creator-vault authority path
 - the daemon owns execution and reporting
@@ -121,10 +123,12 @@ Current sell trigger types include:
 
 These sells are reported independently from the original buy action.
 
-## Current Limitation
+## Sniper Autosell
 
-LaunchDeck explicitly rejects:
+`followLaunch.snipes[].postBuySell` is supported.
 
-- `followLaunch.snipes[].postBuySell`
+Current behavior:
 
-In other words, the daemon supports sell-side follow actions, but per-sniper inline `postBuySell` chaining is not supported yet.
+- slot offsets mean `+N slots after the matching buy confirms`
+- `+0` means the autosell becomes eligible immediately after that matching buy confirms
+- market-cap autosells start watching only after the matching buy confirms

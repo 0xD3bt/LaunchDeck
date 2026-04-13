@@ -150,7 +150,11 @@
               <div id="wallet-dropdown" class="wallet-dropdown" hidden>
                 <div class="wallet-dropdown-header">
                   <span class="wallet-dropdown-title">Select wallet</span>
-                  <button id="wallet-refresh-button" type="button" class="wallet-refresh-button" title="Refresh balances" aria-label="Refresh balances">&#8635;</button>
+                  <button id="wallet-refresh-button" type="button" class="wallet-refresh-button" title="Refresh balances" aria-label="Refresh balances">
+                    <svg class="wallet-refresh-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 30" aria-hidden="true" focusable="false">
+                      <path d="M 15 3 C 12.053086 3 9.3294211 4.0897803 7.2558594 5.8359375 A 1.0001 1.0001 0 1 0 8.5449219 7.3652344 C 10.27136 5.9113916 12.546914 5 15 5 C 20.226608 5 24.456683 8.9136179 24.951172 14 L 22 14 L 26 20 L 30 14 L 26.949219 14 C 26.441216 7.8348596 21.297943 3 15 3 z M 4.3007812 9 L 0.30078125 15 L 3 15 C 3 21.635519 8.3644809 27 15 27 C 17.946914 27 20.670579 25.91022 22.744141 24.164062 A 1.0001 1.0001 0 1 0 21.455078 22.634766 C 19.72864 24.088608 17.453086 25 15 25 C 9.4355191 25 5 20.564481 5 15 L 8.3007812 15 L 4.3007812 9 z"></path>
+                    </svg>
+                  </button>
                 </div>
                 <div id="wallet-dropdown-list" class="wallet-dropdown-list"></div>
               </div>
@@ -286,10 +290,6 @@
             </div>
             <input id="metadata-uri" type="hidden" value="">
             <input id="metadata-status" type="hidden" value="">
-            <input name="bagsIdentityMode" type="hidden" value="wallet-only">
-            <input name="bagsAgentUsername" type="hidden" value="">
-            <input name="bagsAuthToken" type="hidden" value="">
-            <input name="bagsIdentityVerifiedWallet" type="hidden" value="">
           </div>
         </div>
 
@@ -388,12 +388,9 @@
           <div class="mode-divider" aria-hidden="true"></div>
 
           <div class="mode-action-row">
-            <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button tooltip-button">
-              <span class="mode-title">Fee Split</span>
-              <span class="tooltip-panel" role="tooltip"><span class="tooltip-panel-body">Configure creator fee sharing when the selected mode supports it.</span></span>
-            </button>
-            <button type="button" id="bags-identity-button" class="button subtle mode-action-button" hidden>
-              <span class="mode-title" id="bags-identity-button-label">Wallet Only</span>
+            <button type="button" id="fee-split-pill" class="button subtle mode-action-button fee-split-action-button">
+              <span id="fee-split-pill-title" class="mode-title">Fee Split</span>
+              <span id="fee-split-pill-progress" class="fee-split-pill-progress">(0)</span>
             </button>
             <button id="mode-vanity-button" type="button" class="button subtle mode-action-button">
               <span class="mode-title">Vanity</span>
@@ -677,7 +674,9 @@
             <h3>Settings</h3>
             <div class="settings-modal-subtitle">Preset routes, fee defaults, and backend routing summary.</div>
           </div>
-          <button type="button" id="settings-close" class="modal-close" hidden>&times;</button>
+          <button type="button" id="settings-close" class="modal-close" aria-label="Close modal" hidden>
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body settings-modal-body">
           <div class="settings-modal-layout">
@@ -908,7 +907,9 @@
       <div class="modal image-library-modal">
         <div class="modal-header">
           <h3>Image Library</h3>
-          <button type="button" id="image-library-close" class="modal-close">&times;</button>
+          <button type="button" id="image-library-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body image-library-body">
           <div class="image-library-topbar">
@@ -943,7 +944,9 @@
           <div class="sniper-modal-actions">
             <button type="button" id="sniper-refresh-button" class="button subtle sniper-header-button">Refresh</button>
             <button type="button" id="sniper-reset-button" class="button subtle sniper-header-button">Reset</button>
-            <button type="button" id="sniper-close" class="modal-close">&times;</button>
+            <button type="button" id="sniper-close" class="modal-close" aria-label="Close modal">
+              <img class="modal-close-icon" src="/modal-close.png" alt="">
+            </button>
           </div>
         </div>
         <div class="modal-body sniper-modal-body">
@@ -991,22 +994,17 @@
       <div class="modal fee-split-modal">
         <div class="modal-header">
           <div>
-            <h3>Fee Split</h3>
-            <div class="muted small">Wallet addresses or GitHub usernames. Total must equal 100%.</div>
+            <h3 id="fee-split-title">Fee Split</h3>
+            <div id="fee-split-intro" class="muted small">Wallet addresses or GitHub usernames. Total must equal 100%.</div>
           </div>
-          <button type="button" id="fee-split-close" class="modal-close">&times;</button>
+          <button type="button" id="fee-split-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
-          <div class="fee-split-header">
-            <div>
-              <strong>Recipients</strong>
-              <div class="muted small">Creator rewards will be routed using this split after launch.</div>
-            </div>
-            <div id="fee-split-total" class="fee-split-total">0%</div>
-          </div>
           <div id="fee-split-list" class="fee-split-list"></div>
           <div class="fee-split-actions">
-            <button id="fee-split-add" type="button" class="button subtle">+ Add</button>
+            <button id="fee-split-add" type="button" class="button subtle">+ Add recipient</button>
             <button id="fee-split-reset" type="button" class="button subtle">Reset</button>
             <button id="fee-split-even" type="button" class="button subtle">Split evenly</button>
             <button id="fee-split-clear-all" type="button" class="button subtle">Clear All</button>
@@ -1015,7 +1013,24 @@
             <div id="fee-split-bar" class="fee-split-bar"></div>
             <div id="fee-split-legend-list" class="fee-split-legend-list"></div>
           </div>
-          <div id="fee-split-modal-error" class="sniper-modal-error muted small"></div>
+          <div class="fee-split-header">
+            <div>
+              <strong>Recipients</strong>
+              <div id="fee-split-recipients-copy" class="muted small">Creator rewards will be routed using this split after launch.</div>
+            </div>
+            <div id="fee-split-total" class="fee-split-total">Total: 0%</div>
+          </div>
+          <div id="bags-fee-split-summary" class="bags-fee-split-summary" hidden>
+            <div class="bags-fee-split-card">
+              <span id="fee-split-summary-primary-label" class="bags-fee-split-card-label">You Keep</span>
+              <strong id="bags-fee-split-creator-share">100%</strong>
+            </div>
+            <div class="bags-fee-split-card">
+              <span id="fee-split-summary-secondary-label" class="bags-fee-split-card-label">Others Get</span>
+              <strong id="bags-fee-split-shared-share">0%</strong>
+            </div>
+          </div>
+          <div id="fee-split-modal-error" class="field-error fee-split-modal-error" aria-live="polite"></div>
         </div>
         <div class="modal-footer">
           <button type="button" id="fee-split-disable" class="button">Cancel</button>
@@ -1024,56 +1039,16 @@
       </div>
     </div>
 
-    <div id="bags-identity-modal" class="modal-overlay" hidden>
-      <div class="modal fee-split-modal bags-identity-modal">
-        <div class="modal-header">
-          <div>
-            <h3>Bags Identity</h3>
-            <div class="muted small">Wallet-only launches use the selected LaunchDeck wallet. Linked identity requires the selected wallet to belong to the authenticated Bags account.</div>
-          </div>
-          <button type="button" id="bags-identity-close" class="modal-close">&times;</button>
-        </div>
-        <div class="modal-body stack">
-          <div id="bags-identity-current" class="modal-warning" hidden></div>
-          <label>
-            <span>Bags API Key</span>
-            <input id="bags-api-key-input" type="password" placeholder="Enter Bags API key if missing or replacing">
-          </label>
-          <label class="checkbox-row">
-            <input id="bags-api-key-save" type="checkbox" checked>
-            <span>Save API key for future launches</span>
-          </label>
-          <label>
-            <span>Agent Username</span>
-            <input id="bags-agent-username-input" type="text" placeholder="Moltbook username">
-          </label>
-          <button type="button" id="bags-identity-init-button" class="button subtle">Generate Verification</button>
-          <label>
-            <span>Verification Post Content</span>
-            <textarea id="bags-verification-content" rows="4" readonly placeholder="Generate verification first"></textarea>
-          </label>
-          <label>
-            <span>Moltbook Post ID</span>
-            <input id="bags-post-id-input" type="text" placeholder="Paste the verification post id">
-          </label>
-          <div class="muted small">Linked mode stays enabled only when the selected LaunchDeck wallet belongs to the authenticated Bags account. If the account context or wallet does not match, LaunchDeck falls back to wallet-only mode.</div>
-          <div id="bags-identity-error" class="field-error"></div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" id="bags-identity-cancel" class="button subtle">Cancel</button>
-          <button type="button" id="bags-identity-verify" class="button deploy">Verify</button>
-        </div>
-      </div>
-    </div>
-
     <div id="agent-split-modal" class="modal-overlay" hidden>
-      <div class="modal fee-split-modal">
+      <div class="modal fee-split-modal compact-fee-split-modal">
         <div class="modal-header">
           <div>
             <h3>Agent Split</h3>
             <div class="muted small">Bundled right after launch and final once created. Total must equal 100%.</div>
           </div>
-          <button type="button" id="agent-split-close" class="modal-close">&times;</button>
+          <button type="button" id="agent-split-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
           <div class="fee-split-header">
@@ -1081,7 +1056,7 @@
               <strong>Fee Split</strong>
               <div class="muted small">Define the bundled agent buyback row plus any wallet or GitHub recipients.</div>
             </div>
-            <div id="agent-split-total" class="fee-split-total">0%</div>
+            <div id="agent-split-total" class="fee-split-total">Total: 0%</div>
           </div>
           <div id="agent-split-list" class="fee-split-list"></div>
           <div class="fee-split-actions">
@@ -1094,7 +1069,7 @@
             <div id="agent-split-bar" class="fee-split-bar"></div>
             <div id="agent-split-legend-list" class="fee-split-legend-list"></div>
           </div>
-          <div id="agent-split-modal-error" class="field-error"></div>
+          <div id="agent-split-modal-error" class="field-error fee-split-modal-error" aria-live="polite"></div>
         </div>
         <div class="modal-footer">
           <button type="button" id="agent-split-cancel" class="button">Cancel</button>
@@ -1107,7 +1082,9 @@
       <div class="modal vanity-modal">
         <div class="modal-header">
           <h3>Vanity</h3>
-          <button type="button" id="vanity-close" class="modal-close">&times;</button>
+          <button type="button" id="vanity-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
           <div class="stack">
@@ -1133,7 +1110,9 @@
             <h3>Vamp</h3>
             <div class="muted small">Paste a contract address to copy the token image, metadata, ticker, and links into the form.</div>
           </div>
-          <button type="button" id="vamp-close" class="modal-close">&times;</button>
+          <button type="button" id="vamp-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
           <div class="stack">
@@ -1162,7 +1141,9 @@
       <div class="modal image-details-modal">
         <div class="modal-header">
           <h3 id="image-details-title">Edit Image Details</h3>
-          <button type="button" id="image-details-close" class="modal-close">&times;</button>
+          <button type="button" id="image-details-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
           <div class="stack">
@@ -1201,7 +1182,9 @@
       <div class="modal image-category-modal">
         <div class="modal-header">
           <h3>New Category</h3>
-          <button type="button" id="image-category-close" class="modal-close">&times;</button>
+          <button type="button" id="image-category-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body">
           <div class="stack">
@@ -1223,7 +1206,9 @@
       <div class="modal">
         <div class="modal-header">
           <h3>Confirm Deploy</h3>
-          <button type="button" id="modal-close" class="modal-close">&times;</button>
+          <button type="button" id="modal-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div class="modal-body" id="modal-body"></div>
         <div class="modal-footer">
@@ -1240,7 +1225,9 @@
             <h3 id="benchmarks-popout-title">Benchmarks Popout</h3>
             <div class="settings-modal-subtitle">Expanded benchmark view sized for clean screenshots.</div>
           </div>
-          <button type="button" id="benchmarks-popout-close" class="modal-close">&times;</button>
+          <button type="button" id="benchmarks-popout-close" class="modal-close" aria-label="Close modal">
+            <img class="modal-close-icon" src="/modal-close.png" alt="">
+          </button>
         </div>
         <div id="benchmarks-popout-body" class="modal-body benchmarks-popout-body"></div>
       </div>

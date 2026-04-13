@@ -89,8 +89,10 @@ pub struct SentItem {
     pub firstObservedAtMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmedAtMs: Option<u128>,
-    pub sendObservedBlockHeight: Option<u64>,
-    pub confirmedObservedBlockHeight: Option<u64>,
+    #[serde(default, alias = "sendObservedBlockHeight")]
+    pub sendObservedSlot: Option<u64>,
+    #[serde(default, alias = "confirmedObservedBlockHeight")]
+    pub confirmedObservedSlot: Option<u64>,
     pub confirmedSlot: Option<u64>,
     pub computeUnitLimit: Option<u64>,
     pub computeUnitPriceMicroLamports: Option<u64>,
@@ -147,6 +149,12 @@ pub struct ExecutionTimings {
     pub compileFollowUpSerializeMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compileTipSerializeMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagsPrepareLaunchMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagsMetadataUploadMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagsFeeRecipientResolveMs: Option<u128>,
     pub simulateMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simulateLaunchMs: Option<u128>,
@@ -165,6 +173,10 @@ pub struct ExecutionTimings {
     pub sendWatchFallbackMs: Option<u128>,
     pub bagsSetupSubmitMs: Option<u128>,
     pub bagsSetupConfirmMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagsSetupGateMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagsLaunchBuildMs: Option<u128>,
     pub persistReportMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistInitialSnapshotMs: Option<u128>,
@@ -193,6 +205,10 @@ pub struct FollowActionTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligibilityMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postEligibilityToSubmitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preSignedExpiryCheckMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compileMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submitMs: Option<u128>,
@@ -220,6 +236,12 @@ pub struct FollowJobTimings {
     pub watcherWaitMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligibilityMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggerCompilePrepMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postEligibilityToSubmitMs: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preSignedExpiryCheckMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compileMs: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,9 +284,12 @@ pub struct BenchmarkSentItem {
     pub label: String,
     pub signature: Option<String>,
     pub confirmationStatus: Option<String>,
-    pub sendBlockHeight: Option<u64>,
-    pub confirmedBlockHeight: Option<u64>,
-    pub blocksToConfirm: Option<u64>,
+    #[serde(default, alias = "sendBlockHeight")]
+    pub sendSlot: Option<u64>,
+    #[serde(default, alias = "confirmedBlockHeight")]
+    pub confirmedObservedSlot: Option<u64>,
+    #[serde(default, alias = "blocksToConfirm")]
+    pub slotsToConfirm: Option<u64>,
     pub confirmedSlot: Option<u64>,
 }
 
@@ -430,6 +455,18 @@ fn summarize_recipients(
                 let share = entry.shareBps as f64 / 100.0;
                 match entry.r#type.as_deref() {
                     Some("agent") => format!("agent buyback ({share}%)"),
+                    Some("github") if !entry.githubUsername.is_empty() => {
+                        format!("GitHub @{} ({share}%)", entry.githubUsername)
+                    }
+                    Some("twitter") | Some("x") if !entry.githubUsername.is_empty() => {
+                        format!("X @{} ({share}%)", entry.githubUsername)
+                    }
+                    Some("kick") if !entry.githubUsername.is_empty() => {
+                        format!("Kick @{} ({share}%)", entry.githubUsername)
+                    }
+                    Some("tiktok") if !entry.githubUsername.is_empty() => {
+                        format!("TikTok @{} ({share}%)", entry.githubUsername)
+                    }
                     _ if !entry.githubUsername.is_empty() => {
                         format!("@{} ({share}%)", entry.githubUsername)
                     }
@@ -521,7 +558,25 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
         parts.push(format!("delay={}ms", delay_ms));
     }
     if let Some(block_offset) = action.get("targetBlockOffset").and_then(Value::as_u64) {
-        parts.push(format!("block+{}", block_offset));
+        parts.push(format!("slot+{}", block_offset));
+    }
+    if let Some(trigger_key) = action.get("triggerKey").and_then(Value::as_str)
+        && !trigger_key.trim().is_empty()
+    {
+        let trigger_label = if trigger_key.starts_with("market:") {
+            "trigger=market-cap"
+        } else if trigger_key.starts_with("slot:") {
+            "trigger=block-offset"
+        } else if trigger_key.starts_with("delay:") {
+            "trigger=delay"
+        } else if trigger_key.starts_with("submit:") {
+            "trigger=submit"
+        } else if trigger_key == "confirm" {
+            "trigger=confirm"
+        } else {
+            "trigger=unknown"
+        };
+        parts.push(trigger_label.to_string());
     }
     if let Some(market_cap) = action.get("marketCap").and_then(Value::as_object) {
         let threshold = market_cap
@@ -529,7 +584,10 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or("");
         if !threshold.trim().is_empty() {
-            parts.push(format!("market {}", threshold.trim()));
+            parts.push(format!(
+                "market ${}",
+                format_market_cap_threshold_for_display(threshold)
+            ));
         }
         if let Some(timeout_seconds) = market_cap.get("scanTimeoutSeconds").and_then(Value::as_u64)
         {
@@ -552,12 +610,19 @@ fn render_follow_action_summary(action: &Value) -> Option<String> {
     {
         parts.push(format!("sig={}", short_address(signature.trim(), 8, 8)));
     }
-    if let Some(blocks) = action.get("blocksToConfirm").and_then(Value::as_u64) {
-        parts.push(format!("blocks={blocks}"));
+    if let Some(slots) = action
+        .get("slotsToConfirm")
+        .or_else(|| action.get("blocksToConfirm"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("slots={slots}"));
     }
     if let Some(error) = action.get("lastError").and_then(Value::as_str)
         && !error.trim().is_empty()
     {
+        if error.contains("market-cap scan stopped") {
+            parts.push("timeout=stop".to_string());
+        }
         parts.push(format!("error={}", error.trim()));
     }
     if let Some(reason) = action.get("watcherFallbackReason").and_then(Value::as_str)
@@ -576,6 +641,57 @@ fn short_address(value: &str, left: usize, right: usize) -> String {
         return value.to_string();
     }
     format!("{}...{}", &value[..left], &value[value.len() - right..])
+}
+
+fn format_market_cap_threshold_for_display(value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return trimmed.to_string();
+    }
+    let Ok(micros) = trimmed.parse::<u128>() else {
+        return trimmed.to_string();
+    };
+    if micros < 1_000_000 {
+        return trimmed.to_string();
+    }
+    let whole_usd = micros / 1_000_000;
+    let fractional_micros = micros % 1_000_000;
+    let format_with_suffix = |suffix_value: u128, suffix_label: &str| {
+        let whole = whole_usd / suffix_value;
+        let remainder = whole_usd % suffix_value;
+        if whole >= 100 || remainder == 0 {
+            return format!("{whole}{suffix_label}");
+        }
+        let decimal = (remainder * 10) / suffix_value;
+        if decimal == 0 {
+            return format!("{whole}{suffix_label}");
+        }
+        format!("{whole}.{decimal}{suffix_label}")
+    };
+    if fractional_micros == 0 {
+        if whole_usd >= 1_000_000_000_000 {
+            return format_with_suffix(1_000_000_000_000, "t");
+        }
+        if whole_usd >= 1_000_000_000 {
+            return format_with_suffix(1_000_000_000, "b");
+        }
+        if whole_usd >= 1_000_000 {
+            return format_with_suffix(1_000_000, "m");
+        }
+        if whole_usd >= 1_000 {
+            return format_with_suffix(1_000, "k");
+        }
+        return whole_usd.to_string();
+    }
+    let mut fractional = format!("{fractional_micros:06}");
+    while fractional.ends_with('0') {
+        fractional.pop();
+    }
+    if fractional.is_empty() {
+        whole_usd.to_string()
+    } else {
+        format!("{whole_usd}.{fractional}")
+    }
 }
 
 fn format_duration_ms(value_ms: u128) -> String {
@@ -790,13 +906,24 @@ pub fn build_report(
         "agent-custom" => "untouched on launch (configure later manually)".to_string(),
         "agent-unlocked" => "untouched on launch (configure later once)".to_string(),
         "agent-locked" => "locked to agent escrow".to_string(),
+        _ if config.launchpad == "bagsapp" && !config.feeSharing.recipients.is_empty() => {
+            "configured during Bags setup".to_string()
+        }
         _ if has_launch_follow_up(config) => "deferred one-time setup artifact".to_string(),
         _ => "untouched".to_string(),
     };
-    let notes = vec![
-        "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly covers LaunchDeck's Pump launch modes end-to-end."
-            .to_string(),
-    ];
+    let notes = vec![match config.launchpad.as_str() {
+        "bonk" => {
+            "Rust engine owns validation, runtime state, and API contracts. Native Bonk assembly covers LaunchDeck's Bonk launch modes end-to-end."
+        }
+        "bagsapp" => {
+            "Rust engine owns validation, runtime state, and API contracts. Native Bags assembly covers LaunchDeck's Bags launch flows end-to-end."
+        }
+        _ => {
+            "Rust engine owns validation, runtime state, and API contracts. Native Pump assembly covers LaunchDeck's Pump launch modes end-to-end."
+        }
+    }
+    .to_string()];
     let mut warnings = vec![];
     let has_unverified_provider =
         !crate::providers::get_provider_meta(&transport_plan.resolvedProvider).verified;
@@ -974,12 +1101,17 @@ pub fn sanitize_execution_timings_for_mode(
             sanitized.compileLaunchSerializeMs = None;
             sanitized.compileFollowUpSerializeMs = None;
             sanitized.compileTipSerializeMs = None;
+            sanitized.bagsPrepareLaunchMs = None;
+            sanitized.bagsMetadataUploadMs = None;
+            sanitized.bagsFeeRecipientResolveMs = None;
             sanitized.simulateLaunchMs = None;
             sanitized.simulateFollowUpMs = None;
             sanitized.sendTransportSubmitMs = None;
             sanitized.sendTransportConfirmMs = None;
             sanitized.sendBundleStatusMs = None;
             sanitized.sendWatchFallbackMs = None;
+            sanitized.bagsSetupGateMs = None;
+            sanitized.bagsLaunchBuildMs = None;
             sanitized.persistFinalReportUpdateMs = None;
             sanitized.followSnapshotFlushMs = None;
             sanitized.reportRenderMs = None;
@@ -1021,6 +1153,9 @@ pub fn build_benchmark_timing_groups(
             timings.compileFollowUpSerializeMs,
             timings.compileTipSerializeMs,
             timings.compileTxSerializeMs,
+            timings.bagsPrepareLaunchMs,
+            timings.bagsMetadataUploadMs,
+            timings.bagsFeeRecipientResolveMs,
         ],
     );
     let simulate_other = remaining_time(
@@ -1035,6 +1170,7 @@ pub fn build_benchmark_timing_groups(
         timings.sendSubmitMs,
         &[
             timings.bagsSetupSubmitMs,
+            timings.bagsLaunchBuildMs,
             timings.sendTransportSubmitMs,
             pick_first(&[
                 timings.compileLaunchSerializeMs,
@@ -1046,7 +1182,7 @@ pub fn build_benchmark_timing_groups(
     let confirm_other = remaining_time(
         timings.sendConfirmMs,
         &[
-            timings.bagsSetupConfirmMs,
+            pick_first(&[timings.bagsSetupGateMs, timings.bagsSetupConfirmMs]),
             timings.sendTransportConfirmMs,
             timings.sendBundleStatusMs,
             timings.sendWatchFallbackMs,
@@ -1339,6 +1475,30 @@ pub fn build_benchmark_timing_groups(
                 false,
             ),
             timing_metric(
+                "bagsPrepareLaunchMs",
+                "Bags prepare",
+                timings.bagsPrepareLaunchMs,
+                Some("native/helper prepare-launch total"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "bagsMetadataUploadMs",
+                "Bags metadata upload",
+                timings.bagsMetadataUploadMs,
+                Some("native/helper metadata upload only"),
+                false,
+                false,
+            ),
+            timing_metric(
+                "bagsFeeRecipientResolveMs",
+                "Bags recipient resolve",
+                timings.bagsFeeRecipientResolveMs,
+                Some("native/helper fee-recipient resolution"),
+                false,
+                false,
+            ),
+            timing_metric(
                 "compileOtherMs",
                 "Compile remainder",
                 compile_other,
@@ -1423,6 +1583,14 @@ pub fn build_benchmark_timing_groups(
                 false,
             ),
             timing_metric(
+                "bagsLaunchBuildMs",
+                "Bags launch build",
+                timings.bagsLaunchBuildMs,
+                Some("build final launch transaction after setup"),
+                false,
+                false,
+            ),
+            timing_metric(
                 "sendSubmitOtherMs",
                 "Submit remainder",
                 submit_other,
@@ -1463,10 +1631,10 @@ pub fn build_benchmark_timing_groups(
                 false,
             ),
             timing_metric(
-                "bagsSetupConfirmMs",
-                "Setup confirm",
-                timings.bagsSetupConfirmMs,
-                Some("setup transaction confirmation"),
+                "bagsSetupGateMs",
+                "Setup gate",
+                pick_first(&[timings.bagsSetupGateMs, timings.bagsSetupConfirmMs]),
+                Some("wait before final launch build"),
                 false,
                 false,
             ),
@@ -1577,6 +1745,30 @@ pub fn build_benchmark_timing_groups(
                     "Eligibility",
                     follow.eligibilityMs,
                     Some("time to become runnable"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followTriggerCompilePrepMs",
+                    "Trigger compile prep",
+                    follow.triggerCompilePrepMs,
+                    Some("shared trigger-time warm/compile preparation"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followPostEligibilityToSubmitMs",
+                    "Eligible to submit",
+                    follow.postEligibilityToSubmitMs,
+                    Some("gap between eligible and submit start"),
+                    false,
+                    false,
+                ),
+                timing_metric(
+                    "followPreSignedExpiryCheckMs",
+                    "Pre-signed expiry check",
+                    follow.preSignedExpiryCheckMs,
+                    Some("block-height safety check before sending pre-signed actions"),
                     false,
                     false,
                 ),
@@ -1692,10 +1884,7 @@ pub fn render_report(report: &LaunchReport) -> String {
         "Skip preflight: {} | max retries: {}",
         report.execution.skipPreflight, report.execution.maxRetries
     ));
-    lines.push(format!(
-        "Track send block height: {}",
-        report.execution.trackSendBlockHeight
-    ));
+    lines.push(format!("Track send slot: {}", report.execution.trackSendBlockHeight));
     if let Some(endpoint) = &report.execution.heliusSenderEndpoint {
         lines.push(format!("Helius Sender responder: {}", endpoint));
     }
@@ -1825,6 +2014,12 @@ pub fn render_report(report: &LaunchReport) -> String {
         if let Some(value) = timings.bagsSetupConfirmMs {
             timing_parts.push(format!("setupConfirm={value}ms"));
         }
+        if let Some(value) = timings.bagsSetupGateMs {
+            timing_parts.push(format!("setupGate={value}ms"));
+        }
+        if let Some(value) = timings.bagsLaunchBuildMs {
+            timing_parts.push(format!("bagsLaunchBuild={value}ms"));
+        }
         if let Some(value) = timings.persistReportMs {
             timing_parts.push(format!("persistReport={value}ms"));
         }
@@ -1833,17 +2028,17 @@ pub fn render_report(report: &LaunchReport) -> String {
         }
         for sent in &benchmark.sent {
             let mut sent_parts = Vec::new();
-            if let Some(value) = sent.sendBlockHeight {
-                sent_parts.push(format!("send block height={value}"));
-            }
-            if let Some(value) = sent.confirmedBlockHeight {
-                sent_parts.push(format!("confirmed block height={value}"));
-            }
-            if let Some(value) = sent.blocksToConfirm {
-                sent_parts.push(format!("blocks to confirm={value}"));
+            if let Some(value) = sent.sendSlot {
+                sent_parts.push(format!("observed send slot={value}"));
             }
             if let Some(value) = sent.confirmedSlot {
                 sent_parts.push(format!("confirmed slot={value}"));
+            }
+            if let Some(value) = sent.confirmedObservedSlot {
+                sent_parts.push(format!("observed confirm slot={value}"));
+            }
+            if let Some(value) = sent.slotsToConfirm {
+                sent_parts.push(format!("observed slots to confirm={value}"));
             }
             if !sent_parts.is_empty() {
                 lines.push(format!(
@@ -1903,23 +2098,23 @@ pub fn render_report(report: &LaunchReport) -> String {
             if let Some(source) = sent.confirmationSource.as_deref() {
                 summary.push_str(&format!(" | via={source}"));
             }
-            if let Some(block_height) = sent.sendObservedBlockHeight {
-                summary.push_str(&format!(" | send block height={block_height}"));
-            }
-            if let Some(block_height) = sent.confirmedObservedBlockHeight {
-                summary.push_str(&format!(" | confirmed block height={block_height}"));
-            }
-            if let (Some(send_height), Some(confirmed_height)) = (
-                sent.sendObservedBlockHeight,
-                sent.confirmedObservedBlockHeight,
-            ) {
-                summary.push_str(&format!(
-                    " | blocks to confirm={}",
-                    confirmed_height.saturating_sub(send_height)
-                ));
+            if let Some(slot) = sent.sendObservedSlot {
+                summary.push_str(&format!(" | observed send slot={slot}"));
             }
             if let Some(slot) = sent.confirmedSlot {
                 summary.push_str(&format!(" | confirmed slot={slot}"));
+            }
+            if let Some(slot) = sent.confirmedObservedSlot {
+                summary.push_str(&format!(" | observed confirm slot={slot}"));
+            }
+            if let (Some(send_slot), Some(confirmed_slot)) = (
+                sent.sendObservedSlot,
+                sent.confirmedObservedSlot,
+            ) {
+                summary.push_str(&format!(
+                    " | observed slots to confirm={}",
+                    confirmed_slot.saturating_sub(send_slot)
+                ));
             }
             if let (Some(submitted_at), Some(first_seen_at)) =
                 (sent.submittedAtMs, sent.firstObservedAtMs)
@@ -2149,5 +2344,17 @@ mod tests {
         assert_eq!(sanitized.persistInitialSnapshotMs, None);
         assert_eq!(sanitized.compileTransactionsMs, None);
         assert_eq!(sanitized.sendTransportSubmitMs, None);
+    }
+
+    #[test]
+    fn formats_market_cap_thresholds_for_display() {
+        assert_eq!(
+            format_market_cap_threshold_for_display("100000000000"),
+            "100k"
+        );
+        assert_eq!(
+            format_market_cap_threshold_for_display("250000000"),
+            "250"
+        );
     }
 }

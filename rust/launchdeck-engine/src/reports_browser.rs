@@ -185,17 +185,7 @@ pub fn build_report_summary_entry(file_name: &str) -> Result<ReportSummaryEntry,
     ))
 }
 
-pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
-    let cache = report_summary_cache();
-    if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.as_ref()
-    {
-        return if sort == "oldest" {
-            cached.oldest.clone()
-        } else {
-            cached.newest.clone()
-        };
-    }
+fn scan_report_cache_files() -> Vec<ReportCacheFileMeta> {
     let dir = paths::reports_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return vec![];
@@ -222,6 +212,22 @@ pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
         })
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    files
+}
+
+pub fn list_persisted_reports(sort: &str) -> Vec<ReportSummaryEntry> {
+    let files = scan_report_cache_files();
+    let cache = report_summary_cache();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.files == files
+    {
+        return if sort == "oldest" {
+            cached.oldest.clone()
+        } else {
+            cached.newest.clone()
+        };
+    }
     let mut newest = files
         .iter()
         .filter_map(|entry| build_report_summary_entry(&entry.file_name).ok())
@@ -254,6 +260,14 @@ pub fn record_persisted_report_payload(file_name: &str, payload: &Value) {
         .and_then(Value::as_u64)
         .map(u128::from)
         .unwrap_or(0);
+    let file_metadata = fs::metadata(paths::reports_dir().join(&safe_file_name)).ok();
+    let modified_ms = file_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or(written_at_ms);
+    let len = file_metadata.map(|metadata| metadata.len()).unwrap_or(0);
     let summary = build_report_summary_entry_from_payload(&safe_file_name, payload, written_at_ms);
     let mut cache = match report_summary_cache().lock() {
         Ok(cache) => cache,
@@ -269,8 +283,8 @@ pub fn record_persisted_report_payload(file_name: &str, payload: &Value) {
         .retain(|entry| entry.file_name != safe_file_name);
     existing.files.push(ReportCacheFileMeta {
         file_name: safe_file_name.clone(),
-        modified_ms: written_at_ms,
-        len: 0,
+        modified_ms,
+        len,
     });
     existing
         .newest
@@ -387,29 +401,35 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                         .and_then(Value::as_str)
                         .unwrap_or("(pending)")
                 );
-                if let Some(block_height) =
-                    sent.get("sendObservedBlockHeight").and_then(Value::as_u64)
-                {
-                    summary.push_str(&format!(" | send block height={block_height}"));
-                }
-                if let Some(block_height) = sent
-                    .get("confirmedObservedBlockHeight")
+                if let Some(slot) = sent
+                    .get("sendObservedSlot")
+                    .or_else(|| sent.get("sendObservedBlockHeight"))
                     .and_then(Value::as_u64)
                 {
-                    summary.push_str(&format!(" | confirmed block height={block_height}"));
-                }
-                if let (Some(send_height), Some(confirmed_height)) = (
-                    sent.get("sendObservedBlockHeight").and_then(Value::as_u64),
-                    sent.get("confirmedObservedBlockHeight")
-                        .and_then(Value::as_u64),
-                ) {
-                    summary.push_str(&format!(
-                        " | blocks to confirm={}",
-                        confirmed_height.saturating_sub(send_height)
-                    ));
+                    summary.push_str(&format!(" | observed send slot={slot}"));
                 }
                 if let Some(slot) = sent.get("confirmedSlot").and_then(Value::as_u64) {
                     summary.push_str(&format!(" | confirmed slot={slot}"));
+                }
+                if let Some(slot) = sent
+                    .get("confirmedObservedSlot")
+                    .or_else(|| sent.get("confirmedObservedBlockHeight"))
+                    .and_then(Value::as_u64)
+                {
+                    summary.push_str(&format!(" | observed confirm slot={slot}"));
+                }
+                if let (Some(send_slot), Some(confirmed_slot)) = (
+                    sent.get("sendObservedSlot")
+                        .or_else(|| sent.get("sendObservedBlockHeight"))
+                        .and_then(Value::as_u64),
+                    sent.get("confirmedObservedSlot")
+                        .or_else(|| sent.get("confirmedObservedBlockHeight"))
+                        .and_then(Value::as_u64),
+                ) {
+                    summary.push_str(&format!(
+                        " | observed slots to confirm={}",
+                        confirmed_slot.saturating_sub(send_slot)
+                    ));
                 }
                 lines.push(summary);
             }
@@ -540,17 +560,17 @@ fn build_report_text(file_name: &str, payload: &Value, fallback_raw: &str) -> St
                     .and_then(Value::as_str)
                     .unwrap_or("(unknown)");
                 let mut sent_parts = Vec::new();
-                if let Some(value) = sent.get("sendBlockHeight").and_then(Value::as_u64) {
-                    sent_parts.push(format!("send block height={value}"));
-                }
-                if let Some(value) = sent.get("confirmedBlockHeight").and_then(Value::as_u64) {
-                    sent_parts.push(format!("confirmed block height={value}"));
-                }
-                if let Some(value) = sent.get("blocksToConfirm").and_then(Value::as_u64) {
-                    sent_parts.push(format!("blocks to confirm={value}"));
+                if let Some(value) = sent.get("sendSlot").and_then(Value::as_u64) {
+                    sent_parts.push(format!("observed send slot={value}"));
                 }
                 if let Some(value) = sent.get("confirmedSlot").and_then(Value::as_u64) {
                     sent_parts.push(format!("confirmed slot={value}"));
+                }
+                if let Some(value) = sent.get("confirmedObservedSlot").and_then(Value::as_u64) {
+                    sent_parts.push(format!("observed confirm slot={value}"));
+                }
+                if let Some(value) = sent.get("slotsToConfirm").and_then(Value::as_u64) {
+                    sent_parts.push(format!("observed slots to confirm={value}"));
                 }
                 if !sent_parts.is_empty() {
                     lines.push(format!("  {}: {}", label, sent_parts.join(" | ")));
@@ -605,11 +625,24 @@ pub fn read_persisted_report_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn temp_reports_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "launchdeck-report-cache-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -651,8 +684,15 @@ mod tests {
 
     #[test]
     fn record_persisted_report_payload_updates_cached_lists() {
-        let _guard = env_lock().lock().expect("lock env");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         clear_report_summary_cache();
+        let temp_dir = temp_reports_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp reports dir");
+        unsafe {
+            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
+        }
 
         let initial_payload = serde_json::json!({
             "writtenAtMs": 100,
@@ -667,6 +707,11 @@ mod tests {
             },
             "signatures": ["sig-1"]
         });
+        fs::write(
+            temp_dir.join("cached-report.json"),
+            serde_json::to_vec(&initial_payload).expect("serialize initial payload"),
+        )
+        .expect("write initial payload");
         record_persisted_report_payload("cached-report.json", &initial_payload);
 
         let updated_payload = serde_json::json!({
@@ -682,11 +727,86 @@ mod tests {
             },
             "signatures": ["sig-2"]
         });
+        fs::write(
+            temp_dir.join("cached-report.json"),
+            serde_json::to_vec(&updated_payload).expect("serialize updated payload"),
+        )
+        .expect("write updated payload");
         record_persisted_report_payload("cached-report.json", &updated_payload);
 
         let newest = list_persisted_reports("newest");
         assert_eq!(newest.len(), 1);
         assert_eq!(newest[0].mint, "mint-2");
         assert_eq!(newest[0].provider, "standard-rpc");
+
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
+        }
+        fs::remove_dir_all(&temp_dir).expect("remove temp reports dir");
+        clear_report_summary_cache();
+    }
+
+    #[test]
+    fn list_persisted_reports_reloads_when_cache_is_incomplete() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        clear_report_summary_cache();
+
+        let temp_dir = temp_reports_dir();
+        fs::create_dir_all(&temp_dir).expect("create temp reports dir");
+        unsafe {
+            std::env::set_var("LAUNCHDECK_SEND_LOG_DIR", &temp_dir);
+        }
+
+        let older_payload = serde_json::json!({
+            "writtenAtMs": 100,
+            "action": "send",
+            "traceId": "trace-older",
+            "mint": "mint-older",
+            "report": {
+                "execution": {
+                    "provider": "helius-sender",
+                    "transportType": "helius-sender"
+                }
+            },
+            "signatures": ["sig-older"]
+        });
+        let newer_payload = serde_json::json!({
+            "writtenAtMs": 200,
+            "action": "send",
+            "traceId": "trace-newer",
+            "mint": "mint-newer",
+            "report": {
+                "execution": {
+                    "provider": "standard-rpc",
+                    "transportType": "standard-rpc"
+                }
+            },
+            "signatures": ["sig-newer"]
+        });
+        fs::write(
+            temp_dir.join("100-send-older.json"),
+            serde_json::to_vec(&older_payload).expect("serialize older payload"),
+        )
+        .expect("write older payload");
+        fs::write(
+            temp_dir.join("200-send-newer.json"),
+            serde_json::to_vec(&newer_payload).expect("serialize newer payload"),
+        )
+        .expect("write newer payload");
+
+        record_persisted_report_payload("200-send-newer.json", &newer_payload);
+
+        let newest = list_persisted_reports("newest");
+        assert_eq!(newest.len(), 2);
+        assert_eq!(newest[0].mint, "mint-newer");
+        assert_eq!(newest[1].mint, "mint-older");
+
+        unsafe {
+            std::env::remove_var("LAUNCHDECK_SEND_LOG_DIR");
+        }
+        fs::remove_dir_all(&temp_dir).expect("remove temp reports dir");
+        clear_report_summary_cache();
     }
 }
